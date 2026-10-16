@@ -12,8 +12,10 @@ def decide(last_user_texts, tool_results, summary):
     if summary: return ("text", "SUMMARY: handoff note")
     if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " "))
     t = last_user_texts
+    m = re.search(r"call:\s*(\w+)\s+(\{.*\})\s*$", t, re.S)      # call: TOOL {json input}
+    if m: return ("tool", (m.group(1), json.loads(m.group(2))))
     m = re.search(r"run:\s*(.+)", t, re.S)
-    if m: return ("tool", m.group(1).strip())
+    if m: return ("tool", ("bash", {"command": m.group(1).strip()}))
     return ("text", "echo: " + t.strip()[:80])
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -53,7 +55,7 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"prompt is too long: {size} tokens > {CTX} maximum"}})
             last = msgs[-1]["content"]
             kind, val = decide(last_text(last), [b["content"] for b in last if b["type"] == "tool_result"], body.get("tool_choice", {}).get("type") == "none")
-            content = [{"type": "text", "text": val}] if kind == "text" else [{"type": "text", "text": "Running it."}, {"type": "tool_use", "id": f"toolu_{len(msgs)}", "name": "bash", "input": {"command": val}}]
+            content = [{"type": "text", "text": val}] if kind == "text" else [{"type": "text", "text": "Running it."}, {"type": "tool_use", "id": f"toolu_{len(msgs)}", "name": val[0], "input": val[1]}]
             return self.send(200, {"content": content, "stop_reason": "tool_use" if kind == "tool" else "end_turn", "usage": {"input_tokens": size}})
         if self.path == "/v1/chat/completions":
             msgs = body["messages"]; assert msgs[0]["role"] == "system"; pending = set()
@@ -71,7 +73,7 @@ class H(BaseHTTPRequestHandler):
                 tail.insert(0, m)
             texts = "\n".join(m["content"] for m in tail if m["role"] == "user")
             kind, val = decide(texts, [m["content"] for m in tail if m["role"] == "tool"], body.get("tool_choice") == "none")
-            msg = {"role": "assistant", "content": val} if kind == "text" else {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{len(msgs)}", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": val})}}]}
+            msg = {"role": "assistant", "content": val} if kind == "text" else {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{len(msgs)}", "type": "function", "function": {"name": val[0], "arguments": json.dumps(val[1])}}]}
             return self.send(200, {"choices": [{"message": msg, "finish_reason": "tool_calls" if kind == "tool" else "stop"}], "usage": {"prompt_tokens": size}})
         self.send(404, {})
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

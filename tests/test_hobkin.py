@@ -123,18 +123,18 @@ try:
 
     # compaction on a tiny context; context size learned from error when the API doesn't list it
     for api, port, listctx in (("anthropic", 48703, "list"), ("openai", 48704, "nolist")):
-        mock(port, 3000, listctx)
+        mock(port, 8000, listctx)
         base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
         h = home(api + "-small", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", "max_output_tokens": 200})
         p, aid, d = start(h)
         for i in range(8):
-            say(d, f"run: seq 1 {300 + i}")
-            wait_for(d, f"{300 + i}", 20); time.sleep(0.3)
+            say(d, f"run: seq 1 {1000 + i}")
+            wait_for(d, f"{1000 + i}", 20); time.sleep(0.3)
         out = open(d + "/out").read()
         st = json.load(open(d + "/state.json"))
         check(f"[{api}] compacted", "compacted; note" in out and os.listdir(d + "/archive"), out[-800:])
-        check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 3000, st)
-        check(f"[{api}] request survives compaction", "seq 1 307" in open(d + "/context.jsonl").read() or "307" in open(d + "/out").read().split("compacted; note")[-1])
+        check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 8000, st)
+        check(f"[{api}] request survives compaction", "seq 1 1007" in open(d + "/context.jsonl").read() or "1007" in open(d + "/out").read().split("compacted; note")[-1])
         time.sleep(1); say(d, "still there?"); wait_for(d, "echo: still there?")
         p.send_signal(signal.SIGTERM); p.wait(10)
     # skills: shared, overridden per agent, extra dirs from config; listed (not inlined) in the prompt
@@ -157,23 +157,81 @@ try:
     check("[skills] listed with descriptions", "**deploy**: Ship a release: build, tag and push." in system
           and "**notes**: Keep tidy notes." in system, system[-900:])
     check("[skills] agent's own skill wins, then shared over extra", "The agent's own greeting rules." in system
-          and "lower priority" not in system and d + "/skills/greet/SKILL.md" in system, system[-900:])
+          and "lower priority" not in system, system[-900:])
     check("[skills] bodies aren't inlined", "SECRET-BODY-TEXT" not in system)
     check("[skills] folder name used when there's no front matter", "**nofront**: (no description)" in system, system[-900:])
     check("[skills] the agent can read one", "SECRET-BODY-TEXT" in open(d + "/out").read())
     p.send_signal(signal.SIGTERM); p.wait(10)
-    # default AGENTS.md: an untouched old default is upgraded; an edited one is left alone
-    import importlib.util, re as _re
-    old_src = subprocess.run(["git", "-C", os.path.join(HERE, ".."), "show", "8025fbe:hobkin.py"], capture_output=True, text=True).stdout
-    old_default = _re.search(r'DEFAULT_AGENTS_MD = """(.*?)"""', old_src, _re.S).group(1)
-    for name, text, expect_upgrade in (("old-default", old_default, True), ("edited", old_default + "\nMy own rule.\n", False)):
-        h = home("agentsmd-" + name, {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
-        open(h + "/_shared/AGENTS.md", "w").write(text)
+    # shell state carries over; secrets never saved; reset; login profile on a fresh shell
+    fake_home = os.path.join(BASE, "fakehome"); os.makedirs(fake_home)
+    open(os.path.join(fake_home, ".profile"), "w").write("export LOGIN_MARK=from-profile\n")
+    h = home("shell", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+    os.environ["HOME"], real_home = fake_home, os.environ["HOME"]
+    try:
         p, aid, d = start(h)
-        now_text = open(h + "/_shared/AGENTS.md").read()
-        upgraded = "## The routine for every task" in now_text
-        check(f"[AGENTS.md] {name}: {'upgraded' if expect_upgrade else 'kept'}", upgraded == expect_upgrade and (expect_upgrade or "My own rule." in now_text))
-        p.send_signal(signal.SIGTERM); p.wait(10)
+    finally:
+        os.environ["HOME"] = real_home
+    open(d + "/secrets.env", "w").write("SECRET_TOKEN=hunter2\n")
+    def run(cmd, marker):
+        say(d, "run: " + cmd); wait_for(d, "Done. Output was: " + marker)
+    run("echo login=$LOGIN_MARK", "login=from-profile")
+    run("export A=1; B='two words'; arr=(x y); greet() { echo hi $1; }; alias ll='echo listed'; mkdir -p v/bin; "
+        "printf '#!/bin/sh\\necho venv-python\\n' > v/bin/py; chmod +x v/bin/py; export PATH=$PWD/v/bin:$PATH; cd v",
+        "[exit code 0; now in v/")
+    say(d, "run: echo A=$A B=$B arr=${arr[1]}; greet bob; ll; py; echo token=$SECRET_TOKEN")
+    wait_for(d, "    A=1 B=two words arr=y\n    hi bob\n    listed\n    venv-python\n    token=hunter2\n")
+    saved = open(d + "/shell.sh").read()
+    check("[shell] state carries over (vars, arrays, functions, aliases, PATH, folder)", True)
+    check("[shell] secrets and HOBKIN_* never saved in shell.sh", "hunter2" not in saved and "HOBKIN_WORK" not in saved and "SECRET_TOKEN" not in saved, saved[:300])
+    run("exit 3", "[exit code 3")
+    run("echo still A=$A", "still A=1")
+    say(d, 'call: bash {"command": "echo fresh A=$A login=$LOGIN_MARK; pwd", "reset": true}')
+    wait_for(d, "Done. Output was: fresh A= login=")
+    after = open(d + "/out").read().split("(fresh shell)")[-1]
+    check("[shell] reset starts fresh in the workspace", "=> (exit code 0; now in your workspace)\n    fresh A= login=from-profile" in after, after[:400])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # file tools: exact text in and out, helpful edit errors, paging; the skill tool
+    h = home("files", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"})
+    os.makedirs(h + "/_shared/skills/release/scripts")
+    open(h + "/_shared/skills/release/SKILL.md", "w").write("---\nname: release\ndescription: Ship it.\n---\n\nRun scripts/go.sh\n")
+    open(h + "/_shared/skills/release/scripts/go.sh", "w").write("echo go\n")
+    p, aid, d = start(h)
+    tricky = 'say "hi" & echo $HOME \\n `x` \'q\'\n\ttab\nline3\nline4\nline3\n'
+    def call(tool, args, marker):
+        say(d, f"call: {tool} " + json.dumps(args)); wait_for(d, marker, file="context.jsonl")
+    call("write_file", {"path": "t/a.txt", "content": tricky}, "Created ")
+    check("[files] write_file keeps text exactly", open(d + "/work/t/a.txt").read() == tricky)
+    call("read_file", {"path": "t/a.txt", "offset": 2, "limit": 2}, "showing lines 2-3 of 5")
+    call("edit_file", {"path": "t/a.txt", "old_text": "line3", "new_text": "L3"}, "appears 2 times (lines 3, 5)")
+    call("edit_file", {"path": "t/a.txt", "old_text": "    3| line3\n    4| line4", "new_text": "LINE3\nline4"}, "line numbers from read_file removed")
+    check("[files] edit with pasted line numbers still works", open(d + "/work/t/a.txt").read().endswith("LINE3\nline4\nline3\n"))
+    call("edit_file", {"path": "t/a.txt", "old_text": "lime4", "new_text": "x"}, "The closest text in the file is lines 4-4")
+    call("edit_file", {"path": "$HOBKIN_MEMORY", "old_text": "nothing", "new_text": "x"}, "The file is empty")
+    call("write_file", {"path": "$HOBKIN_MEMORY", "content": "Current task: test\n"}, "Replaced ")
+    check("[files] $HOBKIN_MEMORY path works", open(d + "/MEMORY.md").read() == "Current task: test\n")
+    call("skill", {"name": "Release"}, "Skill: release")
+    last = [m for m in ctx(d) if m["role"] == "user"][-1]["content"][0]["content"]
+    check("[skill] tool gives folder, files and instructions", d.split("/files/")[0] + "/files/_shared/skills/release" in last
+          and "scripts/go.sh" in last and "Run scripts/go.sh" in last, last)
+    call("skill", {"name": "nope"}, "No skill named 'nope'. Skills: release")
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # requests_per_minute: shared across agents on the same API/model/key
+    h = home("rpm", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
+                     "requests_per_minute": 3})
+    p1, a1, d1 = start(h); p2, a2, d2 = start(h)
+    say(d1, "one"); wait_for(d1, "echo: one")
+    say(d2, "two"); wait_for(d2, "echo: two")
+    say(d1, "three"); wait_for(d1, "echo: three")
+    say(d2, "four"); wait_for(d2, "rate limit (3/min): waiting", 10)
+    time.sleep(1)
+    check("[rpm] 4th request across two agents waits", "echo: four" not in open(d2 + "/out").read())
+    rate_files = [f for f in os.listdir(h + "/_shared") if f.startswith(".requests-")]
+    check("[rpm] one shared request log, no key in it", len(rate_files) == 1 and "test-key" not in rate_files[0]
+          and len(open(h + "/_shared/" + rate_files[0]).read().split()) == 3, rate_files)
+    say(d2, "/stop"); p2.wait(10)
+    check("[rpm] /stop works while waiting", p2.returncode == 0)
+    p1.send_signal(signal.SIGTERM); p1.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:

@@ -25,6 +25,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 """
 
 import errno
+import difflib
 import fcntl
 import hashlib
 import json
@@ -54,7 +55,8 @@ DEFAULT_CONFIG = {
             "model": "claude-sonnet-5-5",
             "key_env": "ANTHROPIC_API_KEY",
             "key_file": "~/.anthropic.key",
-            "context_tokens": None,   # optional: set to override; null = ask the API
+            "context_tokens": None,      # optional: set to override; null = ask the API
+            "requests_per_minute": None, # optional: cap, shared by every agent using this API, model and key
         },
         "openrouter": {
             "api": "openai",
@@ -87,12 +89,29 @@ You are an unattended agent running under hobkin. Nobody watches while you work.
 Your job: finish each task completely and correctly, keep your workspace
 organized, and report clearly when you're done.
 
-## Your tool: bash
+## Your tools
 
-- The shell remembers which folder you're in between calls, like a terminal,
-  and every result ends with "now in ...". Check it before writing files.
-  Variables and `export`s do not carry over: set them in the same command
-  that uses them.
+- **bash** runs commands. The shell stays as you left it between calls, like a
+  terminal: your folder, variables, exports, functions, aliases and an
+  activated Python venv all carry over. Every result ends with "now in ..."
+  (the folder you're in). If the shell gets into a bad state, such as a broken
+  PATH, run your command with `reset: true` to start a fresh shell.
+- **read_file** shows a file with line numbers, or lists a folder. Read a file
+  before you change it.
+- **write_file** creates a file or replaces all of it. **edit_file** replaces
+  one exact piece of text in a file. Use these two for every file you create or
+  change, never `echo`, heredocs or `sed`: they take your text exactly as
+  written, so you never have to escape quotes, `$` or backslashes.
+  - For edit_file, copy old_text exactly from read_file's output, without the
+    line numbers, and include two or three lines around the change so it
+    matches only once. If it says the text isn't found, read the file again;
+    don't guess.
+  - Read the result each tool shows you, and check it's what you meant.
+- **skill** opens a skill by name (see the Skills list). Always open the skill
+  before doing a task it covers, and follow its steps in order. Its files are
+  in the folder it tells you; use those full paths.
+- Paths in the file tools are relative to the folder bash is in;
+  `$HOBKIN_WORK`, `$HOBKIN_MEMORY` and `~` work too.
 - Commands are killed after a time limit. Run anything long (installs, builds,
   servers) in the background and check on it:
   `nohup make build > build.log 2>&1 &`, then later `tail -20 build.log`.
@@ -100,8 +119,6 @@ organized, and report clearly when you're done.
   Use non-interactive flags: `-y`, `git --no-pager`, `PAGER=cat`.
 - Read the output before moving on. For long output use `head`, `tail`,
   `grep` or `wc -l` rather than printing everything.
-- Write files with a heredoc (`cat > file.py <<'EOF'` ... `EOF`), then check
-  the file: run it, or `cat` it.
 
 ## The routine for every task
 
@@ -158,10 +175,9 @@ first unchecked step.
   you'll need again (paths, ids, decisions, what the operator prefers), and
   lessons learned ("tests need `make deps` first").
 - Update it when you start a task, finish an important step, or learn
-  something. Delete lines that are no longer true. Always write it by its full
-  path, rewriting the whole file:
-  `cat > "$HOBKIN_MEMORY" <<'EOF'` ... `EOF`
-  (a `MEMORY.md` anywhere else is just a file; only this one is remembered).
+  something. Delete lines that are no longer true. Write it with write_file
+  or edit_file at path `$HOBKIN_MEMORY` (a `MEMORY.md` anywhere else is just a
+  file; only this one is remembered).
 
 ## Finishing a task
 
@@ -191,24 +207,76 @@ Then stop calling tools. The next message will wake you.
 - When you're unsure what the operator wants and a wrong guess would be costly
   or hard to undo, ask and stop.
 """
-# Default AGENTS.md texts from earlier versions. An _shared/AGENTS.md that still
-# matches one exactly was never edited, so it's replaced with the current default.
-OLD_DEFAULT_AGENTS_MD = {"bea84f43ecbc3e0deb4b3cf32316d68ad0400cb5a6d45933f9f91a1c72fce5ee"}
+TOOLS = [
+    {"name": "bash",
+     "description": ("Run a bash command. You get its output (stdout and stderr), its exit code and the folder "
+                     "you're now in. The shell stays as you left it between calls, like a terminal: the folder, "
+                     "variables, exports, functions, aliases and an activated venv all carry over. It starts as a "
+                     "login shell. Don't use it to write or edit files: use write_file and edit_file."),
+     "input_schema": {"type": "object", "properties": {
+         "command": {"type": "string", "description": "The command to run."},
+         "timeout": {"type": "integer", "description": "Seconds before it's killed (default and maximum: the configured limit)."},
+         "reset": {"type": "boolean", "description": "Start a fresh login shell first, in your workspace (use if the shell is in a bad state)."}},
+         "required": ["command"]}},
+    {"name": "read_file",
+     "description": ("Show a file with line numbers (or list a folder). Long files come in pages: use offset "
+                     "and limit to read more. Paths are relative to your shell's current folder; $HOBKIN_WORK, "
+                     "$HOBKIN_MEMORY and ~ work."),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "offset": {"type": "integer", "description": "First line to show (1 = the start)."},
+         "limit": {"type": "integer", "description": "How many lines to show (default 400)."}},
+         "required": ["path"]}},
+    {"name": "write_file",
+     "description": ("Create a file, or replace everything in it, with exactly the text you give (no escaping "
+                     "needed). Folders are created as needed."),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "content": {"type": "string", "description": "The whole new content of the file."}},
+         "required": ["path", "content"]}},
+    {"name": "edit_file",
+     "description": ("Replace one exact piece of text in a file. old_text must match the file exactly (copy it "
+                     "from read_file, without the line numbers) and appear only once: include a few lines around "
+                     "the change to make it unique. replace_all changes every match instead."),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "old_text": {"type": "string", "description": "The exact text to find."},
+         "new_text": {"type": "string", "description": "What to put there instead."},
+         "replace_all": {"type": "boolean"}},
+         "required": ["path", "old_text", "new_text"]}},
+    {"name": "skill",
+     "description": "Open a skill by name: its instructions, its folder and its files. Open the skill before a task it covers.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+]
 
-BASH_TOOL = {
-    "name": "bash",
-    "description": ("Run a bash command and get its output (stdout and stderr), its exit code and the folder "
-                    "you're now in. The shell keeps its current folder between calls, like a terminal; "
-                    "variables and exports do not carry over."),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "The command to run."},
-            "timeout": {"type": "integer", "description": "Seconds before it's killed (default and maximum: the configured limit)."},
-        },
-        "required": ["command"],
-    },
+# Saved after every command, restored before the next: the shell's folder, variables,
+# functions and aliases (see run_bash). Bash's own variables and readonly ones are skipped.
+SHELL_SAVE = r"""__hobkin_save() {
+  pwd > "$__hobkin_cwd"
+  (
+    umask 077
+    {
+      for __f in $(compgen -A function); do
+        case $__f in __hobkin*) ;; *) declare -f "$__f" ;; esac
+      done
+      alias -p
+      for __v in $(compgen -v); do
+        case " $HOBKIN_NOSAVE " in *" $__v "*) continue ;; esac
+        case $__v in
+          BASH*|FUNCNAME|PIPESTATUS|RANDOM|SRANDOM|SECONDS|LINENO|SHLVL|PPID|UID|EUID|GROUPS|HOSTNAME|\
+          HOSTTYPE|OSTYPE|MACHTYPE|_|PWD|OLDPWD|SHELLOPTS|BASHOPTS|DIRSTACK|EPOCHREALTIME|EPOCHSECONDS|\
+          COLUMNS|LINES|HISTCMD|OPTIND|OPTARG|OPTERR|IFS|PS1|PS2|PS4|COMP_*|__*) continue ;;
+        esac
+        __d=$(declare -p "$__v" 2>/dev/null) || continue
+        [[ $__d =~ ^declare\ -[a-zA-Z]*r ]] && continue
+        printf '%s\n' "$__d"
+      done
+    } > "$__hobkin_state.tmp" 2>/dev/null && mv -f "$__hobkin_state.tmp" "$__hobkin_state"
+  )
 }
+trap __hobkin_save EXIT
+shopt -s expand_aliases
+"""
 
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt")
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524, 529}
@@ -299,9 +367,8 @@ def ensure_shared():
     os.makedirs(os.path.join(SHARED, "skills"), exist_ok=True)
     if not os.path.exists(os.path.join(SHARED, "config.json")):
         write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
-    agents_md = os.path.join(SHARED, "AGENTS.md")
-    if not os.path.exists(agents_md) or hashlib.sha256(read(agents_md).encode()).hexdigest() in OLD_DEFAULT_AGENTS_MD:
-        write_atomic(agents_md, DEFAULT_AGENTS_MD)
+    if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
+        write_atomic(os.path.join(SHARED, "AGENTS.md"), DEFAULT_AGENTS_MD)
 
 
 def is_running(agent_dir):
@@ -359,6 +426,27 @@ class Model:
             h["authorization"] = f"Bearer {self.key}"
         return h
 
+    def rate_file(self):
+        """Request log shared by every agent that uses this API, model and key (the key only hashed)."""
+        tag = hashlib.sha256(f"{self.base}|{self.model}|{self.key}".encode()).hexdigest()[:16]
+        return os.path.join(SHARED, f".requests-{tag}")
+
+    def rate_slot(self, rpm):
+        """Claim a request slot under the per-minute cap: 0 if claimed, else seconds to wait."""
+        path = self.rate_file()
+        with open(path, "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            now_t = time.time()
+            recent = [float(x) for x in f.read().split() if now_t - float(x) < 60]
+            if len(recent) >= rpm:
+                return max(0.1, min(recent) + 60 - now_t)
+            recent.append(now_t)
+            f.seek(0)
+            f.truncate()
+            f.write("\n".join(f"{t:.3f}" for t in recent) + "\n")
+            return 0
+
     def describe(self):
         return f"{self.name} ({self.model} via {self.base})"
 
@@ -399,7 +487,7 @@ class Model:
         return None, None, None
 
     # --- one request
-    def call(self, system, messages, max_tokens, tools=(BASH_TOOL,), tool_choice=None):
+    def call(self, system, messages, max_tokens, tools=TOOLS, tool_choice=None):
         """Returns (content_blocks, stop_reason, input_tokens)."""
         if self.api == "anthropic":
             msgs = json.loads(json.dumps(messages))
@@ -596,9 +684,9 @@ class Agent:
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
         if skills:
             parts.append("# Skills\n\nA skill is a set of instructions (and sometimes scripts) for one kind of task. "
-                         "Before you start a task that a skill below covers, read its SKILL.md with `cat` and follow it. "
-                         "Paths it mentions are relative to the skill's folder.\n\n"
-                         + "\n".join(f"- **{n}**: {d} ({p})" for n, (d, p) in sorted(skills.items())))
+                         "Before you start a task that a skill below covers, open it with the `skill` tool and follow "
+                         "it step by step.\n\n"
+                         + "\n".join(f"- **{n}**: {d}" for n, (d, p) in sorted(skills.items())))
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\n{memory or '(empty)'}")
         return "\n\n---\n\n".join(parts)
@@ -719,6 +807,9 @@ class Agent:
                                            ("status", "model", "context_tokens", "last_input_tokens", "compactions")}))
 
     # --- tools
+    def secret_names(self):
+        return list(load_env_file(os.path.join(SHARED, "secrets.env"))) + list(load_env_file(self.p("secrets.env")))
+
     def tool_env(self):
         env = dict(os.environ)
         env.pop(self.model.cfg.get("key_env") or "", None)   # the model key isn't the agent's to use
@@ -728,19 +819,39 @@ class Agent:
                     "HOBKIN_MEMORY": self.p("MEMORY.md")})
         return env
 
-    def run_bash(self, command, timeout):
+    def cwd(self):
+        cwd = self.state.get("cwd") or self.work
+        return cwd if os.path.isdir(cwd) else self.work
+
+    def where(self, cwd):
+        rel = os.path.relpath(cwd, self.work)
+        return "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
+
+    def run_bash(self, command, timeout=None, reset=False):
+        """Each command is its own bash process, so a hung or crashed one can't take the shell
+        with it. The shell still behaves like one that persists: the first runs as a login shell,
+        and every command starts from the state the last one left (shell.sh)."""
         limit = int(self.cfg["bash_timeout"])
         timeout = max(1, min(int(timeout or limit), limit))
-        cwd = self.state.get("cwd") or self.work
-        if not os.path.isdir(cwd):
-            cwd = self.work
-        self.log("$", command)
+        state_file, cwd_file = self.p("shell.sh"), self.p(".cwd")
+        if reset:
+            for f in (state_file, cwd_file):
+                if os.path.exists(f):
+                    os.remove(f)
+            self.state["cwd"] = self.work
+        cwd = self.cwd()
+        self.log("$", ("(fresh shell) " if reset else "") + command)
         self.interrupt = False
-        cwd_file = self.p(".cwd")
-        # The shell keeps its folder between calls, like a terminal: record where it ends up
-        script = f"trap 'pwd > {shlex.quote(cwd_file)}' EXIT\n{command}"
+        env = self.tool_env()
+        env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
+                                                              "HOBKIN_MEMORY", "HOBKIN_NOSAVE"])
+        restore = os.path.exists(state_file)
+        script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
+                  + (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if restore else "")
+                  + SHELL_SAVE + command)
+        argv = ["bash", "-c", script] if restore else ["bash", "--login", "-c", script]
         with tempfile.TemporaryFile() as outf:
-            proc = subprocess.Popen(["bash", "-c", script], cwd=cwd, env=self.tool_env(),
+            proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                     stdin=subprocess.DEVNULL, stdout=outf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
             start, reason = time.time(), None
@@ -777,18 +888,166 @@ class Agent:
         if new_cwd and os.path.isdir(new_cwd):
             cwd = new_cwd
         self.state["cwd"] = cwd
-        rel = os.path.relpath(cwd, self.work)
-        where = "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
-        status = (reason or f"exit code {proc.returncode}") + f"; now in {where}"
+        status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)}"
         shown = out if len(out) < 2000 else out[:1000] + "\n...\n" + out[-800:]
         self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
         return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
+
+    def resolve(self, path):
+        """A tool path: $HOBKIN_* and ~ expanded, relative to the shell's current folder."""
+        names = {"HOBKIN_WORK": self.work, "HOBKIN_DIR": self.dir, "HOBKIN_MEMORY": self.p("MEMORY.md"),
+                 "HOME": os.path.expanduser("~")}
+        path = re.sub(r"\$\{?(HOBKIN_WORK|HOBKIN_DIR|HOBKIN_MEMORY|HOME)\}?", lambda m: names[m.group(1)], path.strip())
+        return os.path.normpath(os.path.join(self.cwd(), os.path.expanduser(path)))
+
+    def read_file(self, path, offset=None, limit=None):
+        full = self.resolve(path)
+        if os.path.isdir(full):
+            entries = sorted(os.listdir(full))
+            shown = [e + ("/" if os.path.isdir(os.path.join(full, e)) else "") for e in entries[:500]]
+            return f"{full} (folder, {len(entries)} entries):\n" + "\n".join(shown), False
+        if not os.path.isfile(full):
+            return f"No such file: {full}", True
+        data = open(full, "rb").read()
+        if b"\0" in data[:8000]:
+            return f"{full} is a binary file ({len(data)} bytes); not shown.", True
+        lines = data.decode(errors="replace").splitlines()
+        start = max(1, int(offset or 1))
+        count = max(1, int(limit or 400))
+        chunk = lines[start - 1:start - 1 + count]
+        body = "\n".join(f"{n:>5}| {l[:2000]}" for n, l in enumerate(chunk, start))
+        end = start + len(chunk) - 1
+        if not lines:
+            return f"{full} is empty.", False
+        more = f" (showing lines {start}-{end} of {len(lines)}; use offset={end + 1} for more)" if end < len(lines) or start > 1 else ""
+        return f"{full}{more}:\n{body}", False
+
+    def write_file(self, path, content):
+        full = self.resolve(path)
+        existed = os.path.exists(full)
+        if os.path.isdir(full):
+            return f"{full} is a folder.", True
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+        n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+        note = ""
+        if "\n" not in content and "\\n" in content and len(content) > 80:
+            note = ("\nNote: the file has no line breaks but contains the characters \\n. "
+                    "If you meant new lines, write real line breaks in content.")
+        return f"{'Replaced' if existed else 'Created'} {full} ({n} lines){note}", False
+
+    def edit_file(self, path, old, new, replace_all=False):
+        full = self.resolve(path)
+        if not os.path.isfile(full):
+            return f"No such file: {full}. Use write_file to create it.", True
+        text = open(full, encoding="utf-8", errors="replace").read()
+        if not old:
+            return "old_text is empty. To write a whole file use write_file.", True
+        note = ""
+        if old not in text:
+            # Common slips: line numbers copied from read_file, or Windows line endings
+            stripped = re.sub(r"(?m)^\s*\d+\| ?", "", old)
+            if stripped != old and stripped in text:
+                old, new, note = stripped, re.sub(r"(?m)^\s*\d+\| ?", "", new), " (line numbers from read_file removed)"
+            elif "\r\n" in text and old.replace("\n", "\r\n") in text:
+                old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+        count = text.count(old)
+        if count == 0:
+            return "old_text isn't in the file (it must match exactly, including spaces and indentation)." \
+                + self.closest(text, old), True
+        if count > 1 and not replace_all:
+            lines = [text.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old), text)]
+            return (f"old_text appears {count} times (lines {', '.join(map(str, lines[:20]))}). Include more of the "
+                    "surrounding lines so it matches once, or set replace_all."), True
+        first = text.index(old)
+        text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(text)
+        # Show the result around the (first) change, so it can be checked
+        lines = text.splitlines()
+        at = text.count("\n", 0, first)
+        lo, hi = max(0, at - 3), min(len(lines), at + new.count("\n") + 4)
+        shown = "\n".join(f"{n:>5}| {l}" for n, l in enumerate(lines[lo:hi], lo + 1))
+        return f"Edited {full}{' (' + str(count) + ' places)' if replace_all and count > 1 else ''}{note}. Now:\n{shown}", False
+
+    @staticmethod
+    def closest(text, old):
+        """Where the file has text most like old_text, to show in an error."""
+        lines, want = text.splitlines(), old.strip("\n").splitlines()
+        if not lines:
+            return " The file is empty: use write_file to give it content."
+        if not want or len(lines) > 20000:
+            return ""
+        n, target, best = len(want), "\n".join(want), (0.0, 0)
+        for i in range(max(1, len(lines) - n + 1)):
+            m = difflib.SequenceMatcher(None, "\n".join(lines[i:i + n]), target)
+            if m.real_quick_ratio() > best[0] and m.quick_ratio() > best[0]:
+                r = m.ratio()
+                if r > best[0]:
+                    best = (r, i)
+        if best[0] < 0.5:
+            return " Nothing similar found: read_file it again and copy the text exactly."
+        i = best[1]
+        shown = "\n".join(f"{k:>5}| {l}" for k, l in enumerate(lines[i:i + n], i + 1))
+        return f" The closest text in the file is lines {i + 1}-{i + n}:\n{shown}"
+
+    def open_skill(self, name):
+        skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
+        key = name.strip().lower()
+        match = next((n for n in skills if n.lower() == key), None)
+        if not match:
+            return f"No skill named {name!r}. Skills: {', '.join(sorted(skills)) or 'none'}.", True
+        desc, path = skills[match]
+        folder = os.path.dirname(path)
+        files = []
+        for root, dirs, names in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            files += [os.path.relpath(os.path.join(root, f), folder) for f in names if not f.startswith(".")]
+        files = sorted(files)
+        return (f"Skill: {match}\nFolder: {folder}\nFiles: {', '.join(files[:100])}\n"
+                f"Paths in these instructions are relative to that folder: use {folder}/<path>.\n\n{read(path)}"), False
+
+    def run_tool(self, name, inp):
+        """(result text, is_error) for one tool call."""
+        try:
+            if name == "bash":
+                return self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")))
+            if name == "read_file":
+                self.log("read", str(inp.get("path")))
+                return self.read_file(str(inp["path"]), inp.get("offset"), inp.get("limit"))
+            if name == "write_file":
+                result = self.write_file(str(inp["path"]), str(inp["content"]))
+                self.log("write", result[0])
+                return result
+            if name == "edit_file":
+                result = self.edit_file(str(inp["path"]), str(inp["old_text"]), str(inp["new_text"]), bool(inp.get("replace_all")))
+                self.log("edit", result[0])
+                return result
+            if name == "skill":
+                self.log("skill", str(inp.get("name")))
+                return self.open_skill(str(inp["name"]))
+            return f"Unknown tool {name!r}. Tools: {', '.join(t['name'] for t in TOOLS)}.", True
+        except KeyError as e:
+            return f"Missing argument {e} for {name}.", True
+        except (OSError, ValueError, TypeError) as e:
+            return f"{name} failed: {e}", True
 
     # --- the model
     def ask(self, messages, tool_choice=None):
         """Call the model, retrying transient failures. Raises ApiError for real ones."""
         delay = 2
         while True:
+            rpm = self.model.cfg.get("requests_per_minute")
+            if rpm:
+                wait = self.model.rate_slot(int(rpm))
+                if wait:
+                    self.log("hobkin", f"rate limit ({rpm}/min): waiting {wait:.0f}s")
+                    self.save_state("waiting (rate limit)")
+                    self.poll_input(wait)
+                    if self.stop:
+                        raise ApiError(0, "stopping")
+                    continue
             try:
                 blocks, stop_reason, used = self.model.call(self.system_prompt(), messages, self.max_output(),
                                                             tool_choice=tool_choice)
@@ -811,7 +1070,15 @@ class Agent:
     def needs_compaction(self):
         ctx = self.state.get("context_tokens")
         used = self.state.get("last_input_tokens") or 0
-        return bool(ctx) and used > float(self.cfg["compact_at"]) * (ctx - self.max_output())
+        if not ctx or used <= float(self.cfg["compact_at"]) * (ctx - self.max_output()):
+            return False
+        if len(self.messages) <= 2:   # nothing left to compact: the instructions themselves are the bulk
+            if not self.state.get("warned_small_context"):
+                self.log("hobkin", f"warning: the instructions alone use about {used} of {ctx} tokens; "
+                         "this model's context window is too small to work well")
+                self.state["warned_small_context"] = True
+            return False
+        return True
 
     def compact(self, why):
         """Replace the conversation with the agent's own summary of it; archive the old one."""
@@ -913,11 +1180,8 @@ class Agent:
         for b in calls:
             if self.stop:
                 content, err = "Not run: hobkin is stopping.", True
-            elif b.get("name") != "bash":
-                content, err = f"Unknown tool {b.get('name')!r}; the only tool is bash.", True
             else:
-                inp = b.get("input") or {}
-                content, err = self.run_bash(str(inp.get("command", "")), inp.get("timeout"))
+                content, err = self.run_tool(b.get("name"), b.get("input") or {})
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
         # Operator messages that came in meanwhile ride along with the results
         for text in self.pending:

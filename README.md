@@ -53,6 +53,7 @@ tmux, or a systemd user service.
 | `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. |
+| `shell.sh` | Its shell's saved state (folder, variables, functions, aliases), restored before each command. Secrets are never saved here. |
 | `secrets.env` | Optional `KEY=value` lines, set as environment variables in its shell (never put in its context). |
 | `config.json` | Optional per-agent settings over the shared ones. |
 | `*.md` | Optional per-agent instructions; replace shared files of the same name. |
@@ -87,9 +88,10 @@ or reference files. Install one by copying its folder into
 ~/.hobkins/_shared/skills/release/build.sh
 ```
 
-The prompt lists only each skill's name, description and path. The agent reads
-the full `SKILL.md` (with `cat`) when a task calls for it, so dozens of skills
-cost a line each.
+The prompt lists only each skill's name and description. When a task calls for
+one, the agent opens it with the `skill` tool. That gives it the instructions,
+the skill's folder as a full path, and its list of files, so it never has to
+work out where scripts live. Dozens of skills cost a line each.
 
 - An agent's own `skills/` folder can add skills, or replace a shared one with the
   same name.
@@ -135,6 +137,11 @@ operator]". A line that is just one of these is a command instead:
 - The key comes from the environment variable `key_env`, or else from the file
   `key_file`. It's removed from the agent's shell environment.
 - `headers` (optional): extra HTTP headers.
+- `requests_per_minute` (optional): a cap on calls to this model. It's shared by
+  every agent using the same API, model and key, because that's what the
+  provider counts. The agents coordinate through a small lock file in
+  `_shared/` (holding a hash of the key, never the key). An agent at the cap
+  waits, and still answers commands such as `/stop` while it does.
 
 **The context window is asked for, not hard-coded.** At start-up hobkin asks the API:
 
@@ -159,17 +166,36 @@ Other settings (shared or per agent): `bash_timeout` (600 s per command),
 `max_output_tokens` (16,000, capped at what the API reports), and
 `idle_prompt` / `idle_seconds` (see below).
 
-## Its one tool
+## Its tools
 
-`bash`, run as your user, starting in `work/`. The shell keeps its current
-folder between calls, like a terminal: every result ends with where it now is,
-and that's remembered across restarts. Variables don't carry over. The
-environment has `secrets.env` plus `HOBKIN_ID`, `HOBKIN_DIR`, `HOBKIN_WORK` and
-`HOBKIN_MEMORY` (the path of its `MEMORY.md`). That's enough for git, tests,
-`curl` to any API, and editing its own `MEMORY.md`. **Nothing asks for
-approval:** an agent can do anything your account can. Agents in one account
-stay apart by convention (their own folders), not by enforcement. Use a
-separate account or container when that matters.
+- **`bash`** runs as your user, starting in `work/`. It behaves like one shell
+  that stays open:
+  - The first command runs as a login shell (your profile's PATH and so on).
+  - After every command, its state is saved to `shell.sh`: the folder,
+    variables, exports, functions and aliases. The next command starts from that
+    state. So `cd`, `export` and `source .venv/bin/activate` carry over, even
+    across restarts.
+  - Each command is still its own process, so a hung or crashed command can't
+    take the shell's state with it. Shell options like `set -e` don't carry over.
+  - `reset: true` starts a fresh login shell in `work/`.
+  - Every result ends with the folder it's now in.
+  - The environment has `secrets.env` plus `HOBKIN_ID`, `HOBKIN_DIR`,
+    `HOBKIN_WORK` and `HOBKIN_MEMORY`.
+- **`read_file`** shows a file with line numbers (in pages), or lists a folder.
+- **`write_file`** writes a whole file. **`edit_file`** replaces one exact piece
+  of text. The text goes in as is, with no shell quoting, which is where smaller
+  models most often go wrong.
+  - Errors are written to help: "appears 2 times (lines 3, 5)", or the closest
+    matching lines when the text isn't found.
+  - Line numbers pasted from `read_file` are stripped automatically, and
+    Windows line endings are handled.
+  - Paths are relative to the shell's folder; `$HOBKIN_WORK`, `$HOBKIN_MEMORY`
+    and `~` work.
+- **`skill`** opens a skill by name.
+
+**Nothing asks for approval:** an agent can do anything your account can. Agents
+in one account stay apart by convention (their own folders), not by enforcement.
+Use a separate account or container when that matters.
 
 ## Waking up when idle
 
@@ -216,4 +242,10 @@ nothing and don't need a key. They cover both API styles:
   mid-command;
 - stopping and resuming, and recovery after a crash mid-command;
 - compaction, learning the window from an error, and the newest request
-  surviving compaction.
+  surviving compaction;
+- the shell's saved state (variables, arrays, functions, aliases, PATH, folder,
+  login profile, `reset`), with secrets never saved;
+- the file tools (exact text with quotes, `$` and backslashes; repeated and
+  missing matches; pasted line numbers; paging) and the skill tool;
+- skills (listing, which copy wins, front matter);
+- `requests_per_minute` shared across two agents.
