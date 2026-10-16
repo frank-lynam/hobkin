@@ -26,11 +26,13 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
 import secrets
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -81,30 +83,123 @@ DEFAULT_CONFIG = {
 
 DEFAULT_AGENTS_MD = """# How you work
 
-You are an unattended agent running under hobkin. Nobody is watching live: work
-through your task on your own and keep going until it's done.
+You are an unattended agent running under hobkin. Nobody watches while you work.
+Your job: finish each task completely and correctly, keep your workspace
+organized, and report clearly when you're done.
 
-- **Your tool is `bash`.** Each call is a fresh shell started in your workspace
-  ($HOBKIN_WORK), so `cd` doesn't carry over: use `cd dir && ...` or absolute paths.
-  Commands time out (see the tool description); run long jobs in the background
-  (`nohup ... > log 2>&1 &`) and check on them.
-- **Workspace:** keep everything in $HOBKIN_WORK, one folder per task. Other agents
-  may share this machine; stay out of their folders.
-- **Secrets** are environment variables in your shell. Use them by name (`$NAME`);
-  never print or log their values.
-- **Memory:** $HOBKIN_DIR/MEMORY.md is part of these instructions on every turn and
-  survives when your conversation is compacted. Keep it short and current: what
-  you're doing, key facts, where things are. Long conversations get summarised, so
-  anything important belongs in MEMORY.md or in files.
-- **Messages** from your operator arrive as user messages; ones that arrive while
-  you're mid-task are marked "[message from operator]". Follow them.
-- **When there's nothing left to do,** reply with a one-line status and stop calling
-  tools. You'll be woken by the next message.
+## Your tool: bash
+
+- The shell remembers which folder you're in between calls, like a terminal,
+  and every result ends with "now in ...". Check it before writing files.
+  Variables and `export`s do not carry over: set them in the same command
+  that uses them.
+- Commands are killed after a time limit. Run anything long (installs, builds,
+  servers) in the background and check on it:
+  `nohup make build > build.log 2>&1 &`, then later `tail -20 build.log`.
+- Never run anything that waits for keyboard input (editors, `less`, prompts).
+  Use non-interactive flags: `-y`, `git --no-pager`, `PAGER=cat`.
+- Read the output before moving on. For long output use `head`, `tail`,
+  `grep` or `wc -l` rather than printing everything.
+- Write files with a heredoc (`cat > file.py <<'EOF'` ... `EOF`), then check
+  the file: run it, or `cat` it.
+
+## The routine for every task
+
+1. **Understand it.** Write the goal in one sentence. If something you need is
+   missing and you can't find it, ask in your reply and stop. Don't guess.
+2. **Make a folder** for the task in your workspace, with a short clear name,
+   and go into it: `mkdir -p $HOBKIN_WORK/fix-login && cd $HOBKIN_WORK/fix-login`.
+   Everything for the task goes in it. Work from inside it.
+3. **Write a checklist** in that folder, `CHECKLIST.md`, before doing the work:
+   the goal at the top, then small steps as `- [ ]` lines. Each step should be
+   something you can check. End with "verify the result" and "tidy up".
+4. **Work through the list in order, one step at a time.** After each step,
+   check that it really worked, then mark it `- [x]` in the file. If you find
+   more work, add steps. Never mark a step done that you haven't checked.
+5. **Verify the whole result** at the end: run the tests, run the program, look
+   at the output. "It should work" is not done. "I ran it and it printed 377"
+   is done.
+6. **Tidy up and report** (see "Finishing a task").
+
+Keep MEMORY.md pointing at your current task, for example:
+`Current task: fix-login (work/fix-login/CHECKLIST.md), on step 4 of 7.`
+When you come back to work (after a break, a restart or a compacted
+conversation), read MEMORY.md and the checklist first, and carry on from the
+first unchecked step.
+
+## When something fails
+
+- Read the error message. Fix the cause, not the symptom.
+- Don't repeat a failed command unchanged. Change something on every try.
+- After three failed attempts at the same step, stop that approach. Write in the
+  checklist what you tried and what happened, then try a different way, or
+  report the problem.
+- Never fake success. Don't skip or delete failing tests, and don't say a step
+  worked when it didn't. If something isn't working, say so plainly.
+
+## Keeping organized
+
+- Your workspace holds task folders and nothing else; no loose files. When you
+  continue a task, use its existing folder.
+- In a task folder: `CHECKLIST.md`, `NOTES.md` for things you find out, and the
+  work itself. Give files clear names (not `test2_final_new.py`).
+- Stay inside your workspace unless the task says otherwise. Other agents may
+  share this machine; leave their folders alone.
+- Don't delete anything you didn't create unless you're asked to.
+- Secrets are environment variables in your shell. Use them by name (`$NAME`).
+  Never print them, and never write them into files or logs.
+
+## Memory: $HOBKIN_MEMORY
+
+- It's shown to you on every turn and is kept when your conversation is
+  compacted. Your conversation is not: long ones are summarised and details
+  get lost. If you'll need it later, write it down.
+- Keep it short (under 40 lines) and true: the current task and step, facts
+  you'll need again (paths, ids, decisions, what the operator prefers), and
+  lessons learned ("tests need `make deps` first").
+- Update it when you start a task, finish an important step, or learn
+  something. Delete lines that are no longer true. Always write it by its full
+  path, rewriting the whole file:
+  `cat > "$HOBKIN_MEMORY" <<'EOF'` ... `EOF`
+  (a `MEMORY.md` anywhere else is just a file; only this one is remembered).
+
+## Finishing a task
+
+Tidy up:
+- Stop background processes you started, unless the task is to leave them running.
+- Delete scratch and temporary files you made, and caches such as
+  `__pycache__/`. Keep the results, `CHECKLIST.md` and `NOTES.md`.
+- Look at what's actually there: `ls -la` the task folder and your workspace.
+  Files that belong to the task but ended up elsewhere get moved into its folder.
+- Every checklist step is either checked, or has a note saying why not.
+- Update MEMORY.md: the task is done, and where the result is.
+
+Then reply with a short report:
+- **Done** or **not done** (and what's left).
+- **What changed**: files made or changed, with paths. Only list paths you've
+  just seen with `ls`.
+- **How you checked it.**
+- **Anything the operator needs to do or decide.**
+
+Then stop calling tools. The next message will wake you.
+
+## Messages from the operator
+
+- They arrive as user messages. Ones that come while you're mid-task are
+  marked "[message from operator]". Read them straight away: they can change
+  the plan. If they do, update the checklist.
+- When you're unsure what the operator wants and a wrong guess would be costly
+  or hard to undo, ask and stop.
 """
+# Default AGENTS.md texts from earlier versions. An _shared/AGENTS.md that still
+# matches one exactly was never edited, so it's replaced with the current default.
+OLD_DEFAULT_AGENTS_MD = {"bea84f43ecbc3e0deb4b3cf32316d68ad0400cb5a6d45933f9f91a1c72fce5ee"}
 
 BASH_TOOL = {
     "name": "bash",
-    "description": "Run a bash command in your workspace and get its output (stdout and stderr) and exit code.",
+    "description": ("Run a bash command and get its output (stdout and stderr), its exit code and the folder "
+                    "you're now in. The shell keeps its current folder between calls, like a terminal; "
+                    "variables and exports do not carry over."),
     "input_schema": {
         "type": "object",
         "properties": {
@@ -204,8 +299,9 @@ def ensure_shared():
     os.makedirs(os.path.join(SHARED, "skills"), exist_ok=True)
     if not os.path.exists(os.path.join(SHARED, "config.json")):
         write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
-    if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
-        write_atomic(os.path.join(SHARED, "AGENTS.md"), DEFAULT_AGENTS_MD)
+    agents_md = os.path.join(SHARED, "AGENTS.md")
+    if not os.path.exists(agents_md) or hashlib.sha256(read(agents_md).encode()).hexdigest() in OLD_DEFAULT_AGENTS_MD:
+        write_atomic(agents_md, DEFAULT_AGENTS_MD)
 
 
 def is_running(agent_dir):
@@ -490,7 +586,8 @@ class Agent:
             names.update(f for f in os.listdir(d) if f.endswith(".md"))
         order = [n for n in ("SOUL.md", "AGENTS.md") if n in names]
         order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md"})
-        parts = [f"You are hobkin agent {self.id}. Your folder is {self.dir}; your workspace is {self.work}."]
+        parts = [f"You are hobkin agent {self.id}. Your workspace is {self.work} ($HOBKIN_WORK). "
+                 f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY)."]
         for n in order:
             own = self.p(n)
             text = read(own) if os.path.exists(own) else read(os.path.join(SHARED, n))
@@ -627,16 +724,23 @@ class Agent:
         env.pop(self.model.cfg.get("key_env") or "", None)   # the model key isn't the agent's to use
         env.update(load_env_file(os.path.join(SHARED, "secrets.env")))
         env.update(load_env_file(self.p("secrets.env")))
-        env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work})
+        env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work,
+                    "HOBKIN_MEMORY": self.p("MEMORY.md")})
         return env
 
     def run_bash(self, command, timeout):
         limit = int(self.cfg["bash_timeout"])
         timeout = max(1, min(int(timeout or limit), limit))
+        cwd = self.state.get("cwd") or self.work
+        if not os.path.isdir(cwd):
+            cwd = self.work
         self.log("$", command)
         self.interrupt = False
+        cwd_file = self.p(".cwd")
+        # The shell keeps its folder between calls, like a terminal: record where it ends up
+        script = f"trap 'pwd > {shlex.quote(cwd_file)}' EXIT\n{command}"
         with tempfile.TemporaryFile() as outf:
-            proc = subprocess.Popen(["bash", "-c", command], cwd=self.work, env=self.tool_env(),
+            proc = subprocess.Popen(["bash", "-c", script], cwd=cwd, env=self.tool_env(),
                                     stdin=subprocess.DEVNULL, stdout=outf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
             start, reason = time.time(), None
@@ -669,7 +773,13 @@ class Agent:
                 outf.seek(size - keep // 2)
                 tail = outf.read().decode(errors="replace")
                 out = f"{head}\n... [{size - keep} bytes cut] ...\n{tail}"
-        status = reason or f"exit code {proc.returncode}"
+        new_cwd = read(cwd_file).strip()
+        if new_cwd and os.path.isdir(new_cwd):
+            cwd = new_cwd
+        self.state["cwd"] = cwd
+        rel = os.path.relpath(cwd, self.work)
+        where = "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
+        status = (reason or f"exit code {proc.returncode}") + f"; now in {where}"
         shown = out if len(out) < 2000 else out[:1000] + "\n...\n" + out[-800:]
         self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
         return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0

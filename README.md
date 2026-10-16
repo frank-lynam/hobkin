@@ -60,7 +60,9 @@ tmux, or a systemd user service.
 | `queue`, `lock` | Messages sent while it was stopped; the process lock. |
 
 `~/.hobkins/_shared/` holds what all agents share: `config.json`, `AGENTS.md` (how
-to work as a hobkin; created on first run, edit freely), an optional `SOUL.md`,
+to work as a hobkin: a task routine with checklists, failure handling,
+organization, memory and tidying up; created on first run, edit freely. Once
+edited it's never touched; an untouched copy of an older default is upgraded), an optional `SOUL.md`,
 any other `.md` instructions, and `secrets.env`.
 
 **The system prompt** is:
@@ -159,8 +161,11 @@ Other settings (shared or per agent): `bash_timeout` (600 s per command),
 
 ## Its one tool
 
-`bash`, run in `work/` as your user, with `secrets.env` in the environment plus
-`HOBKIN_ID`, `HOBKIN_DIR` and `HOBKIN_WORK`. That's enough for git, tests,
+`bash`, run as your user, starting in `work/`. The shell keeps its current
+folder between calls, like a terminal: every result ends with where it now is,
+and that's remembered across restarts. Variables don't carry over. The
+environment has `secrets.env` plus `HOBKIN_ID`, `HOBKIN_DIR`, `HOBKIN_WORK` and
+`HOBKIN_MEMORY` (the path of its `MEMORY.md`). That's enough for git, tests,
 `curl` to any API, and editing its own `MEMORY.md`. **Nothing asks for
 approval:** an agent can do anything your account can. Agents in one account
 stay apart by convention (their own folders), not by enforcement. Use a

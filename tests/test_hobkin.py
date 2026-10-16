@@ -52,6 +52,15 @@ try:
         c = ctx(d)
         check(f"[{api}] context file: system + 4 messages", [m["role"] for m in c] == ["system", "user", "assistant", "user", "assistant"], [m["role"] for m in c])
         check(f"[{api}] model key hidden from the shell", "KEY=unset" in open(d + "/out").read())
+        # the shell keeps its folder between calls (and says where it is)
+        say(d, "run: mkdir -p sub/deeper && cd sub/deeper")
+        wait_for(d, "now in sub/deeper/ in your workspace")
+        say(d, "run: pwd && echo $HOBKIN_MEMORY")
+        wait_for(d, "    " + d + "/work/sub/deeper\n    " + d + "/MEMORY.md")
+        check(f"[{api}] cd carries over; HOBKIN_MEMORY set", True)
+        say(d, "run: cd .. && rmdir deeper")
+        wait_for(d, "now in sub/ in your workspace")
+        say(d, "run: cd $HOBKIN_WORK && echo back-home"); wait_for(d, "Done. Output was: back-home")
         # secrets + live send via CLI
         open(d + "/secrets.env", "w").write("FOO=bar\n")
         r = subprocess.run([sys.executable, HOB, "send", aid, "run: echo FOO=$FOO"], env={**os.environ, "HOBKIN_HOME": h}, capture_output=True, text=True)
@@ -153,6 +162,18 @@ try:
     check("[skills] folder name used when there's no front matter", "**nofront**: (no description)" in system, system[-900:])
     check("[skills] the agent can read one", "SECRET-BODY-TEXT" in open(d + "/out").read())
     p.send_signal(signal.SIGTERM); p.wait(10)
+    # default AGENTS.md: an untouched old default is upgraded; an edited one is left alone
+    import importlib.util, re as _re
+    old_src = subprocess.run(["git", "-C", os.path.join(HERE, ".."), "show", "8025fbe:hobkin.py"], capture_output=True, text=True).stdout
+    old_default = _re.search(r'DEFAULT_AGENTS_MD = """(.*?)"""', old_src, _re.S).group(1)
+    for name, text, expect_upgrade in (("old-default", old_default, True), ("edited", old_default + "\nMy own rule.\n", False)):
+        h = home("agentsmd-" + name, {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+        open(h + "/_shared/AGENTS.md", "w").write(text)
+        p, aid, d = start(h)
+        now_text = open(h + "/_shared/AGENTS.md").read()
+        upgraded = "## The routine for every task" in now_text
+        check(f"[AGENTS.md] {name}: {'upgraded' if expect_upgrade else 'kept'}", upgraded == expect_upgrade and (expect_upgrade or "My own rule." in now_text))
+        p.send_signal(signal.SIGTERM); p.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:
