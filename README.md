@@ -103,7 +103,9 @@ operator]". A line that is just one of these is a command instead:
   `max_model_len` as on vLLM, and similar).
 - llama.cpp's `/props` and Ollama's `/api/show`.
 
-If none of those say, set `context_tokens` on the model. Failing that, hobkin
+`context_tokens` on a model is optional: set it and that number is used as
+given; leave it out (or `null`) and it's detected. If the API doesn't say,
+set it. Failing that, hobkin
 learns the limit from the first "context too long" error and remembers it.
 `state.json` records where the number came from.
 

@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
             "model": "claude-sonnet-5-5",
             "key_env": "ANTHROPIC_API_KEY",
             "key_file": "~/.anthropic.key",
+            "context_tokens": None,   # optional: set to override; null = ask the API
         },
         "openrouter": {
             "api": "openai",
