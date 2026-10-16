@@ -21,7 +21,17 @@ python3 hobkin.py 7f3a91c2     # resume that agent later (its context is kept)
 The first run creates `~/.hobkins/_shared/config.json`. Set your model there (see
 **Models**) and make sure the API key is reachable.
 
-Then, from another terminal:
+Then, from another terminal, chat with it:
+
+```sh
+python3 hobkin.py chat 7f3a91c2
+```
+
+Its output appears as it comes, and each line you type (or paste) is sent;
+`/stop` and the other commands work, and Ctrl-D leaves. Piped, it sends the
+input, prints the reply and exits: `echo "status?" | python3 hobkin.py chat 7f3a91c2`.
+
+Or with plain files:
 
 ```sh
 echo "Clone https://example.com/repo and get its tests passing" > ~/.hobkins/7f3a91c2/in
@@ -71,7 +81,7 @@ operator]". A line that is just one of these is a command instead:
 | `/compact` | Summarise and clear the conversation now. |
 | `/status` | Write its status to `out`. |
 
-`python3 hobkin.py list` shows all agents, their status and their last line of output.
+`python3 hobkin.py chat ID` puts both in one terminal (see Quick start). `python3 hobkin.py list` shows all agents, their status and their last line of output.
 
 ## Models
 

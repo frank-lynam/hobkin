@@ -3,6 +3,7 @@
 
     hobkin.py                 start a new agent (prints its id)
     hobkin.py ID              resume agent ID
+    hobkin.py chat ID         talk to a running agent in this terminal
     hobkin.py send ID TEXT    message an agent (queued if it isn't running)
     hobkin.py list            list agents
 
@@ -852,6 +853,67 @@ def cmd_send(agent_id, text):
     print(f"{agent_id} isn't running; queued for when it starts")
 
 
+def cmd_chat(agent_id):
+    """Talk to a running agent in one terminal: its output appears as it comes, and each line
+    you type (or paste) is sent. Piped input: send it all, print the reply, exit."""
+    d = os.path.join(HOME, valid_id(agent_id))
+    if not os.path.isdir(d) or not is_running(d):
+        sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin.py {agent_id})")
+    fifo = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
+    os.set_blocking(fifo, True)
+    out_path, state_path = os.path.join(d, "out"), os.path.join(d, "state.json")
+    tty = sys.stdin.isatty()
+    with open(out_path, "rb") as f:
+        recent = f.read().decode(errors="replace").splitlines()[-12:]
+        pos = f.tell()
+    mine = False                     # inside one of our own "you>" entries (not echoed back)
+
+    def show_new():
+        nonlocal pos, mine
+        with open(out_path, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+        cut = chunk.rfind(b"\n") + 1   # whole lines only
+        pos += cut
+        for line in chunk[:cut].decode(errors="replace").splitlines():
+            if not line.startswith("    "):
+                mine = line[20:].startswith("you> ")
+            if not mine:
+                print(line[11:] if not line.startswith("    ") else line, flush=True)  # drop the date
+
+    if tty:
+        print("\n".join(l[11:] if not l.startswith("    ") else l for l in recent))
+        print(f"-- chatting with {agent_id}: type and press Enter to send; /stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
+    sent_at, eof = 0.0, False
+    try:
+        while True:
+            ready = select.select([sys.stdin] if not eof else [], [], [], 0.3)[0]
+            if ready:
+                line = sys.stdin.readline()
+                if line:
+                    os.write(fifo, line.encode())
+                    sent_at = time.time()
+                else:
+                    eof = True
+                    if tty:
+                        break
+            show_new()
+            if eof and not tty:
+                # Piped: leave once the agent has gone idle again after our message
+                time.sleep(0.5)
+                st = json.loads(read(state_path, "{}") or "{}")
+                if time.time() - sent_at > 2 and st.get("status") in ("idle", "paused", "error", "stopped"):
+                    show_new()
+                    break
+                if not is_running(d):
+                    show_new()
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.close(fifo)
+
+
 def cmd_list():
     if not os.path.isdir(HOME):
         return print("no agents yet")
@@ -874,6 +936,10 @@ def main(argv):
         return
     if argv[:1] == ["list"]:
         return cmd_list()
+    if argv[:1] == ["chat"]:
+        if len(argv) != 2:
+            sys.exit("usage: hobkin.py chat ID")
+        return cmd_chat(argv[1])
     if argv[:1] == ["send"]:
         if len(argv) < 3:
             sys.exit("usage: hobkin.py send ID TEXT")

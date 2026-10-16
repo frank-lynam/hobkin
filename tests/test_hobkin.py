@@ -2,7 +2,7 @@
 
     python3 tests/test_hobkin.py
 """
-import json, os, subprocess, sys, time, shutil, signal, tempfile
+import json, os, select, subprocess, sys, time, shutil, signal, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOB = os.path.join(HERE, "..", "hobkin.py")
 BASE = tempfile.mkdtemp(prefix="hobkin-test-")
@@ -81,6 +81,27 @@ try:
         check(f"[{api}] resumed with context kept", len(ctx(d)) == n + 2, (n, len(ctx(d))))
         r = subprocess.run([sys.executable, HOB, "list"], env={**os.environ, "HOBKIN_HOME": h}, capture_output=True, text=True)
         check(f"[{api}] list shows it", aid in r.stdout and "idle" in r.stdout, r.stdout)
+        # chat, piped: sends, prints the reply, exits
+        r = subprocess.run([sys.executable, HOB, "chat", aid], input="hi from a pipe\n", env={**os.environ, "HOBKIN_HOME": h},
+                           capture_output=True, text=True, timeout=30)
+        check(f"[{api}] chat (piped) prints the reply", "agent> echo: hi from a pipe" in r.stdout and "you>" not in r.stdout, r.stdout + r.stderr)
+        # chat, interactive: in a pseudo-terminal
+        import pty
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["HOBKIN_HOME"] = h
+            os.execv(sys.executable, [sys.executable, HOB, "chat", aid])
+        buf = b""; end = time.time() + 20; sent = False
+        while time.time() < end and b"echo: typed in a terminal" not in buf:
+            r_, _, _ = select.select([fd], [], [], 0.2)
+            if r_:
+                try: buf += os.read(fd, 4096)
+                except OSError: break
+            if not sent and b"chatting with" in buf:
+                os.write(fd, b"typed in a terminal\n"); sent = True
+        os.write(fd, b"\x04")   # Ctrl-D leaves
+        _, status = os.waitpid(pid, 0)
+        check(f"[{api}] chat (terminal) round trip and Ctrl-D", b"echo: typed in a terminal" in buf and status == 0, buf[-400:])
         p.send_signal(signal.SIGTERM); p.wait(10)
         # crash repair: context ending in an unanswered tool call
         c = ctx(d); assert c[-1]["role"] == "assistant"; c[-1] = {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_crash", "name": "bash", "input": {"command": "echo never"}}]}
