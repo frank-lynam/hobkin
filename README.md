@@ -11,11 +11,21 @@ sleeps.
 - **Many per account.** Each agent has its own id and folder, and a lock stops two
   processes running the same one.
 
+## Install
+
+```sh
+pipx install hobkin        # or: uv tool install hobkin
+```
+
+That gives you the `hobkin` command. Python 3.9 or newer on Linux (or another
+POSIX system); no dependencies. You can also skip installing and run the file
+directly: `python3 hobkin.py`.
+
 ## Quick start
 
 ```sh
-python3 hobkin.py              # a new agent: prints its id, e.g. 7f3a91c2
-python3 hobkin.py 7f3a91c2     # resume that agent later (its context is kept)
+hobkin                 # a new agent: prints its id, e.g. 7f3a91c2
+hobkin 7f3a91c2        # resume that agent later (its context is kept)
 ```
 
 The first run creates `~/.hobkins/_shared/config.json`. Set your model there (see
@@ -24,12 +34,12 @@ The first run creates `~/.hobkins/_shared/config.json`. Set your model there (se
 Then, from another terminal, chat with it:
 
 ```sh
-python3 hobkin.py chat 7f3a91c2
+hobkin chat 7f3a91c2
 ```
 
 Its output appears as it comes, and each line you type (or paste) is sent;
 `/stop` and the other commands work, and Ctrl-D leaves. Piped, it sends the
-input, prints the reply and exits: `echo "status?" | python3 hobkin.py chat 7f3a91c2`.
+input, prints the reply and exits: `echo "status?" | hobkin chat 7f3a91c2`.
 
 Or with plain files:
 
@@ -38,7 +48,7 @@ echo "Clone https://example.com/repo and get its tests passing" > ~/.hobkins/7f3
 tail -f ~/.hobkins/7f3a91c2/out
 ```
 
-Run it in the background however you like: `nohup python3 hobkin.py 7f3a91c2 &`,
+Run it in the background however you like: `nohup hobkin 7f3a91c2 &`,
 tmux, or a systemd user service.
 
 ## An agent's folder
@@ -47,7 +57,7 @@ tmux, or a systemd user service.
 
 | File | What it is |
 |---|---|
-| `in` | A named pipe. `echo text > in` sends a message. A write waits until the agent is running; `hobkin.py send ID text` queues it instead. |
+| `in` | A named pipe. `echo text > in` sends a message. A write waits until the agent is running; `hobkin send ID text` queues it instead. |
 | `out` | Everything it says and does, with timestamps: messages, commands, output. `tail -f out` |
 | `context.jsonl` | Exactly what the model is sent: line 1 is the system prompt, then one message per line. Rewritten after every change. |
 | `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. |
@@ -113,7 +123,7 @@ operator]". A line that is just one of these is a command instead:
 | `/compact` | Summarise and clear the conversation now. |
 | `/status` | Write its status to `out`. |
 
-`python3 hobkin.py chat ID` puts both in one terminal (see Quick start). `python3 hobkin.py list` shows all agents, their status and their last line of output.
+`hobkin chat ID` puts both in one terminal (see Quick start). `hobkin list` shows all agents, their status and their last line of output.
 
 ## Models
 
@@ -209,7 +219,7 @@ Nothing in hobkin knows about agent-tickets; you give it the instructions and
 the token:
 
 ```sh
-python3 hobkin.py                 # note the id, then /stop it (Ctrl-C)
+hobkin                            # note the id, then /stop it (Ctrl-C)
 ID=7f3a91c2 URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
 printf 'AGENT_TICKETS_URL=%s\nAGENT_TICKETS_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
 chmod 600 ~/.hobkins/$ID/secrets.env
@@ -217,7 +227,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \
   -o ~/.hobkins/_shared/skills/agent-tickets/SKILL.md
 echo '{"idle_prompt": "Run the agent-tickets wait loop (GET /api/wait) and do what it says.", "idle_seconds": 60}' \
   > ~/.hobkins/$ID/config.json
-python3 hobkin.py $ID
+hobkin $ID
 ```
 
 The agent-tickets skill is shared: it reads the token from
@@ -226,6 +236,18 @@ The agent-tickets skill is shared: it reads the token from
 checking for work, and it can also hold `/api/wait` open itself inside a
 command. Give each worker its own token, so claims and comments show which
 agent did what.
+
+## Releasing
+
+Releases go to PyPI from GitHub Actions with Trusted Publishing (no token stored):
+
+1. Bump `__version__` in `hobkin.py`, commit and push.
+2. Publish a GitHub release tagged `vX.Y.Z` (matching `__version__`). The
+   workflow runs the tests on Python 3.9, 3.12 and 3.14, builds, checks the tag
+   matches, and uploads to PyPI.
+
+Running the workflow by hand (Actions → Publish → Run workflow) uploads to
+TestPyPI instead, for a dry run.
 
 ## Tests
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """hobkin: one unattended agent per process, driven through plain files.
 
-    hobkin.py                 start a new agent (prints its id)
-    hobkin.py ID              resume agent ID
-    hobkin.py chat ID         talk to a running agent in this terminal
-    hobkin.py send ID TEXT    message an agent (queued if it isn't running)
-    hobkin.py list            list agents
+    hobkin                 start a new agent (prints its id)
+    hobkin ID              resume agent ID
+    hobkin chat ID         talk to a running agent in this terminal
+    hobkin send ID TEXT    message an agent (queued if it isn't running)
+    hobkin list            list agents
+    hobkin --version
+
+(Or run the file directly: python3 hobkin.py ...)
 
 Each agent lives in ~/.hobkins/ID/ (or $HOBKIN_HOME/ID/):
 
@@ -23,6 +26,8 @@ for the agent's shell: _shared/secrets.env and ID/secrets.env (KEY=value lines).
 
 Standard library only. No ports: it only makes outgoing HTTP calls to the model API.
 """
+
+__version__ = "0.1.0"
 
 import errno
 import difflib
@@ -1275,7 +1280,7 @@ def cmd_chat(agent_id):
     you type (or paste) is sent. Piped input: send it all, print the reply, exit."""
     d = os.path.join(HOME, valid_id(agent_id))
     if not os.path.isdir(d) or not is_running(d):
-        sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin.py {agent_id})")
+        sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin {agent_id})")
     fifo = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
     os.set_blocking(fifo, True)
     out_path, state_path = os.path.join(d, "out"), os.path.join(d, "state.json")
@@ -1351,15 +1356,18 @@ def main(argv):
     if argv[:1] in (["-h"], ["--help"], ["help"]):
         print(__doc__)
         return
+    if argv[:1] in (["-V"], ["--version"]):
+        print(f"hobkin {__version__}")
+        return
     if argv[:1] == ["list"]:
         return cmd_list()
     if argv[:1] == ["chat"]:
         if len(argv) != 2:
-            sys.exit("usage: hobkin.py chat ID")
+            sys.exit("usage: hobkin chat ID")
         return cmd_chat(argv[1])
     if argv[:1] == ["send"]:
         if len(argv) < 3:
-            sys.exit("usage: hobkin.py send ID TEXT")
+            sys.exit("usage: hobkin send ID TEXT")
         return cmd_send(argv[1], " ".join(argv[2:]))
     if len(argv) > 1:
         sys.exit(__doc__)
@@ -1375,5 +1383,10 @@ def main(argv):
     Agent(agent_id).run()
 
 
-if __name__ == "__main__":
+def cli():
+    """Entry point for the installed `hobkin` command."""
     main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    cli()
