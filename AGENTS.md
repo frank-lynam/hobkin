@@ -15,4 +15,4 @@
   environment, and `secrets.env` values only ever reach it as environment variables.
 - **Tests:** `python3 tests/test_hobkin.py` (real processes against
   `tests/fake_api.py`; no key, no cost). Add a check for every behaviour you change.
-- Local git only for now (no remote yet).
+- GitHub: `frank-lynam/hobkin` (remote `origin` uses the `github-hobkin` SSH alias). Commit and push finished work.
