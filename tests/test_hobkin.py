@@ -128,6 +128,31 @@ try:
         check(f"[{api}] request survives compaction", "seq 1 307" in open(d + "/context.jsonl").read() or "307" in open(d + "/out").read().split("compacted; note")[-1])
         time.sleep(1); say(d, "still there?"); wait_for(d, "echo: still there?")
         p.send_signal(signal.SIGTERM); p.wait(10)
+    # skills: shared, overridden per agent, extra dirs from config; listed (not inlined) in the prompt
+    extra = os.path.join(BASE, "extra-skills")
+    h = home("skills", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"skill_dirs": [extra]})
+    def skill(root, folder, header, body="SECRET-BODY-TEXT"):
+        os.makedirs(os.path.join(root, folder), exist_ok=True)
+        open(os.path.join(root, folder, "SKILL.md"), "w").write(f"---\n{header}\n---\n\n{body}\n")
+    skill(h + "/_shared/skills", "greet", "name: greet\ndescription: Say hello properly.")
+    skill(h + "/_shared/skills", "deploy", "name: deploy\ndescription: >\n  Ship a release:\n  build, tag and push.")
+    skill(extra, "greet", "name: greet\ndescription: lower priority, should lose")
+    skill(extra, "notes", 'name: "notes"\ndescription: "Keep tidy notes."')
+    skill(h + "/_shared/skills", "nofront", "", body="no front matter here")
+    p, aid, d = start(h)
+    skill(d + "/skills", "greet", "name: greet\ndescription: The agent's own greeting rules.")
+    say(d, "run: cat " + d + "/skills/greet/SKILL.md")
+    wait_for(d, "Done. Output was")
+    system = ctx(d)[0]["content"]
+    check("[skills] listed with descriptions", "**deploy**: Ship a release: build, tag and push." in system
+          and "**notes**: Keep tidy notes." in system, system[-900:])
+    check("[skills] agent's own skill wins, then shared over extra", "The agent's own greeting rules." in system
+          and "lower priority" not in system and d + "/skills/greet/SKILL.md" in system, system[-900:])
+    check("[skills] bodies aren't inlined", "SECRET-BODY-TEXT" not in system)
+    check("[skills] folder name used when there's no front matter", "**nofront**: (no description)" in system, system[-900:])
+    check("[skills] the agent can read one", "SECRET-BODY-TEXT" in open(d + "/out").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:

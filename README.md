@@ -63,9 +63,37 @@ tmux, or a systemd user service.
 to work as a hobkin; created on first run, edit freely), an optional `SOUL.md`,
 any other `.md` instructions, and `secrets.env`.
 
-**The system prompt** is `SOUL.md`, then `AGENTS.md`, then the other `.md` files in
-name order, then `MEMORY.md`. Each file is taken from the agent's folder if it
-has one, otherwise from `_shared/`.
+**The system prompt** is:
+
+1. `SOUL.md`, then `AGENTS.md`, then the other `.md` files in name order;
+2. the list of skills (see below);
+3. `MEMORY.md`.
+
+Each `.md` file is taken from the agent's folder if it has one, otherwise from
+`_shared/`. The prompt is rebuilt every turn, so edits take effect on the next one.
+
+## Skills
+
+Skills use the same format as Claude Code and other agents: a folder holding a
+`SKILL.md` with a `name` and `description` in its front matter, plus any scripts
+or reference files. Install one by copying its folder into
+**`~/.hobkins/_shared/skills/`**, and every agent can use it.
+
+```
+~/.hobkins/_shared/skills/agent-tickets/SKILL.md
+~/.hobkins/_shared/skills/release/SKILL.md
+~/.hobkins/_shared/skills/release/build.sh
+```
+
+The prompt lists only each skill's name, description and path. The agent reads
+the full `SKILL.md` (with `cat`) when a task calls for it, so dozens of skills
+cost a line each.
+
+- An agent's own `skills/` folder can add skills, or replace a shared one with the
+  same name.
+- `skill_dirs` in config adds more folders at the lowest priority, e.g.
+  `["~/.claude/skills"]` to reuse skills you already have.
+- New skills are picked up on the next turn; no restart needed.
 
 ## Talking to it
 
@@ -154,13 +182,16 @@ python3 hobkin.py                 # note the id, then /stop it (Ctrl-C)
 ID=7f3a91c2 URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
 printf 'AGENT_TICKETS_URL=%s\nAGENT_TICKETS_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
 chmod 600 ~/.hobkins/$ID/secrets.env
-curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" > ~/.hobkins/$ID/TICKETS.md
+curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \
+  -o ~/.hobkins/_shared/skills/agent-tickets/SKILL.md
 echo '{"idle_prompt": "Run the agent-tickets wait loop (GET /api/wait) and do what it says.", "idle_seconds": 60}' \
   > ~/.hobkins/$ID/config.json
 python3 hobkin.py $ID
 ```
 
-`TICKETS.md` becomes part of its instructions. The idle prompt keeps it
+The agent-tickets skill is shared: it reads the token from
+`AGENT_TICKETS_TOKEN`, so one copy serves every worker, each with its own
+`secrets.env`. The idle prompt keeps it
 checking for work, and it can also hold `/api/wait` open itself inside a
 command. Give each worker its own token, so claims and comments show which
 agent did what.

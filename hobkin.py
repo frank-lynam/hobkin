@@ -73,6 +73,9 @@ DEFAULT_CONFIG = {
     "bash_timeout": 600,       # seconds per command
     "output_limit": 30000,     # characters of command output kept (head + tail)
     "compact_at": 0.8,         # compact when the context passes this share of the window
+    # Extra folders of skills (each skill a folder with SKILL.md), lowest priority first.
+    # Always searched after these: _shared/skills, then the agent's own skills/.
+    "skill_dirs": [],
     "max_output_tokens": 16000,
 }
 
@@ -163,8 +166,42 @@ def load_env_file(path):
     return env
 
 
+def skill_header(path):
+    """name and description from a SKILL.md's front matter (--- key: value ---).
+    Handles plain, quoted and block (| or >) values."""
+    lines = read(path).splitlines()
+    meta = {}
+    if lines and lines[0].strip() == "---":
+        key = None
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            m = re.match(r"([A-Za-z_][\w-]*):\s*(.*)$", line)
+            if m and not line.startswith((" ", "\t")):
+                key, val = m.group(1), m.group(2).strip()
+                meta[key] = "" if val in ("|", ">", "|-", ">-") else val.strip("'\"")
+            elif key and line.strip():
+                meta[key] = (meta[key] + " " + line.strip()).strip()
+    return meta.get("name"), meta.get("description")
+
+
+def find_skills(agent_dir, extra_dirs=()):
+    """{name: (description, path to SKILL.md)}. Later folders replace earlier ones by name:
+    config skill_dirs, then _shared/skills, then the agent's own skills/."""
+    skills = {}
+    for root in [os.path.expanduser(d) for d in extra_dirs] + [os.path.join(SHARED, "skills"), os.path.join(agent_dir, "skills")]:
+        if not os.path.isdir(root):
+            continue
+        for entry in sorted(os.listdir(root)):
+            path = os.path.join(root, entry, "SKILL.md")
+            if os.path.isfile(path):
+                name, desc = skill_header(path)
+                skills[name or entry] = (desc or "(no description)", path)
+    return skills
+
+
 def ensure_shared():
-    os.makedirs(SHARED, exist_ok=True)
+    os.makedirs(os.path.join(SHARED, "skills"), exist_ok=True)
     if not os.path.exists(os.path.join(SHARED, "config.json")):
         write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
     if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
@@ -459,6 +496,12 @@ class Agent:
             text = read(own) if os.path.exists(own) else read(os.path.join(SHARED, n))
             if text.strip():
                 parts.append(text.strip())
+        skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
+        if skills:
+            parts.append("# Skills\n\nA skill is a set of instructions (and sometimes scripts) for one kind of task. "
+                         "Before you start a task that a skill below covers, read its SKILL.md with `cat` and follow it. "
+                         "Paths it mentions are relative to the skill's folder.\n\n"
+                         + "\n".join(f"- **{n}**: {d} ({p})" for n, (d, p) in sorted(skills.items())))
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\n{memory or '(empty)'}")
         return "\n\n---\n\n".join(parts)
