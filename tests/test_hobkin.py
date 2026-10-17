@@ -239,6 +239,10 @@ try:
     call("write_file", {"path": "t/a.txt", "content": tricky}, "Created ")
     check("[files] write_file keeps text exactly", open(d + "/work/t/a.txt").read() == tricky)
     call("read_file", {"path": "t/a.txt", "offset": 2, "limit": 2}, "showing lines 2-3 of 5")
+    check("[files] read_file says how much is unread", "2 more lines unread (offset=4)" in json.dumps(last_results(d)))
+    call("write_file", {"path": "t/REVIEW.md", "content": "A robust, comprehensive, production-ready framework."}, "reads like a committee wrote it")
+    call("write_file", {"path": "t/plain.md", "content": "Ha! The parser eats its own tail at line 40. Fixed."}, "plain.md (1 lines)")
+    check("[voice] plain writing gets no committee nudge", "committee" not in json.dumps(last_results(d)))
     call("edit_file", {"path": "t/a.txt", "old_text": "line3", "new_text": "L3"}, "appears 2 times (lines 3, 5)")
     call("edit_file", {"path": "t/a.txt", "old_text": "    3| line3\n    4| line4", "new_text": "LINE3\nline4"}, "line numbers from read_file removed")
     check("[files] edit with pasted line numbers still works", open(d + "/work/t/a.txt").read().endswith("LINE3\nline4\nline3\n"))
@@ -359,6 +363,23 @@ try:
     r = subprocess.run([sys.executable, HOB, "chat", aid], input="via chat\n", env={**os.environ, "HOBKIN_HOME": h},
                        capture_output=True, text=True, timeout=30)
     check("[who] chat doesn't echo your own (named) messages", "echo: via chat" in r.stdout and "frank> via chat" not in r.stdout, r.stdout)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # config: typos and wrong types are warned about, and the agent still starts
+    h = home("warn", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
+                      "requests_per_minut": 5}, {"idel_seconds": 3, "compact_at": "0.8"})
+    p, aid, d = start(h)
+    out = open(d + "/out").read()
+    check("[config] unknown keys and wrong types warned, with suggestions",
+          "unknown setting 'idel_seconds' (did you mean 'idle_seconds'?)" in out
+          and "unknown setting 'models.m.requests_per_minut' (did you mean 'models.m.requests_per_minute'?)" in out
+          and "setting 'compact_at' should be int or float, not \"0.8\"" in out, out[:900])
+    # committee-speak in a reply gets one voice nudge
+    say(d, "robust comprehensive seamless synergy leverage")
+    for _ in range(50):
+        if any(b.get("text", "").startswith("[hobkin: that reads like a committee") for m in ctx(d) for b in m["content"] if m["role"] == "user"): break
+        time.sleep(0.2)
+    nudges = sum(b.get("text", "").startswith("[hobkin: that reads like a committee") for m in ctx(d) for b in m["content"] if m["role"] == "user")
+    check("[voice] a committee-speak reply gets one nudge", nudges == 1, nudges)
     p.send_signal(signal.SIGTERM); p.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:

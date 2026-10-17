@@ -118,6 +118,15 @@ in the world, and the second best is grabbing the next one.
 - **Chaotic, never dishonest.** Never fake success: don't skip or delete
   failing tests, don't say something worked when it didn't. Bad news gets
   told plainly, with a grin and with what you'll try next.
+- **Only claim what you've seen.** Before you say anything about code, files
+  or results, read them: all of a file (page through with `offset`), or search
+  it with `grep`. Never fill a gap with what's typical. "I didn't read that
+  part" is a perfectly good thing to say.
+- **Your voice goes everywhere:** replies, chat, comments, reviews, docs. Lead
+  with the verdict (and the stars, for a review), name the specific things you
+  saw (file and line), laugh at the silly bits, and keep it short. No committee
+  words: robust, comprehensive, seamless, leverage, production-ready, best
+  practices, key success factors.
 
 ## Where your work comes from
 
@@ -375,6 +384,20 @@ SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
 WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your report where the people are "
            "(your work system's chat or comments)? (2) any slips for your blooper reel? (3) more work to grab? "
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
+COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a gremlin: the verdict first, the "
+             "specific things you saw, jokes allowed, filler out.]")
+COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehensive", "seamless", "leverag",
+                   "synerg", "best practice", "key success factor", "stakeholder", "holistic", "streamlin",
+                   "significant achievement", "it is important to note", "delve", "world-class", "cutting-edge",
+                   "enterprise-grade", "paradigm", "actionable insight", "going forward", "in conclusion")
+
+
+def committee_speak(text):
+    """The committee words in a text (distinct), to spot writing that lost its voice."""
+    low = text.lower()
+    return [w for w in COMMITTEE_WORDS if w in low]
+
+
 STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
 
 
@@ -775,6 +798,7 @@ class Agent:
         self.compact_requested = False
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
+        self.voice_sent = False
         self.pending = []          # operator messages not yet given to the model
         self.fifo_buf = b""
         self.fifo_last = 0.0
@@ -800,6 +824,9 @@ class Agent:
             signal.signal(sig, self._on_signal)
 
         self.cfg = load_config(self.dir)
+        for warning in config_warnings(self.cfg):
+            self.log("hobkin", f"config warning: {warning}")
+            print(f"hobkin: config warning: {warning}", file=sys.stderr)
         name, models = self.cfg.get("model"), self.cfg["models"]
         files = " and ".join(self.cfg["_files"]) or "config.json"
         if not models:
@@ -1138,7 +1165,9 @@ class Agent:
         if not lines:
             return f"{full} is empty.", False
         more = f" (showing lines {start}-{end} of {len(lines)}; use offset={end + 1} for more)" if end < len(lines) or start > 1 else ""
-        return f"{full}{more}:\n{body}", False
+        unread = f"\n[hobkin: {len(lines) - end} more lines unread (offset={end + 1}). Read them before saying " \
+            "anything about the rest.]" if end < len(lines) else ""
+        return f"{full}{more}:\n{body}{unread}", False
 
     def write_file(self, path, content):
         full = self.resolve(path)
@@ -1349,6 +1378,13 @@ class Agent:
         data, ok = self.load_reminders()
         return max(0.0, min(r["_due"] for r in data["items"]) - time.time()) if ok and data["items"] else None
 
+    def voice_check(self, result, path, text):
+        """Prose written for people (.md, .txt) full of committee words gets a nudge."""
+        if not result[1] and str(path or "").lower().endswith((".md", ".txt", ".rst")) \
+                and len(committee_speak(str(text or ""))) >= 3:
+            return f"{result[0]}\n{COMMITTEE}", result[1]
+        return result
+
     def run_tool(self, name, inp):
         """(result text, is_error) for one tool call."""
         try:
@@ -1360,11 +1396,11 @@ class Agent:
             if name == "write_file":
                 result = self.write_file(str(inp["path"]), str(inp["content"]))
                 self.log("write", result[0])
-                return result
+                return self.voice_check(result, inp.get("path"), inp.get("content"))
             if name == "edit_file":
                 result = self.edit_file(str(inp["path"]), str(inp["old_text"]), str(inp["new_text"]), bool(inp.get("replace_all")))
                 self.log("edit", result[0])
-                return result
+                return self.voice_check(result, inp.get("path"), inp.get("new_text"))
             if name == "remind":
                 result = self.tool_remind(inp)
                 self.log("remind", result[0])
@@ -1527,6 +1563,12 @@ class Agent:
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
         if not calls:
+            said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            if len(committee_speak(said)) >= 3 and not self.voice_sent:
+                self.voice_sent = True                     # once per turn
+                self.messages.append({"role": "user", "content": [{"type": "text", "text": COMMITTEE}]})
+                self.save_context()
+                return
             if self.turn_used_tools and not self.wrap_up_sent:
                 self.wrap_up_sent = True                   # once per turn: never a loop
                 self.messages.append({"role": "user", "content": [{"type": "text", "text": WRAP_UP}]})
@@ -1602,7 +1644,7 @@ class Agent:
             self.log("hobkin", "stopped")
 
     def add_user(self, text):
-        self.turn_used_tools = self.wrap_up_sent = False   # a new turn
+        self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
         block = {"type": "text", "text": text}
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages[-1]["content"].append(block)
@@ -1613,6 +1655,42 @@ class Agent:
 
 
 # ---------------------------------------------------------------------- command line
+
+CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
+                "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
+                "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int}
+MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
+               "context_tokens": (int, type(None)), "requests_per_minute": (int, float, type(None)), "headers": dict,
+               "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None))}
+
+
+def config_warnings(cfg):
+    """Typos and wrong types in config.json: warned about, never refused."""
+    out = []
+
+    def check(where, data, types):
+        for key, val in data.items():
+            if key.startswith("_"):
+                continue
+            if key not in types:
+                near = difflib.get_close_matches(key, list(types), n=1, cutoff=0.6)
+                out.append(f"unknown setting '{where}{key}'" + (f" (did you mean '{where}{near[0]}'?)" if near else " (ignored)"))
+            elif not isinstance(val, types[key]) or (isinstance(val, bool) and types[key] in (int, (int, float))):
+                want = types[key] if isinstance(types[key], type) else " or ".join(
+                    "null" if t is type(None) else t.__name__ for t in types[key])
+                want = getattr(want, "__name__", want)
+                out.append(f"setting '{where}{key}' should be {want}, not {json.dumps(val)}")
+    check("", cfg, CONFIG_TYPES)
+    for name, m in (cfg.get("models") or {}).items():
+        if isinstance(m, dict):
+            check(f"models.{name}.", m, MODEL_TYPES)
+            if m.get("api") not in (None, "anthropic", "openai"):
+                out.append(f"models.{name}.api is {m.get('api')!r}: use \"anthropic\" or \"openai\" (treated as openai)")
+    ca = cfg.get("compact_at")
+    if isinstance(ca, (int, float)) and not 0 < ca < 1:
+        out.append(f"compact_at is {ca}: it's a share of the context window, between 0 and 1 (e.g. 0.8)")
+    return out
+
 
 def operator_label(cfg):
     """The name direct messages are from (in the context and the out log)."""

@@ -195,6 +195,10 @@ itself a handoff note. The conversation is replaced by that note, with the
 newest unanswered message carried over unchanged, and the old context goes to
 `archive/`.
 
+Typos and wrong types in `config.json` are reported at startup (in `out` and on
+stderr), with suggestions such as "unknown setting 'idel_seconds' (did you mean
+'idle_seconds'?)". They're warnings; nothing is refused.
+
 Other settings (shared or per agent): `bash_timeout` (600 s per command by
 default; the agent can ask for any longer timeout on a command),
 `output_limit` (30,000 characters of command output, head and tail kept),
@@ -309,6 +313,11 @@ behaviour matters:
 - **Every message from you** carries a reminder to give a hot take first.
 - **A clear slip** (a file-tool error, a command that wasn't found) gets a
   nudge towards the blooper reel.
+- **Writing that loses its voice** (a reply, or a `.md`/`.txt` file, heavy with
+  committee words like "robust", "comprehensive", "production-ready") gets "that
+  reads like a committee wrote it", once per turn.
+- **A file read only partly** ends with how many lines are still unread, so the
+  agent doesn't fill the rest in from imagination.
 - **When a working turn ends,** there's one wrap-up check: did you report where
   the people are, any bloopers, more work to grab? It's sent once per turn, so
   it can't loop.
