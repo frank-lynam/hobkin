@@ -314,13 +314,26 @@ def merged(base, over):
 
 
 def load_config(agent_dir):
-    cfg = DEFAULT_CONFIG
+    """Settings: built-in defaults, then _shared/config.json, then the agent's config.json.
+    Models are different: they come only from the files (the built-in ones are just the starter
+    config.json), so deleting a model from your config really removes it. An agent's file can add
+    models or change settings on one; those merge over the shared entry."""
+    cfg = {k: v for k, v in DEFAULT_CONFIG.items() if k not in ("models", "model")}
+    cfg["models"], cfg["model"], files = {}, None, []
     for path in (os.path.join(SHARED, "config.json"), os.path.join(agent_dir, "config.json")):
         if os.path.exists(path):
             try:
-                cfg = merged(cfg, json.loads(read(path)))
+                data = json.loads(read(path))
             except json.JSONDecodeError as e:
                 sys.exit(f"hobkin: {path}: {e}")
+            models = data.pop("models", None) or {}
+            cfg = merged(cfg, data)
+            for name, m in models.items():
+                cfg["models"][name] = merged(cfg["models"].get(name, {}), m)
+            files.append(path)
+    if not files:
+        cfg["models"], cfg["model"] = DEFAULT_CONFIG["models"], DEFAULT_CONFIG["model"]
+    cfg["_files"] = files
     return cfg
 
 
@@ -619,9 +632,16 @@ class Agent:
             signal.signal(sig, self._on_signal)
 
         self.cfg = load_config(self.dir)
-        name = self.cfg["model"]
-        if name not in self.cfg["models"]:
-            sys.exit(f"hobkin: model {name!r} isn't in config.json 'models'")
+        name, models = self.cfg.get("model"), self.cfg["models"]
+        files = " and ".join(self.cfg["_files"]) or "config.json"
+        if not models:
+            sys.exit(f"hobkin: no models defined in {files} (add one under \"models\")")
+        if not name and len(models) == 1:
+            name = next(iter(models))
+        if name not in models:
+            what = f"\"model\" is {name!r}, which" if name else "\"model\" isn't set, and with more than one model hobkin"
+            sys.exit(f"hobkin: {what} isn't one of the models defined in {files}: {', '.join(models)}. "
+                     f"Set \"model\" to one of those.")
         self.model = Model(name, self.cfg["models"][name])
         if not self.model.key and (self.model.cfg.get("key_env") or self.model.cfg.get("key_file")):
             where = " or ".join(x for x in (

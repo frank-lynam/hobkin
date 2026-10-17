@@ -240,6 +240,25 @@ try:
     check("[keys] missing key stops with a clear message", r.returncode != 0 and "no API key for model m (fake via" in r.stderr
           and "NO_SUCH_KEY_VAR" in r.stderr and "~/no-such-key-file" in r.stderr, r.stderr)
     check("[keys] no request was sent", len(open(LOG).read()) == before)
+    # config: models come only from the files; "model" must name one of them
+    h = home("cfg", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+    cfg = json.load(open(h + "/_shared/config.json")); cfg["model"] = "claude"          # the deleted default
+    json.dump(cfg, open(h + "/_shared/config.json", "w"))
+    r = subprocess.run([sys.executable, HOB, "cfg1"], env={**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"},
+                       capture_output=True, text=True, timeout=20)
+    check("[config] a model deleted from config.json isn't brought back by the defaults",
+          r.returncode != 0 and "\"model\" is 'claude', which isn't one of the models defined in" in r.stderr and ": m." in r.stderr, r.stderr)
+    del cfg["model"]; json.dump(cfg, open(h + "/_shared/config.json", "w"))
+    p, aid, d = start(h, "cfg2")
+    check("[config] the only model is used when \"model\" isn't set", "up: m (fake via" in open(d + "/out").read())
+    os.makedirs(d, exist_ok=True)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    json.dump({"models": {"m": {"requests_per_minute": 99}, "extra": {"api": "openai", "base_url": "http://x/v1", "model": "y"}}},
+              open(d + "/config.json", "w"))
+    r = subprocess.run([sys.executable, HOB, "cfg2"], env={**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"},
+                       capture_output=True, text=True, timeout=20)
+    check("[config] two models and no \"model\": asks you to pick", r.returncode != 0 and "\"model\" isn't set" in r.stderr
+          and "m, extra" in r.stderr, r.stderr)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:

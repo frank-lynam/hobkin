@@ -142,6 +142,13 @@ operator]". A line that is just one of these is a command instead:
 }
 ```
 
+`model` picks one of `models`. The models are exactly the ones in your config
+files (the three above are only the starter file), so a model you delete is
+gone. An agent's own `config.json` can add models, or change settings on a
+shared one (e.g. its `requests_per_minute`), and can pick a different `model`.
+If `model` names one that isn't defined, hobkin stops and lists the ones that
+are; if it's left out and there's only one model, that one is used.
+
 - `api`: `anthropic` (the Messages API) or `openai` (Chat Completions: OpenAI,
   OpenRouter, vLLM, llama.cpp, Ollama, ...).
 - The key comes from the environment variable `key_env`, or else from the file
