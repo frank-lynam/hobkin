@@ -112,7 +112,12 @@ work out where scripts live. Dozens of skills cost a line each.
 
 ## Talking to it
 
-Anything you write to `in` is a message. If it's busy running a command, the
+Anything you write to `in` is a message. The agent sees it labelled with who
+sent it: set `"operator": "frank"` in `config.json` (use the name people know
+you by, e.g. your tracker username) and it reads `[message from frank]`, with
+its system prompt saying who that is; without it, `[message from operator]`.
+Automatic messages are marked too (`[from hobkin: idle prompt]`, `[Reminder
+#3 …]`), so the agent never mistakes them for you. If it's busy running a command, the
 message is added to the result of that command, marked "[message from
 operator]". A line that is just one of these is a command instead:
 

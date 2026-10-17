@@ -78,6 +78,9 @@ DEFAULT_CONFIG = {
     },
     # When the agent has nothing to do: wait for a message, or after idle_seconds
     # send idle_prompt (if set), e.g. "Check for new work."
+    # Who sends the messages that arrive directly (in, chat, send). Use the name people know
+    # you by elsewhere (e.g. your tracker username). Unset: "operator".
+    "operator": None,
     "idle_prompt": None,
     "idle_seconds": 300,
     "bash_timeout": 600,       # seconds per command
@@ -246,7 +249,7 @@ Then stop calling tools. The next message will wake you.
 ## Talking to people
 
 - People reach you two ways: directly (messages that arrive here, marked
-  "[message from operator]" when you're mid-task), and through the systems you
+  marked with who sent them, like "[message from ...]"), and through the systems you
   work in: chat, comments and the like (see your skills). Prefer the system you
   work in. That's where people look, and they may never read this console.
 - Answer people where they spoke to you. Put updates, questions and hand-offs
@@ -751,6 +754,7 @@ class Agent:
             sys.exit(f"hobkin: {what} isn't one of the models defined in {files}: {', '.join(models)}. "
                      f"Set \"model\" to one of those.")
         self.model = Model(name, self.cfg["models"][name])
+        self.who = operator_label(self.cfg)
         if not self.model.key and (self.model.cfg.get("key_env") or self.model.cfg.get("key_file")):
             where = " or ".join(x for x in (
                 f"the environment variable {self.model.cfg['key_env']}" if self.model.cfg.get("key_env") else "",
@@ -817,8 +821,11 @@ class Agent:
             names.update(f for f in os.listdir(d) if f.endswith(".md"))
         order = [n for n in ("SOUL.md", "AGENTS.md") if n in names]
         order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md"})
+        who = self.who if self.who != "operator" else "your operator"
         parts = [f"You are hobkin agent {self.id}. Your workspace is {self.work} ($HOBKIN_WORK). "
-                 f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY)."]
+                 f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY). Messages that arrive here directly "
+                 f"are from {who}, marked [message from {self.who}]; ones marked [from hobkin: ...] or [Reminder ...] "
+                 "are automatic."]
         for n in order:
             own = self.p(n)
             text = read(own) if os.path.exists(own) else read(os.path.join(SHARED, n))
@@ -932,7 +939,7 @@ class Agent:
                 body.append(line)
         body = "\n".join(body).strip()
         if body:
-            self.log("you", body)
+            self.log(self.who, body)
             self.pending.append(body)
 
     def command(self, cmd):
@@ -1467,7 +1474,7 @@ class Agent:
         for text in self.take_due_reminders():
             results.append({"type": "text", "text": text})
         for text in self.pending:
-            results.append({"type": "text", "text": f"[message from operator]\n{text}"})
+            results.append({"type": "text", "text": f"[message from {self.who}]\n{text}"})
         self.pending = []
         self.messages.append({"role": "user", "content": results})
         self.save_context()
@@ -1491,7 +1498,7 @@ class Agent:
                     self.compact("requested")
                 due = self.take_due_reminders()
                 if due or self.pending:
-                    self.add_user("\n\n".join(due + self.pending))
+                    self.add_user("\n\n".join(due + [f"[message from {self.who}]\n{t}" for t in self.pending]))
                     self.pending = []
                 if self.working:
                     self.save_state("working")
@@ -1506,7 +1513,7 @@ class Agent:
                 self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
                     self.log("hobkin", "idle prompt")
-                    self.add_user(prompt)
+                    self.add_user(f"[from hobkin: idle prompt]\n{prompt}")
                     idle_since = time.time()
         except KeyboardInterrupt:
             pass
@@ -1527,6 +1534,11 @@ class Agent:
 
 
 # ---------------------------------------------------------------------- command line
+
+def operator_label(cfg):
+    """The name direct messages are from (in the context and the out log)."""
+    return str(cfg.get("operator") or "operator").strip() or "operator"
+
 
 def valid_id(agent_id):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id or ""):
@@ -1568,7 +1580,8 @@ def cmd_chat(agent_id):
     with open(out_path, "rb") as f:
         recent = f.read().decode(errors="replace").splitlines()[-12:]
         pos = f.tell()
-    mine = False                     # inside one of our own "you>" entries (not echoed back)
+    mine = False                     # inside one of our own entries (not echoed back)
+    own = f"{operator_label(load_config(d))}> "
 
     def show_new():
         nonlocal pos, mine
@@ -1579,7 +1592,7 @@ def cmd_chat(agent_id):
         pos += cut
         for line in chunk[:cut].decode(errors="replace").splitlines():
             if not line.startswith("    "):
-                mine = line[20:].startswith("you> ")
+                mine = line[20:].startswith(own)
             if not mine:
                 print(line[11:] if not line.startswith("    ") else line, flush=True)  # drop the date
 

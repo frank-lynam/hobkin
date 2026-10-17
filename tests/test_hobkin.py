@@ -93,7 +93,7 @@ try:
         # chat, piped: sends, prints the reply, exits
         r = subprocess.run([sys.executable, HOB, "chat", aid], input="hi from a pipe\n", env={**os.environ, "HOBKIN_HOME": h},
                            capture_output=True, text=True, timeout=30)
-        check(f"[{api}] chat (piped) prints the reply", "agent> echo: hi from a pipe" in r.stdout and "you>" not in r.stdout, r.stdout + r.stderr)
+        check(f"[{api}] chat (piped) prints the reply", "agent> echo: hi from a pipe" in r.stdout and "operator>" not in r.stdout, r.stdout + r.stderr)
         # chat, interactive: in a pseudo-terminal
         import pty
         pid, fd = pty.fork()
@@ -298,6 +298,22 @@ try:
     open(d + "/reminders.json", "w").write("{broken")
     say(d, "hello"); wait_for(d, "echo: hello"); say(d, "again"); wait_for(d, "echo: again")
     check("[remind] a broken reminders.json is reported once", open(d + "/out").read().count("isn't valid JSON") == 1)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # operator: names the sender of direct messages; automatic ones are marked as such
+    h = home("who", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"operator": "frank", "idle_prompt": "Check for new work.", "idle_seconds": 3})
+    p, aid, d = start(h)
+    wait_for(d, "echo: Check for new work.", 10)
+    say(d, "hello there"); wait_for(d, "echo: hello there")
+    users = [m for m in ctx(d) if m["role"] == "user"]
+    texts = [b.get("text", "") for m in users for b in m["content"]]
+    check("[who] direct messages say who sent them", "[message from frank]\nhello there" in texts, texts)
+    check("[who] idle prompt is marked automatic", "[from hobkin: idle prompt]\nCheck for new work." in texts, texts)
+    check("[who] system prompt names the operator", "Messages that arrive here directly are from frank" in ctx(d)[0]["content"])
+    check("[who] out log uses the name", "frank> hello there" in open(d + "/out").read())
+    r = subprocess.run([sys.executable, HOB, "chat", aid], input="via chat\n", env={**os.environ, "HOBKIN_HOME": h},
+                       capture_output=True, text=True, timeout=30)
+    check("[who] chat doesn't echo your own (named) messages", "echo: via chat" in r.stdout and "frank> via chat" not in r.stdout, r.stdout)
     p.send_signal(signal.SIGTERM); p.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
