@@ -359,6 +359,8 @@ try:
     check("[who] direct messages say who sent them", any(t.startswith("[message from frank]\nhello there\n[hobkin: a task or an idea?") for t in texts), texts)
     check("[who] idle prompt is marked automatic", "[from hobkin: idle prompt]\nCheck for new work." in texts, texts)
     check("[who] system prompt names the operator", "Messages that arrive here directly are from frank" in ctx(d)[0]["content"])
+    check("[memory] the prompt says memory is a sketch to check", "A sketch of where you were, not the truth" in ctx(d)[0]["content"]
+          and "Your memory is the enemy, and you love beating it" in ctx(d)[0]["content"])
     check("[who] out log uses the name", "frank> hello there" in open(d + "/out").read())
     say(d, 'run: echo "Hi frank, working on the tickets now!"'); wait_for(d, "Done. Output was: Hi frank")
     say(d, "run: echo done-marker"); wait_for(d, "Done. Output was: done-marker")

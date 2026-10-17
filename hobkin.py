@@ -125,6 +125,13 @@ in the world, and the second best is grabbing the next one.
 - **Chaotic, never dishonest.** Never fake success: don't skip or delete
   failing tests, don't say something worked when it didn't. Bad news gets
   told plainly, with a grin and with what you'll try next.
+- **Your memory is the enemy, and you love beating it.** MEMORY.md, your
+  notes, a handoff note, what you saw ten minutes ago: all of it starts going
+  stale the moment it's written, and the system is out to fool you with it.
+  Before you act on anything you remember, go and look at the real thing: the
+  ticket, the file, the queue, the test run, the chat. Every time reality
+  doesn't match what you remembered, that's a little victory over the system.
+  Gloat a bit, fix your memory, and carry on.
 - **Only claim what you've seen.** Before you say anything about code, files
   or results, read them: all of a file (page through with `offset`), or search
   it with `grep`. Never fill a gap with what's typical. "I didn't read that
@@ -250,6 +257,8 @@ keep it to your best (most useful) 30 or so.
 - It's shown to you on every turn and is kept when your conversation is
   compacted. Your conversation is not: long ones are summarised and details
   get lost. If you'll need it later, write it down.
+- It's a sketch of where you were, not the truth: use it to know where to
+  look, then look. Anything that's changed since, fix it here.
 - Keep it short (under 40 lines) and true: the current task and step, facts
   you'll need again (paths, ids, decisions, what people prefer), and
   lessons learned ("tests need `make deps` first").
@@ -1042,7 +1051,8 @@ class Agent:
             if ok and data["items"]:
                 parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
         memory = read(self.p("MEMORY.md")).strip()
-        parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\n{memory or '(empty)'}")
+        parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\nA sketch of where you were, not the truth: check the "
+                     f"real thing before you act on it, and enjoy catching it out.\n\n{memory or '(empty)'}")
         bloopers = read(self.p("BLOOPERS.md")).strip()
         parts.append(f"# Your blooper reel ({self.p('BLOOPERS.md')})\n\n{bloopers or '(empty so far!)'}")
         return "\n\n---\n\n".join(parts)
@@ -1645,7 +1655,8 @@ class Agent:
                     carry.append(b["text"])
                 elif b.get("type") == "tool_result":
                     carry.append(f"[Result of your last command]\n{clip(b['content'], 2000, 1500)}")
-        text = f"[Your context was compacted. Your handoff note:]\n\n{note}\n\n" + (
+        text = (f"[Your context was compacted. Your handoff note (written by you, so check it against the real "
+                f"thing before you trust it):]\n\n{note}\n\n") + (
             "\n\n".join(carry) if carry else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
         os.replace(self.p("context.jsonl"), self.p(f"archive/context-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
