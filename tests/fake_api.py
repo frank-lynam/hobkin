@@ -12,6 +12,7 @@ def decide(last_user_texts, tool_results, summary):
     if summary: return ("text", "SUMMARY: handoff note")
     if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " "))
     t = re.sub(r"(?m)^\[(message from [^\]]*|from hobkin[^\]]*)\]\n", "", last_user_texts)   # sender labels
+    t = re.sub(r"(?m)\n?^\[hobkin: [^\n]*\]$", "", t)                                          # nudges
     m = re.search(r"call:\s*(\w+)\s+(\{.*\})\s*$", t, re.S)      # call: TOOL {json input}
     if m: return ("tool", (m.group(1), json.loads(m.group(2))))
     m = re.search(r"run:\s*(.+)", t, re.S)

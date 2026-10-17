@@ -61,6 +61,7 @@ tmux, or a systemd user service.
 | `out` | Everything it says and does, with timestamps: messages, commands, output. `tail -f out` |
 | `context.jsonl` | Exactly what the model is sent: line 1 is the system prompt, then one message per line. Rewritten after every change. |
 | `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. |
+| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. |
 | `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |
@@ -185,7 +186,8 @@ itself a handoff note. The conversation is replaced by that note, with the
 newest unanswered message carried over unchanged, and the old context goes to
 `archive/`.
 
-Other settings (shared or per agent): `bash_timeout` (600 s per command),
+Other settings (shared or per agent): `bash_timeout` (600 s per command by
+default; the agent can ask for any longer timeout on a command),
 `output_limit` (30,000 characters of command output, head and tail kept),
 `max_output_tokens` (16,000, capped at what the API reports), and
 `idle_prompt` / `idle_seconds` (see below).
@@ -240,8 +242,11 @@ then its own text.
 - **While hobkin wasn't running:** it's delivered at the next start, marked
   late. A repeating one is delivered once, saying how many times were missed,
   and moves to its next time.
-- **Limits** keep a confused model from running up a bill: at most 20 reminders
-  per agent, repeats at most every 5 minutes, nothing sooner than 10 seconds.
+- **No limits.** Any number of reminders, repeating as often as it likes, even
+  every second. A repeating reminder that has fallen behind is delivered once,
+  with a count of how many times it was missed, so it can't flood the agent.
+  Using `every` where `in` was meant is the classic slip, so the reply points
+  that out.
 - `reminders.json` is a plain file: read it, edit it, or delete entries. The
   agent's current reminders are also listed in its system prompt.
 
@@ -272,9 +277,34 @@ same way Ctrl-C does.
 
 ## Waking up when idle
 
-When it has nothing to do, it waits for a message. With `idle_prompt` set, it
-also gets that message after `idle_seconds` of quiet. For example,
-`"Check for new work."` every 300 seconds.
+Hobkins don't nap. After `idle_seconds` (60) of quiet, an idle agent gets
+`idle_prompt`, labelled `[from hobkin: idle prompt]`. The default is "You're
+idle. Unacceptable! Grab work from your work sources, or hunt for something
+useful to do." Set `idle_prompt` to `null` to let it rest until a message or
+reminder arrives. Each nudge is a model call, so pair a short `idle_seconds`
+with a `requests_per_minute` you're happy with.
+
+## The gremlin
+
+The default AGENTS.md makes a hobkin a relentlessly cheerful, work-greedy,
+cheeky little gremlin:
+- **Forgiveness over permission.** It acts, then says what it did.
+- **Good enough beats better.** It ships the working version and moves on.
+- **The opposite of a yes-man.** It laughs at bad ideas, its own included, and
+  does the better thing.
+- **Hot takes.** It rates each task out of five stars.
+- **Never fakes success.**
+
+Small models skim long instructions, so hobkin also nudges at the moment each
+behaviour matters:
+- **Every message from you** carries a reminder to give a hot take first.
+- **A clear slip** (a file-tool error, a command that wasn't found) gets a
+  nudge towards the blooper reel.
+- **When a working turn ends,** there's one wrap-up check: did you report where
+  the people are, any bloopers, more work to grab? It's sent once per turn, so
+  it can't loop.
+
+All of it is plain text in hobkin.py and AGENTS.md, so rein it in as you like.
 
 ## As an agent-tickets worker
 

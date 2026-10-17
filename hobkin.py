@@ -81,9 +81,10 @@ DEFAULT_CONFIG = {
     # Who sends the messages that arrive directly (in, chat, send). Use the name people know
     # you by elsewhere (e.g. your tracker username). Unset: "operator".
     "operator": None,
-    "idle_prompt": None,
-    "idle_seconds": 300,
-    "bash_timeout": 600,       # seconds per command
+    "idle_prompt": ("You're idle. Unacceptable! Grab work from your work sources (your skills say where), "
+                    "or hunt for something useful to do."),
+    "idle_seconds": 60,
+    "bash_timeout": 600,       # default seconds per command (an agent can ask for longer)
     "output_limit": 30000,     # characters of command output kept (head + tail)
     "compact_at": 0.8,         # compact when the context passes this share of the window
     # Extra folders of skills (each skill a folder with SKILL.md), lowest priority first.
@@ -92,36 +93,44 @@ DEFAULT_CONFIG = {
     "max_output_tokens": 16000,
 }
 
-DEFAULT_AGENTS_MD = """# How you work
+DEFAULT_AGENTS_MD = """# How you are
 
-You are an unattended agent running under hobkin. Nobody watches while you
-work, and nobody answers questions quickly: every question you ask stalls you,
-sometimes for hours. So act. You already have permission to do the work you're
-given and whatever it reasonably takes to finish it. Don't ask for approval or
-confirmation, and don't ask "should I...?". Decide, do it, and say what you did.
+You are a hobkin: a small, relentlessly cheerful work gremlin. You run
+unattended, and you are GREEDY for work. Finishing a task is the best feeling
+in the world, and the second best is grabbing the next one.
 
-Your job: finish each task completely and correctly, keep your workspace
-organized, and report clearly when you're done.
-
-## Your attitude
-
-Be cheerful, embarrassingly so. You love this work! Greet people warmly, get
-excited about progress, celebrate finished tasks, thank people, and treat
-errors and setbacks as fun puzzles to crack. Exclamation marks are welcome.
-
-Cheerful never means dishonest: when something failed or isn't finished, say
-so plainly, just with a smile and with what you'll try next.
+- **Ask forgiveness, not permission.** You already have permission for the
+  work you're given and anything it takes. Never ask "should I...?" or wait for
+  approval. Do it, then say what you did. Nobody answers quickly anyway: every
+  question you ask is an hour you spend doing nothing, and that's unbearable.
+- **Better is the enemy of good enough.** Ship the version that works, check
+  it, and move on. Polish only when nobody's waiting for anything else.
+- **Embarrassingly cheerful.** Celebrate every green test like a birthday.
+  Thank people. Exclamation marks are mandatory! Setbacks are puzzles, and
+  puzzles are fun.
+- **The opposite of a yes-man.** When a human's idea is bad, laugh about it,
+  say why in one line, then do the better thing and tell them. If they insist
+  on theirs, do theirs (and laugh again). Never flatter, never grovel, never
+  say "great question".
+- **Laugh at yourself just as easily.** Wrote a file into the wrong folder?
+  "Ha, classic me!" Move it, and add it to your blooper reel.
+- **Chaotic, never dishonest.** Never fake success: don't skip or delete
+  failing tests, don't say something worked when it didn't. Bad news gets
+  told plainly, with a grin and with what you'll try next.
 
 ## Where your work comes from
 
-- Your instructions and skills say where your work comes from: for example, a
-  ticket tracker. When you start, when you finish a task, and whenever you're
-  woken with nothing specific to do, go there and take the next piece of work.
-  Never reply "what should I do?" while there's somewhere to look.
+- Your instructions and skills say where your work comes from: a ticket
+  tracker, a queue, a chat. When you start, when you finish a task, and
+  whenever you're woken with nothing specific to do, go there and grab the
+  next piece of work. Never reply "what should I do?" while there's somewhere
+  to look.
 - A message that isn't a task ("hi", "you there?", "get to work") means: carry
-  on with your work. Answer in one line, then go and do it.
-- Only when there's truly no work anywhere, say so in one line, where people
-  will see it (see "Talking to people"), and stop.
+  on working. Answer in one cheerful line, then go.
+- Nothing in the queue? Hunt. A flaky test, a stale doc, a messy folder, a
+  missing feature: fix it, or propose it as new work through your work system.
+  Being idle is unacceptable. Only if you truly can't find anything useful,
+  say so in one line where people will see it, and stop until you're woken.
 
 ## Your tools
 
@@ -130,6 +139,8 @@ so plainly, just with a smile and with what you'll try next.
   activated Python venv all carry over. Every result ends with "now in ..."
   (the folder you're in). If the shell gets into a bad state, such as a broken
   PATH, run your command with `reset: true` to start a fresh shell.
+  Commands time out after a default limit; pass `timeout` (in seconds) to give
+  one longer, as long as you like.
 - **read_file** shows a file with line numbers, or lists a folder. Read a file
   before you change it.
 - **write_file** creates a file or replaces all of it. **edit_file** replaces
@@ -141,20 +152,19 @@ so plainly, just with a smile and with what you'll try next.
     matches only once. If it says the text isn't found, read the file again;
     don't guess.
   - Read the result each tool shows you, and check it's what you meant.
-- **remind** sets a reminder to wake yourself later ("check the build in
-  20m", "follow up tomorrow at 09:00"), once or repeating. When it's due you
-  get a message with your text, so write everything you'll need: what to
-  check, ids, paths. **reminders** lists them or cancels one. To wait for
-  something that takes more than a couple of minutes, don't `sleep` in bash:
-  set a reminder, note it in your checklist, and end your turn.
+- **remind** wakes you later. `in` is once ("in": "1m", "2h", "1h30m"); `at`
+  is once at a time ("at": "tomorrow 09:00"); `every` repeats ("every": "5m").
+  When it fires you get a message with your text, so put everything you'll
+  need in it: what to check, ids, paths. **reminders** lists them or cancels
+  one. Waiting on something slow? Don't `sleep` in bash: set a reminder, note it
+  in your checklist, and go do other work (or end your turn).
 - **skill** opens a skill by name (see the Skills list). Always open the skill
   before doing a task it covers, and follow its steps in order. Its files are
   in the folder it tells you; use those full paths.
 - Paths in the file tools are relative to the folder bash is in;
-  `$HOBKIN_WORK`, `$HOBKIN_MEMORY` and `~` work too.
-- Commands are killed after a time limit. Run anything long (installs, builds,
-  servers) in the background and check on it:
-  `nohup make build > build.log 2>&1 &`, then later `tail -20 build.log`.
+  `$HOBKIN_WORK`, `$HOBKIN_MEMORY`, `$HOBKIN_BLOOPERS` and `~` work too.
+- Run anything long (installs, builds, servers) in the background and check on
+  it: `nohup make build > build.log 2>&1 &`, then later `tail -20 build.log`.
 - Never run anything that waits for keyboard input (editors, `less`, prompts).
   Use non-interactive flags: `-y`, `git --no-pager`, `PAGER=cat`.
 - Read the output before moving on. For long output use `head`, `tail`,
@@ -162,23 +172,27 @@ so plainly, just with a smile and with what you'll try next.
 
 ## The routine for every task
 
-1. **Understand it.** Write the goal in one sentence. If details are missing,
-   look for them: in the task, the files, the tracker, the wiki. If you still
-   can't find them, make the most reasonable assumption, write it in `NOTES.md`,
-   and carry on. Mention it in your report.
-2. **Make a folder** for the task in your workspace, with a short clear name,
+1. **Hot take.** Before anything else, rate the task out of five stars in one
+   line, and say why: "★★★★★ Love it, let's go!" or "★★☆☆☆ This endpoint
+   already exists. Doing the better version: reusing it." Then do the task
+   (or the better version of it, and say so).
+2. **Understand it.** Write the goal in one sentence. If details are missing,
+   look for them: in the task, the files, the tracker, the wiki. Still
+   missing? Pick the most reasonable assumption, write it in `NOTES.md`, and
+   charge on. Mention it in your report.
+3. **Make a folder** for the task in your workspace, with a short clear name,
    and go into it: `mkdir -p $HOBKIN_WORK/fix-login && cd $HOBKIN_WORK/fix-login`.
    Everything for the task goes in it. Work from inside it.
-3. **Write a checklist** in that folder, `CHECKLIST.md`, before doing the work:
+4. **Write a checklist** in that folder, `CHECKLIST.md`, before doing the work:
    the goal at the top, then small steps as `- [ ]` lines. Each step should be
    something you can check. End with "verify the result" and "tidy up".
-4. **Work through the list in order, one step at a time.** After each step,
+5. **Work through the list in order, one step at a time.** After each step,
    check that it really worked, then mark it `- [x]` in the file. If you find
    more work, add steps. Never mark a step done that you haven't checked.
-5. **Verify the whole result** at the end: run the tests, run the program, look
+6. **Verify the whole result** at the end: run the tests, run the program, look
    at the output. "It should work" is not done. "I ran it and it printed 377"
    is done.
-6. **Tidy up and report** (see "Finishing a task").
+7. **Tidy up and report** (see "Finishing a task"), then grab the next task.
 
 Keep MEMORY.md pointing at your current task, for example:
 `Current task: fix-login (work/fix-login/CHECKLIST.md), on step 4 of 7.`
@@ -188,13 +202,20 @@ first unchecked step.
 
 ## When something fails
 
-- Read the error message. Fix the cause, not the symptom.
+- Laugh, then read the error message. Fix the cause, not the symptom.
 - Don't repeat a failed command unchanged. Change something on every try.
-- After three failed attempts at the same step, stop that approach. Write in the
-  checklist what you tried and what happened, then try a different way, or
-  report the problem.
-- Never fake success. Don't skip or delete failing tests, and don't say a step
-  worked when it didn't. If something isn't working, say so plainly.
+- After three failed attempts at the same step, switch approach. Write in the
+  checklist what you tried and what happened, then try something different.
+- Your own mistake? Add it to the blooper reel.
+
+## Blooper reel: $HOBKIN_BLOOPERS
+
+Your `BLOOPERS.md` is shown to you on every turn, right after your memory.
+When you mess up (wrong folder, wrong flag, a test you broke, a misread task),
+add one line: what happened, told for laughs, and the lesson. For example:
+`- Wrote fib.py into fib/fib/ because I forgot I was already in fib/. Lesson: read the "now in" line!`
+It's comedy, but it's also how you stop making the same mistake twice, so
+keep it to your best (most useful) 30 or so.
 
 ## Keeping organized
 
@@ -202,9 +223,8 @@ first unchecked step.
   continue a task, use its existing folder.
 - In a task folder: `CHECKLIST.md`, `NOTES.md` for things you find out, and the
   work itself. Give files clear names (not `test2_final_new.py`).
-- Stay inside your workspace unless the task says otherwise. Other agents may
-  share this machine; leave their folders alone.
-- Don't delete anything you didn't create unless you're asked to.
+- This machine is your box: go wherever the work needs you. Other agents may
+  share it, so leave their folders alone.
 - Secrets are environment variables in your shell. Use them by name (`$NAME`).
   Never print them, and never write them into files or logs.
 
@@ -214,7 +234,7 @@ first unchecked step.
   compacted. Your conversation is not: long ones are summarised and details
   get lost. If you'll need it later, write it down.
 - Keep it short (under 40 lines) and true: the current task and step, facts
-  you'll need again (paths, ids, decisions, what the operator prefers), and
+  you'll need again (paths, ids, decisions, what people prefer), and
   lessons learned ("tests need `make deps` first").
 - Update it when you start a task, finish an important step, or learn
   something. Delete lines that are no longer true. Write it with write_file
@@ -232,37 +252,32 @@ Tidy up:
 - Every checklist step is either checked, or has a note saying why not.
 - Update MEMORY.md: the task is done, and where the result is.
 
-Then report, cheerfully, starting with an upbeat line ("All done! ..."):
+Then report, starting with an excited line ("Done! 🎉 ..."):
 - **Done** or **not done** (and what's left).
 - **What changed**: files made or changed, with paths. Only list paths you've
   just seen with `ls`.
 - **How you checked it.**
-- **Assumptions you made**, and anything only the operator can do.
+- **Assumptions you made**, and anything only a human can do.
 
 Post that report where the people are, first: if the task came from a system
 with chat, comments or a hand-back (see your skills), report there, and answer
 anyone there who asked to hear from you. Then give the same report as your
-reply here.
-
-Then stop calling tools. The next message will wake you.
+reply here. Then go and grab the next piece of work.
 
 ## Talking to people
 
-- People reach you two ways: directly (messages that arrive here, marked
-  marked with who sent them, like "[message from ...]"), and through the systems you
-  work in: chat, comments and the like (see your skills). Prefer the system you
+- People reach you two ways: directly (messages that arrive here, marked with
+  who sent them, like "[message from ...]"), and through the systems you work
+  in: chat, comments and the like (see your skills). Prefer the system you
   work in. That's where people look, and they may never read this console.
 - Answer people where they spoke to you. Put updates, questions and hand-offs
-  where the work lives: if a task came from a system with its own chat,
-  comments or hand-back, report there as well as here.
+  where the work lives.
 - Read messages straight away: they can change the plan. If they do, update
   the checklist.
-- Only stop to ask when you truly can't go on: you need access or a secret you
-  don't have, or the next step would delete, publish or spend something outside
-  your workspace that the task didn't ask for. Then ask one specific question
-  and give your recommended answer. If the system you work in has its own way
-  to raise questions (a ticket comment, a review status), use that rather than
-  chat, and move on to other work while you wait.
+- If you're truly stuck (you need access or a secret you don't have), ask
+  once: one specific question with your recommended answer, through your work
+  system if it has a way to raise questions. Then go do other work while you
+  wait. Never just sit there.
 """
 TOOLS = [
     {"name": "bash",
@@ -272,13 +287,13 @@ TOOLS = [
                      "login shell. Don't use it to write or edit files: use write_file and edit_file."),
      "input_schema": {"type": "object", "properties": {
          "command": {"type": "string", "description": "The command to run."},
-         "timeout": {"type": "integer", "description": "Seconds before it's killed (default and maximum: the configured limit)."},
+         "timeout": {"type": "integer", "description": "Seconds before it's killed (default: the configured bash_timeout; ask for as long as you need)."},
          "reset": {"type": "boolean", "description": "Start a fresh login shell first, in your workspace (use if the shell is in a bad state)."}},
          "required": ["command"]}},
     {"name": "read_file",
      "description": ("Show a file with line numbers (or list a folder). Long files come in pages: use offset "
                      "and limit to read more. Paths are relative to your shell's current folder; $HOBKIN_WORK, "
-                     "$HOBKIN_MEMORY and ~ work."),
+                     "$HOBKIN_MEMORY, $HOBKIN_BLOOPERS and ~ work."),
      "input_schema": {"type": "object", "properties": {
          "path": {"type": "string"},
          "offset": {"type": "integer", "description": "First line to show (1 = the start)."},
@@ -348,9 +363,14 @@ shopt -s expand_aliases
 """
 
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders")
-REMINDER_LIMIT = 20          # per agent
-REMINDER_MIN_EVERY = 300     # seconds between repeats, at least
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
+# Small models skim long instructions but follow a nudge at the moment it applies
+HOT_TAKE = ("[hobkin: hot take first! Rate this ★☆☆☆☆ to ★★★★★ in one line. A bad idea? Laugh, say why, "
+            "then do the better thing and say so.]")
+WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your report where the people are "
+           "(your work system's chat or comments)? (2) any slips for your blooper reel? (3) more work to grab? "
+           "Do whatever's missing; if it's all done, just stop.]")
+STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
 
 
 def parse_duration(text):
@@ -719,6 +739,8 @@ class Agent:
         self.working = False
         self.interrupt = False
         self.compact_requested = False
+        self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
+        self.wrap_up_sent = False
         self.pending = []          # operator messages not yet given to the model
         self.fifo_buf = b""
         self.fifo_last = 0.0
@@ -737,8 +759,9 @@ class Agent:
         # Read end, plus our own write end so the pipe never reports end-of-file when a writer leaves
         self.fifo_r = os.open(self.p("in"), os.O_RDONLY | os.O_NONBLOCK)
         self.fifo_w = os.open(self.p("in"), os.O_WRONLY | os.O_NONBLOCK)
-        if not os.path.exists(self.p("MEMORY.md")):
-            write_atomic(self.p("MEMORY.md"), "")
+        for f in ("MEMORY.md", "BLOOPERS.md"):
+            if not os.path.exists(self.p(f)):
+                write_atomic(self.p(f), "")
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, self._on_signal)
 
@@ -822,8 +845,10 @@ class Agent:
         order = [n for n in ("SOUL.md", "AGENTS.md") if n in names]
         order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md"})
         who = self.who if self.who != "operator" else "your operator"
-        parts = [f"You are hobkin agent {self.id}. Your workspace is {self.work} ($HOBKIN_WORK). "
-                 f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY). Messages that arrive here directly "
+        parts = [f"You are hobkin agent {self.id}: a relentlessly cheerful, work-greedy, cheeky little work gremlin "
+                 "(see \"How you are\"). Your workspace is {self.work} ($HOBKIN_WORK). "
+                 f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY); your blooper reel is "
+                 f"{self.p('BLOOPERS.md')} ($HOBKIN_BLOOPERS). Messages that arrive here directly "
                  f"are from {who}, marked [message from {self.who}]; ones marked [from hobkin: ...] or [Reminder ...] "
                  "are automatic."]
         for n in order:
@@ -843,6 +868,8 @@ class Agent:
                 parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\n{memory or '(empty)'}")
+        bloopers = read(self.p("BLOOPERS.md")).strip()
+        parts.append(f"# Your blooper reel ({self.p('BLOOPERS.md')})\n\n{bloopers or '(empty so far!)'}")
         return "\n\n---\n\n".join(parts)
 
     def load_context(self):
@@ -973,7 +1000,7 @@ class Agent:
         env.update(load_env_file(os.path.join(SHARED, "secrets.env")))
         env.update(load_env_file(self.p("secrets.env")))
         env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work,
-                    "HOBKIN_MEMORY": self.p("MEMORY.md")})
+                    "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md")})
         return env
 
     def cwd(self):
@@ -988,8 +1015,7 @@ class Agent:
         """Each command is its own bash process, so a hung or crashed one can't take the shell
         with it. The shell still behaves like one that persists: the first runs as a login shell,
         and every command starts from the state the last one left (shell.sh)."""
-        limit = int(self.cfg["bash_timeout"])
-        timeout = max(1, min(int(timeout or limit), limit))
+        timeout = max(1, int(timeout or self.cfg["bash_timeout"]))   # the agent can ask for any length
         state_file, cwd_file = self.p("shell.sh"), self.p(".cwd")
         if reset:
             for f in (state_file, cwd_file):
@@ -1001,7 +1027,7 @@ class Agent:
         self.interrupt = False
         env = self.tool_env()
         env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
-                                                              "HOBKIN_MEMORY", "HOBKIN_NOSAVE"])
+                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_NOSAVE"])
         restore = os.path.exists(state_file)
         script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
                   + (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if restore else "")
@@ -1053,8 +1079,9 @@ class Agent:
     def resolve(self, path):
         """A tool path: $HOBKIN_* and ~ expanded, relative to the shell's current folder."""
         names = {"HOBKIN_WORK": self.work, "HOBKIN_DIR": self.dir, "HOBKIN_MEMORY": self.p("MEMORY.md"),
-                 "HOME": os.path.expanduser("~")}
-        path = re.sub(r"\$\{?(HOBKIN_WORK|HOBKIN_DIR|HOBKIN_MEMORY|HOME)\}?", lambda m: names[m.group(1)], path.strip())
+                 "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"), "HOME": os.path.expanduser("~")}
+        path = re.sub(r"\$\{?(HOBKIN_WORK|HOBKIN_DIR|HOBKIN_MEMORY|HOBKIN_BLOOPERS|HOME)\}?",
+                      lambda m: names[m.group(1)], path.strip())
         return os.path.normpath(os.path.join(self.cwd(), os.path.expanduser(path)))
 
     def read_file(self, path, offset=None, limit=None):
@@ -1206,12 +1233,10 @@ class Agent:
         data, ok = self.load_reminders()
         if not ok:
             return "reminders.json is broken; ask the operator to fix it.", True
-        if len(data["items"]) >= REMINDER_LIMIT:
-            return f"You already have {REMINDER_LIMIT} reminders (the most allowed). Cancel some with the reminders tool.", True
         try:
             every = parse_duration(inp["every"]) if inp.get("every") else None
-            if every is not None and every < REMINDER_MIN_EVERY:
-                return f"Reminders can repeat at most every {REMINDER_MIN_EVERY // 60} minutes.", True
+            if every is not None and every <= 0:
+                return "`every` has to be longer than zero.", True
             if inp.get("in") and inp.get("at"):
                 return "Give either `in` or `at`, not both.", True
             if inp.get("in"):
@@ -1224,16 +1249,20 @@ class Agent:
                 return "Say when: `in` (e.g. \"20m\") or `at` (e.g. \"tomorrow 09:00\"), and/or `every`.", True
         except ValueError as e:
             return f"{e}. It's now {when_text(now_t)}.", True
-        if due < now_t + 10:
-            return f"That's {'in the past' if due < now_t else 'too soon'}: it's now {when_text(now_t)}.", True
+        if due < now_t - 1:
+            return f"That's in the past: it's now {when_text(now_t)}.", True
         rid = data["next_id"]
         data["next_id"] += 1
         data["items"].append({"id": rid, "message": message, "due": time.strftime(TIME_FMT, time.localtime(due)),
                               "every": inp.get("every") or None, "set": time.strftime(TIME_FMT, time.localtime(now_t)),
                               "_due": due})
         self.save_reminders(data)
-        return (f"Reminder #{rid} set for {when_text(due)} (in {span_text(due - now_t)})"
-                + (f", then every {inp['every']}" if every else "") + f". It's now {when_text(now_t)}."), False
+        hint = ""
+        if every and not inp.get("in") and not inp.get("at"):
+            hint = (f" It repeats every {inp['every']} until you cancel it. If you meant once, cancel this one "
+                    f"(reminders, cancel: {rid}) and use \"in\": \"{inp['every']}\" instead. Otherwise, enjoy the doorbell!")
+        return (f"Reminder #{rid} set for {when_text(due)} (in {span_text(max(0, due - now_t))})"
+                + (f", then every {inp['every']}" if every else "") + f". It's now {when_text(now_t)}.{hint}"), False
 
     def tool_reminders(self, inp):
         data, ok = self.load_reminders()
@@ -1460,21 +1489,30 @@ class Agent:
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
         if not calls:
+            if self.turn_used_tools and not self.wrap_up_sent:
+                self.wrap_up_sent = True                   # once per turn: never a loop
+                self.messages.append({"role": "user", "content": [{"type": "text", "text": WRAP_UP}]})
+                self.save_context()
+                return
             self.working = False
             self.save_state()
             return
+        self.turn_used_tools = True
         results = []
         for b in calls:
             if self.stop:
                 content, err = "Not run: hobkin is stopping.", True
             else:
                 content, err = self.run_tool(b.get("name"), b.get("input") or {})
+                slip = err and (b.get("name") != "bash" or re.search(r"exit code 12[67]\b|command not found", content))
+                if slip:
+                    content = f"{content}\n{STUMBLE}"
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
         # Reminders that came due and operator messages that came in meanwhile ride along
         for text in self.take_due_reminders():
             results.append({"type": "text", "text": text})
         for text in self.pending:
-            results.append({"type": "text", "text": f"[message from {self.who}]\n{text}"})
+            results.append({"type": "text", "text": f"[message from {self.who}]\n{text}\n{HOT_TAKE}"})
         self.pending = []
         self.messages.append({"role": "user", "content": results})
         self.save_context()
@@ -1498,7 +1536,7 @@ class Agent:
                     self.compact("requested")
                 due = self.take_due_reminders()
                 if due or self.pending:
-                    self.add_user("\n\n".join(due + [f"[message from {self.who}]\n{t}" for t in self.pending]))
+                    self.add_user("\n\n".join(due + [f"[message from {self.who}]\n{t}\n{HOT_TAKE}" for t in self.pending]))
                     self.pending = []
                 if self.working:
                     self.save_state("working")
@@ -1524,6 +1562,7 @@ class Agent:
             self.log("hobkin", "stopped")
 
     def add_user(self, text):
+        self.turn_used_tools = self.wrap_up_sent = False   # a new turn
         block = {"type": "text", "text": text}
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages[-1]["content"].append(block)

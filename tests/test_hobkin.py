@@ -34,6 +34,9 @@ def wait_for(d, needle, t=15, file="out"):
         time.sleep(0.1)
     raise AssertionError(f"timeout waiting for {needle!r} in {file}:\n" + open(os.path.join(d, "out")).read()[-1500:])
 def ctx(d): return [json.loads(l) for l in open(d + "/context.jsonl")]
+def last_results(d):
+    """The last user message that carries tool results (the wrap-up check may follow it)."""
+    return [m for m in ctx(d) if m["role"] == "user" and any(b.get("type") == "tool_result" for b in m["content"])][-1]
 def check(name, cond, info=""):
     print(("PASS " if cond else "FAIL ") + name + ("" if cond else f"  {info}")); 
     if not cond: global failed; failed = True
@@ -50,7 +53,9 @@ try:
         wait_for(d, "Done. Output was")
         check(f"[{api}] command ran in workspace", open(d + "/work/a.txt").read() == "hello\n")
         c = ctx(d)
-        check(f"[{api}] context file: system + 4 messages", [m["role"] for m in c] == ["system", "user", "assistant", "user", "assistant"], [m["role"] for m in c])
+        check(f"[{api}] context file: system, task, tool round, reply, wrap-up check, reply",
+              [m["role"] for m in c] == ["system", "user", "assistant", "user", "assistant", "user", "assistant"]
+              and c[5]["content"][0]["text"].startswith("[hobkin: wrap-up check!"), [m["role"] for m in c])
         check(f"[{api}] model key hidden from the shell", "KEY=unset" in open(d + "/out").read())
         # the shell keeps its folder between calls (and says where it is)
         say(d, "run: mkdir -p sub/deeper && cd sub/deeper")
@@ -77,7 +82,7 @@ try:
         say(d, "run: sleep 2; echo slept")
         wait_for(d, "$> sleep 2"); say(d, "also check the wiki")
         wait_for(d, "Done. Output was: slept")
-        last_user = [m for m in ctx(d) if m["role"] == "user"][-1]
+        last_user = last_results(d)
         check(f"[{api}] mid-command message added after results", any("[message from operator]\nalso check the wiki" in b.get("text", "") for b in last_user["content"]), last_user)
         # stop, queue while stopped, resume
         say(d, "/stop"); p.wait(10)
@@ -123,19 +128,28 @@ try:
 
     # compaction on a tiny context; context size learned from error when the API doesn't list it
     for api, port, listctx in (("anthropic", 48703, "list"), ("openai", 48704, "nolist")):
-        mock(port, 8000, listctx)
+        mock(port, 12000, listctx)
         base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
         h = home(api + "-small", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", "max_output_tokens": 200})
         p, aid, d = start(h)
-        for i in range(8):
+        for i in range(10):
             say(d, f"run: seq 1 {1000 + i}")
             wait_for(d, f"{1000 + i}", 20); time.sleep(0.3)
         out = open(d + "/out").read()
         st = json.load(open(d + "/state.json"))
         check(f"[{api}] compacted", "compacted; note" in out and os.listdir(d + "/archive"), out[-800:])
-        check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 8000, st)
-        check(f"[{api}] request survives compaction", "seq 1 1007" in open(d + "/context.jsonl").read() or "1007" in open(d + "/out").read().split("compacted; note")[-1])
-        time.sleep(1); say(d, "still there?"); wait_for(d, "echo: still there?")
+        check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 12000, st)
+        check(f"[{api}] request survives compaction", "seq 1 1009" in open(d + "/context.jsonl").read() or "1009" in open(d + "/out").read().split("compacted; note")[-1])
+        for _ in range(100):                                   # let the last turn finish first
+            if json.load(open(d + "/state.json")).get("status") == "idle": break
+            time.sleep(0.2)
+        say(d, "still there?"); wait_for(d, "operator> still there?")
+        for _ in range(100):
+            tail = open(d + "/out").read().split("operator> still there?")[-1]
+            if "agent> echo:" in tail: break
+            time.sleep(0.2)
+        last_user = "".join(b.get("text", "") for b in [m for m in ctx(d) if m["role"] == "user"][-1]["content"])
+        check(f"[{api}] answers after compaction, with the message in its context", "agent> echo:" in tail and "still there?" in last_user, tail[-300:])
         p.send_signal(signal.SIGTERM); p.wait(10)
     # skills: shared, overridden per agent, extra dirs from config; listed (not inlined) in the prompt
     extra = os.path.join(BASE, "extra-skills")
@@ -210,8 +224,11 @@ try:
     call("edit_file", {"path": "$HOBKIN_MEMORY", "old_text": "nothing", "new_text": "x"}, "The file is empty")
     call("write_file", {"path": "$HOBKIN_MEMORY", "content": "Current task: test\n"}, "Replaced ")
     check("[files] $HOBKIN_MEMORY path works", open(d + "/MEMORY.md").read() == "Current task: test\n")
+    call("write_file", {"path": "$HOBKIN_BLOOPERS", "content": "- Tripped over my own heredoc. Lesson: use write_file!\n"}, "BLOOPERS.md (1 lines)")
+    say(d, "hi"); wait_for(d, "echo: hi")
+    check("[bloopers] the reel is in the prompt", "Tripped over my own heredoc" in ctx(d)[0]["content"])
     call("skill", {"name": "Release"}, "Skill: release")
-    last = [m for m in ctx(d) if m["role"] == "user"][-1]["content"][0]["content"]
+    last = last_results(d)["content"][0]["content"]
     check("[skill] tool gives folder, files and instructions", d.split("/files/")[0] + "/files/_shared/skills/release" in last
           and "scripts/go.sh" in last and "Run scripts/go.sh" in last, last)
     call("skill", {"name": "nope"}, "No skill named 'nope'. Skills: release")
@@ -271,23 +288,24 @@ try:
     # due in the middle of a command: not an interruption; it arrives with that command's result
     tool("remind", {"message": "mid-task nudge", "in": "11s"}, "Reminder #2 set for")
     say(d, "run: sleep 15; echo finished-sleeping"); wait_for(d, "reminder> [Reminder #2", 25)
-    wait_for(d, "finished-sleeping")
-    last_user = [m for m in ctx(d) if m["role"] == "user"][-1]["content"]
+    wait_for(d, "agent> Done. Output was: finished-sleeping")
+    last_user = last_results(d)["content"]
     check("[remind] due mid-command: command not interrupted, reminder rides with its result",
           last_user[0]["type"] == "tool_result" and "finished-sleeping" in last_user[0]["content"]
           and any("[Reminder #2" in b.get("text", "") and "mid-task nudge" in b.get("text", "") for b in last_user[1:]), last_user)
-    tool("remind", {"message": "x", "every": "10s"}, "at most every 5 minutes")
+    tool("remind", {"message": "doorbell", "every": "1s"}, "Otherwise, enjoy the doorbell!")
+    tool("reminders", {"cancel": 3}, "Cancelled reminder #3")
     tool("remind", {"message": "x", "at": "2000-01-01 10:00"}, "in the past: it's now")
     tool("remind", {"message": "x", "in": "soon"}, "can't read 'soon' as a length of time")
-    tool("remind", {"message": "later", "in": "2h"}, "Reminder #3 set for")
-    tool("remind", {"message": "daily standup notes", "at": "tomorrow 09:00", "every": "1d"}, "Reminder #4 set for")
+    tool("remind", {"message": "later", "in": "2h"}, "Reminder #4 set for")
+    tool("remind", {"message": "daily standup notes", "at": "tomorrow 09:00", "every": "1d"}, "Reminder #5 set for")
     tool("reminders", {}, "Your reminders:")
     check("[remind] listed in the system prompt", "# Your reminders" in ctx(d)[0]["content"] and "daily standup notes" in ctx(d)[0]["content"])
-    tool("reminders", {"cancel": 3}, "Cancelled reminder #3")
-    say(d, "/reminders"); wait_for(d, "#4: ")
+    tool("reminders", {"cancel": 4}, "Cancelled reminder #4")
+    say(d, "/reminders"); wait_for(d, "#5: ")
     say(d, "/stop"); p.wait(10)
     data = json.load(open(d + "/reminders.json"))
-    check("[remind] cancel removed it", [r["id"] for r in data["items"]] == [4], data)
+    check("[remind] cancel removed it", [r["id"] for r in data["items"]] == [5], data)
     three_days_ago = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 3 * 86400 - 600))
     data["items"][0]["due"] = three_days_ago
     json.dump(data, open(d + "/reminders.json", "w"))
@@ -307,7 +325,7 @@ try:
     say(d, "hello there"); wait_for(d, "echo: hello there")
     users = [m for m in ctx(d) if m["role"] == "user"]
     texts = [b.get("text", "") for m in users for b in m["content"]]
-    check("[who] direct messages say who sent them", "[message from frank]\nhello there" in texts, texts)
+    check("[who] direct messages say who sent them", any(t.startswith("[message from frank]\nhello there\n[hobkin: hot take first!") for t in texts), texts)
     check("[who] idle prompt is marked automatic", "[from hobkin: idle prompt]\nCheck for new work." in texts, texts)
     check("[who] system prompt names the operator", "Messages that arrive here directly are from frank" in ctx(d)[0]["content"])
     check("[who] out log uses the name", "frank> hello there" in open(d + "/out").read())
