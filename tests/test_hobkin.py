@@ -52,7 +52,10 @@ try:
         say(d, "run: echo hello > a.txt && cat a.txt && echo FOO=$FOO KEY=${TESTKEY:-unset}")
         wait_for(d, "Done. Output was")
         check(f"[{api}] command ran in workspace", open(d + "/work/a.txt").read() == "hello\n")
-        c = ctx(d)
+        for _ in range(50):                                   # the wrap-up exchange follows the reply
+            c = ctx(d)
+            if len(c) >= 7: break
+            time.sleep(0.2)
         check(f"[{api}] context file: system, task, tool round, reply, wrap-up check, reply",
               [m["role"] for m in c] == ["system", "user", "assistant", "user", "assistant", "user", "assistant"]
               and c[5]["content"][0]["text"].startswith("[hobkin: wrap-up check!"), [m["role"] for m in c])
