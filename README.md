@@ -63,6 +63,7 @@ tmux, or a systemd user service.
 | `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. |
+| `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |
 | `shell.sh` | Its shell's saved state (folder, variables, functions, aliases), restored before each command. Secrets are never saved here. |
 | `secrets.env` | Optional `KEY=value` lines, set as environment variables in its shell (never put in its context). |
 | `config.json` | Optional per-agent settings over the shared ones. |
@@ -122,6 +123,7 @@ operator]". A line that is just one of these is a command instead:
 | `/interrupt` | Kill the command it's running now (it's told it was interrupted). |
 | `/compact` | Summarise and clear the conversation now. |
 | `/status` | Write its status to `out`. |
+| `/reminders` | Write its reminders to `out`. |
 
 `hobkin chat ID` puts both in one terminal (see Quick start). `hobkin list` shows all agents, their status and their last line of output.
 
@@ -208,11 +210,60 @@ Other settings (shared or per agent): `bash_timeout` (600 s per command),
     Windows line endings are handled.
   - Paths are relative to the shell's folder; `$HOBKIN_WORK`, `$HOBKIN_MEMORY`
     and `~` work.
+- **`remind`** sets a reminder to wake itself later, and **`reminders`** lists
+  or cancels them (see below).
 - **`skill`** opens a skill by name.
 
 **Nothing asks for approval:** an agent can do anything your account can. Agents
 in one account stay apart by convention (their own folders), not by enforcement.
 Use a separate account or container when that matters.
+
+## Reminders
+
+An agent can schedule its own wake-ups: `remind` with `in` ("20m", "2h",
+"1h30m"), or `at` (local time: "2026-10-17 09:00", "09:00" for the next one,
+"tomorrow 09:00"), optionally `every` to repeat. The reply states the exact
+time it will fire, because small models are bad at time arithmetic. When it's
+due, the agent gets a message: "[Reminder #3, set … for …. It's now …]" and
+then its own text.
+
+- **Idle:** it wakes straight away.
+- **Mid-task:** nothing is interrupted. The reminder arrives with the result of
+  the step in progress (after a long command finishes, for example), like your
+  own mid-task messages.
+- **Paused:** it waits until `/resume`.
+- **While hobkin wasn't running:** it's delivered at the next start, marked
+  late. A repeating one is delivered once, saying how many times were missed,
+  and moves to its next time.
+- **Limits** keep a confused model from running up a bill: at most 20 reminders
+  per agent, repeats at most every 5 minutes, nothing sooner than 10 seconds.
+- `reminders.json` is a plain file: read it, edit it, or delete entries. The
+  agent's current reminders are also listed in its system prompt.
+
+## Keeping agents running
+
+Reminders and idle prompts only fire while the agent's process runs. An idle
+hobkin costs nothing (it sleeps; no API calls), so the simplest approach is to
+keep agents up, e.g. as systemd user services. Save this as
+`~/.config/systemd/user/hobkin@.service`:
+
+```ini
+[Unit]
+Description=hobkin agent %i
+
+[Service]
+ExecStart=%h/.local/bin/hobkin %i
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user enable --now hobkin@tickets-1` starts agent
+`tickets-1` now and at every boot. Run `loginctl enable-linger $USER` once so
+it runs even when you're not logged in. `/stop` exits cleanly and isn't
+restarted; a crash is. `systemctl --user stop hobkin@tickets-1` stops it the
+same way Ctrl-C does.
 
 ## Waking up when idle
 
@@ -277,4 +328,7 @@ nothing and don't need a key. They cover both API styles:
 - the file tools (exact text with quotes, `$` and backslashes; repeated and
   missing matches; pasted line numbers; paging) and the skill tool;
 - skills (listing, which copy wins, front matter);
-- `requests_per_minute` shared across two agents.
+- `requests_per_minute` shared across two agents;
+- reminders (firing while idle, arriving mid-command with that command's result,
+  validation, list and cancel, the prompt section, late and repeating after a
+  restart, a broken `reminders.json`).

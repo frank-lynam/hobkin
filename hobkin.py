@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+from datetime import date, datetime, timedelta
 import urllib.request
 
 HOME = os.path.expanduser(os.environ.get("HOBKIN_HOME", "~/.hobkins"))
@@ -112,6 +113,12 @@ organized, and report clearly when you're done.
     matches only once. If it says the text isn't found, read the file again;
     don't guess.
   - Read the result each tool shows you, and check it's what you meant.
+- **remind** sets a reminder to wake yourself later ("check the build in
+  20m", "follow up tomorrow at 09:00"), once or repeating. When it's due you
+  get a message with your text, so write everything you'll need: what to
+  check, ids, paths. **reminders** lists them or cancels one. To wait for
+  something that takes more than a couple of minutes, don't `sleep` in bash:
+  set a reminder, note it in your checklist, and end your turn.
 - **skill** opens a skill by name (see the Skills list). Always open the skill
   before doing a task it covers, and follow its steps in order. Its files are
   in the folder it tells you; use those full paths.
@@ -249,6 +256,18 @@ TOOLS = [
          "new_text": {"type": "string", "description": "What to put there instead."},
          "replace_all": {"type": "boolean"}},
          "required": ["path", "old_text", "new_text"]}},
+    {"name": "remind",
+     "description": ("Set a reminder to wake yourself later: when it's due you get a message with its text. Give "
+                     "`in` (e.g. \"20m\", \"2h\", \"1d\", \"1h30m\") or `at` (local time: \"2026-10-17 09:00\", "
+                     "\"09:00\" for the next 9 o'clock, \"tomorrow 09:00\"), and optionally `every` to repeat (at least "
+                     "5m). Use it instead of waiting in bash, then end your turn. The reply says exactly when it will fire."),
+     "input_schema": {"type": "object", "properties": {
+         "message": {"type": "string", "description": "What to tell yourself: what to check or do, with any ids or paths."},
+         "in": {"type": "string"}, "at": {"type": "string"}, "every": {"type": "string"}},
+         "required": ["message"]}},
+    {"name": "reminders",
+     "description": "List your reminders, or cancel one by id.",
+     "input_schema": {"type": "object", "properties": {"cancel": {"type": "integer", "description": "Id of a reminder to cancel."}}}},
     {"name": "skill",
      "description": "Open a skill by name: its instructions, its folder and its files. Open the skill before a task it covers.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
@@ -283,7 +302,54 @@ trap __hobkin_save EXIT
 shopt -s expand_aliases
 """
 
-COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt")
+COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders")
+REMINDER_LIMIT = 20          # per agent
+REMINDER_MIN_EVERY = 300     # seconds between repeats, at least
+TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def parse_duration(text):
+    """'20m', '2h', '1d', '1h30m', '90s', '2 weeks' -> seconds."""
+    t = str(text).strip().lower().replace(" ", "")
+    parts = re.findall(r"(\d+(?:\.\d+)?)(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w)", t)
+    if not parts or "".join(n + u for n, u in parts) != t:
+        raise ValueError(f"can't read {text!r} as a length of time: use e.g. 30m, 2h, 1d or 1h30m")
+    return sum(float(n) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[u[0]] for n, u in parts)
+
+
+def parse_at(text, now_t):
+    """A local time: 'YYYY-MM-DD HH:MM[:SS]' (or with T), 'HH:MM' (the next one), 'tomorrow HH:MM'."""
+    t, tomorrow = str(text).strip(), False
+    if t.lower().startswith("tomorrow"):
+        t, tomorrow = t[8:].strip(), True
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            if not tomorrow:
+                return datetime.strptime(t, fmt).timestamp()
+        except ValueError:
+            pass
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            clock = datetime.strptime(t, fmt).time()
+        except ValueError:
+            continue
+        day = date.fromtimestamp(now_t) + timedelta(days=1 if tomorrow else 0)
+        when = datetime.combine(day, clock).timestamp()
+        return when if tomorrow or when > now_t else when + 86400
+    raise ValueError(f"can't read {text!r} as a time: use '2026-10-17 09:00', '09:00' or 'tomorrow 09:00'")
+
+
+def when_text(t):
+    return time.strftime("%a %Y-%m-%d %H:%M", time.localtime(t))
+
+
+def span_text(seconds):
+    s, out = int(round(seconds)), []
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            out.append(f"{s // size}{unit}")
+            s %= size
+    return " ".join(out[:2]) or f"{s}s"
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524, 529}
 
 
@@ -722,6 +788,10 @@ class Agent:
                          "Before you start a task that a skill below covers, open it with the `skill` tool and follow "
                          "it step by step.\n\n"
                          + "\n".join(f"- **{n}**: {d}" for n, (d, p) in sorted(skills.items())))
+        if os.path.exists(self.p("reminders.json")):
+            data, ok = self.load_reminders()
+            if ok and data["items"]:
+                parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\n{memory or '(empty)'}")
         return "\n\n---\n\n".join(parts)
@@ -837,6 +907,9 @@ class Agent:
             self.compact_requested = True   # done between steps, never mid-command
         elif cmd == "/interrupt":
             self.interrupt = True
+        elif cmd == "/reminders":
+            data, _ = self.load_reminders()
+            self.log("hobkin", "\n".join(self.reminder_lines(data["items"])) or "no reminders")
         elif cmd == "/status":
             self.log("hobkin", json.dumps({k: self.state.get(k) for k in
                                            ("status", "model", "context_tokens", "last_input_tokens", "compactions")}))
@@ -1043,6 +1116,126 @@ class Agent:
         return (f"Skill: {match}\nFolder: {folder}\nFiles: {', '.join(files[:100])}\n"
                 f"Paths in these instructions are relative to that folder: use {folder}/<path>.\n\n{read(path)}"), False
 
+    # --- reminders: reminders.json in the agent's folder (you can read and edit it)
+    def warn_once(self, key, text):
+        """Log a problem with a hand-edited file once per version of that file, not on every check."""
+        if getattr(self, "_warned", {}).get(key) != text:
+            self._warned = {**getattr(self, "_warned", {}), key: text}
+            self.log("hobkin", text)
+
+    def load_reminders(self):
+        try:
+            data = json.loads(read(self.p("reminders.json"), "{}") or "{}")
+        except json.JSONDecodeError as e:
+            self.warn_once("reminders", f"reminders.json isn't valid JSON ({e}); ignoring it until it's fixed")
+            return {"next_id": 1, "items": []}, False
+        items = []
+        for r in data.get("items", []):
+            try:
+                r["_due"] = datetime.strptime(r["due"], TIME_FMT).timestamp()
+                r["_every"] = parse_duration(r["every"]) if r.get("every") else None
+                items.append(r)
+            except (KeyError, ValueError) as e:
+                self.warn_once(f"reminder {r}", f"skipping a reminder in reminders.json I can't read ({e}): {r}")
+        return {"next_id": data.get("next_id", 1 + max([r.get("id", 0) for r in items] or [0])), "items": items}, True
+
+    def save_reminders(self, data):
+        items = sorted(({k: v for k, v in r.items() if not k.startswith("_")} for r in data["items"]), key=lambda r: r["due"])
+        write_atomic(self.p("reminders.json"), json.dumps({"next_id": data["next_id"], "items": items}, indent=2) + "\n")
+
+    def reminder_lines(self, items):
+        now_t = time.time()
+        return [f"#{r['id']}: {when_text(r['_due'])} (in {span_text(max(0, r['_due'] - now_t))})"
+                + (f", repeats every {r['every']}" if r.get("every") else "") + f": {r['message']}"
+                for r in sorted(items, key=lambda r: r["_due"])]
+
+    def tool_remind(self, inp):
+        message = str(inp.get("message") or "").strip()
+        if not message:
+            return "A reminder needs a message: what to check or do when it fires.", True
+        now_t = time.time()
+        data, ok = self.load_reminders()
+        if not ok:
+            return "reminders.json is broken; ask the operator to fix it.", True
+        if len(data["items"]) >= REMINDER_LIMIT:
+            return f"You already have {REMINDER_LIMIT} reminders (the most allowed). Cancel some with the reminders tool.", True
+        try:
+            every = parse_duration(inp["every"]) if inp.get("every") else None
+            if every is not None and every < REMINDER_MIN_EVERY:
+                return f"Reminders can repeat at most every {REMINDER_MIN_EVERY // 60} minutes.", True
+            if inp.get("in") and inp.get("at"):
+                return "Give either `in` or `at`, not both.", True
+            if inp.get("in"):
+                due = now_t + parse_duration(inp["in"])
+            elif inp.get("at"):
+                due = parse_at(inp["at"], now_t)
+            elif every:
+                due = now_t + every
+            else:
+                return "Say when: `in` (e.g. \"20m\") or `at` (e.g. \"tomorrow 09:00\"), and/or `every`.", True
+        except ValueError as e:
+            return f"{e}. It's now {when_text(now_t)}.", True
+        if due < now_t + 10:
+            return f"That's {'in the past' if due < now_t else 'too soon'}: it's now {when_text(now_t)}.", True
+        rid = data["next_id"]
+        data["next_id"] += 1
+        data["items"].append({"id": rid, "message": message, "due": time.strftime(TIME_FMT, time.localtime(due)),
+                              "every": inp.get("every") or None, "set": time.strftime(TIME_FMT, time.localtime(now_t)),
+                              "_due": due})
+        self.save_reminders(data)
+        return (f"Reminder #{rid} set for {when_text(due)} (in {span_text(due - now_t)})"
+                + (f", then every {inp['every']}" if every else "") + f". It's now {when_text(now_t)}."), False
+
+    def tool_reminders(self, inp):
+        data, ok = self.load_reminders()
+        note = ""
+        if inp.get("cancel") is not None:
+            rid = int(inp["cancel"])
+            kept = [r for r in data["items"] if r["id"] != rid]
+            if len(kept) == len(data["items"]):
+                return f"There's no reminder #{rid}.\n" + ("\n".join(self.reminder_lines(data["items"])) or "You have no reminders."), True
+            data["items"] = kept
+            self.save_reminders(data)
+            note = f"Cancelled reminder #{rid}.\n"
+        lines = self.reminder_lines(data["items"])
+        return note + (("Your reminders:\n" + "\n".join(lines)) if lines else "You have no reminders.") \
+            + f"\nIt's now {when_text(time.time())}.", False
+
+    def take_due_reminders(self):
+        """Messages for reminders that are due; repeating ones move to their next time."""
+        if not os.path.exists(self.p("reminders.json")):
+            return []
+        now_t = time.time()
+        data, ok = self.load_reminders()
+        due = [r for r in data["items"] if r["_due"] <= now_t] if ok else []
+        if not due:
+            return []
+        out = []
+        for r in due:
+            late = now_t - r["_due"]
+            text = f"[Reminder #{r['id']}, set {r.get('set', '?')[:16]} for {when_text(r['_due'])}"
+            text += f"; {span_text(late)} late (hobkin wasn't running then)" if late > 90 else ""
+            if r["_every"]:
+                missed, nxt = 0, r["_due"]
+                while nxt <= now_t:
+                    nxt += r["_every"]
+                    missed += 1
+                r["_due"], r["due"] = nxt, time.strftime(TIME_FMT, time.localtime(nxt))
+                text += (f"; {missed - 1} earlier times were missed" if missed > 1 else "") + f"; repeats, next {when_text(nxt)}"
+            else:
+                data["items"].remove(r)
+            text += f". It's now {when_text(now_t)}.]\n{r['message']}"
+            self.log("reminder", text)
+            out.append(text)
+        self.save_reminders(data)
+        return out
+
+    def next_reminder_in(self):
+        if not os.path.exists(self.p("reminders.json")):
+            return None
+        data, ok = self.load_reminders()
+        return max(0.0, min(r["_due"] for r in data["items"]) - time.time()) if ok and data["items"] else None
+
     def run_tool(self, name, inp):
         """(result text, is_error) for one tool call."""
         try:
@@ -1058,6 +1251,14 @@ class Agent:
             if name == "edit_file":
                 result = self.edit_file(str(inp["path"]), str(inp["old_text"]), str(inp["new_text"]), bool(inp.get("replace_all")))
                 self.log("edit", result[0])
+                return result
+            if name == "remind":
+                result = self.tool_remind(inp)
+                self.log("remind", result[0])
+                return result
+            if name == "reminders":
+                result = self.tool_reminders(inp)
+                self.log("reminders", result[0])
                 return result
             if name == "skill":
                 self.log("skill", str(inp.get("name")))
@@ -1220,7 +1421,9 @@ class Agent:
             else:
                 content, err = self.run_tool(b.get("name"), b.get("input") or {})
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
-        # Operator messages that came in meanwhile ride along with the results
+        # Reminders that came due and operator messages that came in meanwhile ride along
+        for text in self.take_due_reminders():
+            results.append({"type": "text", "text": text})
         for text in self.pending:
             results.append({"type": "text", "text": f"[message from operator]\n{text}"})
         self.pending = []
@@ -1244,8 +1447,9 @@ class Agent:
                 if self.compact_requested and not self.working:
                     self.compact_requested = False
                     self.compact("requested")
-                if self.pending:
-                    self.add_user("\n\n".join(self.pending))
+                due = self.take_due_reminders()
+                if due or self.pending:
+                    self.add_user("\n\n".join(due + self.pending))
                     self.pending = []
                 if self.working:
                     self.save_state("working")
@@ -1255,7 +1459,9 @@ class Agent:
                     continue
                 self.save_state("idle")
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
-                self.poll_input(max(0.0, idle_since + every - time.time()) if prompt else 3600)
+                wait = max(0.0, idle_since + every - time.time()) if prompt else 3600
+                nxt = self.next_reminder_in()
+                self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
                     self.log("hobkin", "idle prompt")
                     self.add_user(prompt)

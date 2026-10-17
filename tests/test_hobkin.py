@@ -259,6 +259,46 @@ try:
                        capture_output=True, text=True, timeout=20)
     check("[config] two models and no \"model\": asks you to pick", r.returncode != 0 and "\"model\" isn't set" in r.stderr
           and "m, extra" in r.stderr, r.stderr)
+    # reminders: fire while idle, validation, list/cancel, prompt section, late + repeating after a restart
+    h = home("remind", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+    p, aid, d = start(h)
+    def tool(name, args, marker):
+        say(d, f"call: {name} " + json.dumps(args)); wait_for(d, marker, file="context.jsonl")
+    tool("remind", {"message": "check the build log", "in": "12s"}, "Reminder #1 set for")
+    wait_for(d, "reminder> [Reminder #1", 20)
+    wait_for(d, "agent> echo: [Reminder #1", 10)
+    check("[remind] fires on its own while idle", json.load(open(d + "/reminders.json"))["items"] == [])
+    # due in the middle of a command: not an interruption; it arrives with that command's result
+    tool("remind", {"message": "mid-task nudge", "in": "11s"}, "Reminder #2 set for")
+    say(d, "run: sleep 15; echo finished-sleeping"); wait_for(d, "reminder> [Reminder #2", 25)
+    wait_for(d, "finished-sleeping")
+    last_user = [m for m in ctx(d) if m["role"] == "user"][-1]["content"]
+    check("[remind] due mid-command: command not interrupted, reminder rides with its result",
+          last_user[0]["type"] == "tool_result" and "finished-sleeping" in last_user[0]["content"]
+          and any("[Reminder #2" in b.get("text", "") and "mid-task nudge" in b.get("text", "") for b in last_user[1:]), last_user)
+    tool("remind", {"message": "x", "every": "10s"}, "at most every 5 minutes")
+    tool("remind", {"message": "x", "at": "2000-01-01 10:00"}, "in the past: it's now")
+    tool("remind", {"message": "x", "in": "soon"}, "can't read 'soon' as a length of time")
+    tool("remind", {"message": "later", "in": "2h"}, "Reminder #3 set for")
+    tool("remind", {"message": "daily standup notes", "at": "tomorrow 09:00", "every": "1d"}, "Reminder #4 set for")
+    tool("reminders", {}, "Your reminders:")
+    check("[remind] listed in the system prompt", "# Your reminders" in ctx(d)[0]["content"] and "daily standup notes" in ctx(d)[0]["content"])
+    tool("reminders", {"cancel": 3}, "Cancelled reminder #3")
+    say(d, "/reminders"); wait_for(d, "#4: ")
+    say(d, "/stop"); p.wait(10)
+    data = json.load(open(d + "/reminders.json"))
+    check("[remind] cancel removed it", [r["id"] for r in data["items"]] == [4], data)
+    three_days_ago = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 3 * 86400 - 600))
+    data["items"][0]["due"] = three_days_ago
+    json.dump(data, open(d + "/reminders.json", "w"))
+    p, _, d = start(h, aid)
+    wait_for(d, "late (hobkin wasn't running then); 3 earlier times were missed; repeats, next", 15)
+    nxt = json.load(open(d + "/reminders.json"))["items"][0]["due"]
+    check("[remind] late repeating reminder delivered once, rescheduled ahead", nxt > time.strftime("%Y-%m-%d %H:%M:%S"), nxt)
+    open(d + "/reminders.json", "w").write("{broken")
+    say(d, "hello"); wait_for(d, "echo: hello"); say(d, "again"); wait_for(d, "echo: again")
+    check("[remind] a broken reminders.json is reported once", open(d + "/out").read().count("isn't valid JSON") == 1)
+    p.send_signal(signal.SIGTERM); p.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:
