@@ -386,6 +386,28 @@ try:
     nudges = sum(b.get("text", "").startswith("[hobkin: that reads like a committee") for m in ctx(d) for b in m["content"] if m["role"] == "user")
     check("[voice] a committee-speak reply gets one nudge", nudges == 1, nudges)
     p.send_signal(signal.SIGTERM); p.wait(10)
+    # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
+    h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"heartbeat_seconds": 1, "idle_prompt": None})
+    log = os.path.join(BASE, "beat-stdout.txt")
+    p = subprocess.Popen([sys.executable, HOB, "beat1"], env={**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"},
+                         stdout=open(log, "w"), stderr=subprocess.STDOUT); procs.append(p)
+    d = os.path.join(h, "beat1")
+    for _ in range(50):
+        if os.path.exists(d + "/out") and "up:" in open(d + "/out").read(): break
+        time.sleep(0.1)
+    beats = lambda: [l for l in open(log).read().splitlines() if "hobkin beat1 active:" in l]
+    time.sleep(3)
+    check("[heartbeat] silent while only a message can wake it", beats() == [], beats())
+    say(d, "run: sleep 4; echo slept-for-beat"); wait_for(d, "Done. Output was: slept-for-beat", 20)
+    check("[heartbeat] 'working' while it works", any(l.endswith("active: working") for l in beats()), beats())
+    say(d, 'call: remind {"message": "check the queue", "in": "2h"}'); wait_for(d, "Reminder #1 set for", file="context.jsonl")
+    time.sleep(3)
+    check("[heartbeat] 'on duty' with a reminder coming", any("on duty, next check in" in l and "(reminder #1)" in l for l in beats()), beats()[-3:])
+    say(d, "/pause"); time.sleep(1.5); n = len(beats()); time.sleep(3)
+    check("[heartbeat] silent when paused", len(beats()) == n, beats()[-3:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # systemd user services (only where a user session exists; skipped on CI runners)
     if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0:
         h = home("svc", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake",

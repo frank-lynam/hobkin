@@ -91,6 +91,9 @@ DEFAULT_CONFIG = {
     "bash_timeout": 600,       # default seconds per command (an agent can ask for longer)
     "output_limit": 30000,     # characters of command output kept (head + tail)
     "compact_at": 0.8,         # compact when the context passes this share of the window
+    # Not in a terminal (e.g. a systemd service): print "hobkin ID active: ..." to stdout this often
+    # while on duty (working, or idle with a reminder or idle prompt coming). 0 turns it off.
+    "heartbeat_seconds": 60,
     # Extra folders of skills (each skill a folder with SKILL.md), lowest priority first.
     # Always searched after these: _shared/skills, then the agent's own skills/.
     "skill_dirs": [],
@@ -1618,9 +1621,47 @@ class Agent:
         self.save_context()
         self.save_state()
 
+    def duty(self):
+        """What the heartbeat reports, or None when only a message can wake the agent."""
+        if self.paused or self.stop:
+            return None
+        if self.working:
+            return "working"
+        coming = []
+        try:                                       # read-only: never logs from this thread
+            items = json.loads(read(self.p("reminders.json"), "{}") or "{}").get("items", [])
+            if items:
+                soon = min(items, key=lambda r: r["due"])
+                coming.append((datetime.strptime(soon["due"], TIME_FMT).timestamp(), f"reminder #{soon['id']}"))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
+        if self.next_idle_prompt:
+            coming.append((self.next_idle_prompt, "idle prompt"))
+        if not coming:
+            return None
+        when, what = min(coming)
+        return f"on duty, next check in {span_text(max(0, when - time.time()))} ({what})"
+
+    def start_heartbeat(self):
+        """A line in the systemd journal (stdout) every heartbeat_seconds while on duty: from a thread,
+        because the main loop can spend minutes inside one model call."""
+        every = float(self.cfg.get("heartbeat_seconds") or 0)
+        if every <= 0 or sys.stdout.isatty():
+            return
+
+        def beat():
+            while not self.stop:
+                time.sleep(every)
+                line = self.duty()
+                if line:
+                    print(f"hobkin {self.id} active: {line}", flush=True)
+        threading.Thread(target=beat, daemon=True).start()
+
     def run(self):
         self.boot()
         self.save_context()
+        self.next_idle_prompt = None
+        self.start_heartbeat()
         idle_since = time.time()
         try:
             while not self.stop:
@@ -1647,6 +1688,7 @@ class Agent:
                 self.save_state("idle")
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
                 wait = max(0.0, idle_since + every - time.time()) if prompt else 3600
+                self.next_idle_prompt = idle_since + every if prompt else None
                 nxt = self.next_reminder_in()
                 self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
@@ -1686,7 +1728,8 @@ class Agent:
 
 CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
-                "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int}
+                "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
+                "heartbeat_seconds": (int, float)}
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
                "context_tokens": (int, type(None)), "requests_per_minute": (int, float, type(None)), "headers": dict,
                "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None))}

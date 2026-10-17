@@ -288,8 +288,15 @@ hobkin service remove tickets-1   # stop it and take it off boot
 - **Stopping and crashes:** `/stop` exits cleanly and stays stopped. A crash is
   restarted after 30 seconds, and systemd gives up after 5 failures in 10
   minutes, so a broken config can't spin.
-- **Logs:** they stay in the agent's `out`; `journalctl --user -u hobkin@ID`
-  shows startup errors.
+- **Logs:** the agent's own log stays in its `out` file. The journal
+  (`journalctl --user -u hobkin@ID`) gets startup errors, plus a heartbeat every
+  `heartbeat_seconds` (60) while the agent is on duty:
+  - `hobkin ID active: working` while it works;
+  - `hobkin ID active: on duty, next check in 7m (reminder #2)` while it's idle
+    with a wake-up scheduled (say, a tracker check with nothing to pick up).
+  - It's silent while only a message can wake the agent, or when it's paused, so
+    a quiet journal means it's waiting for you. There's no heartbeat in a
+    terminal; set `heartbeat_seconds` to 0 to turn it off.
 - **Keys:** a service doesn't see your shell's environment. `key_file` works
   as is; for `key_env`, put `NAME=value` lines in `~/.config/hobkin/env`
   (chmod 600). `add` warns when that's needed.
