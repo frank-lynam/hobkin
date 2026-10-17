@@ -162,6 +162,12 @@ are; if it's left out and there's only one model, that one is used.
 - The key comes from the environment variable `key_env`, or else from the file
   `key_file`. It's removed from the agent's shell environment.
 - `headers` (optional): extra HTTP headers.
+- `prompt_cache` (optional): on OpenAI-style APIs, mark the system prompt and the
+  newest message for caching. It's on by default for Claude models (e.g. on
+  OpenRouter), where re-reading the conversation then costs about 5% of the
+  normal input price; a test session went from about $0.023 per call to $0.001.
+  On OpenRouter, each call's reported cost is added up in `state.json`
+  (`spend_usd`).
 - `requests_per_minute` (optional): a cap on calls to this model. It's shared by
   every agent using the same API, model and key, because that's what the
   provider counts. The agents coordinate through a small lock file in

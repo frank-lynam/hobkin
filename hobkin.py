@@ -564,6 +564,7 @@ class Model:
         key = os.environ.get(cfg.get("key_env") or "", "") or read(os.path.expanduser(cfg.get("key_file") or "/nonexistent")).strip()
         self.key = key
         self.extra_headers = cfg.get("headers", {})
+        self.last_cost = None
 
     def headers(self):
         h = dict(self.extra_headers)
@@ -574,6 +575,12 @@ class Model:
         elif self.key:
             h["authorization"] = f"Bearer {self.key}"
         return h
+
+    def prompt_cache(self):
+        """Send cache markers on OpenAI-style APIs: config prompt_cache, else on for Claude models."""
+        if self.cfg.get("prompt_cache") is not None:
+            return bool(self.cfg["prompt_cache"])
+        return "claude" in self.model.lower() or "anthropic/" in self.model.lower()
 
     def rate_file(self):
         """Request log shared by every agent that uses this API, model and key (the key only hashed)."""
@@ -651,14 +658,26 @@ class Model:
             u = r.get("usage") or {}
             used = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
             return r.get("content") or [], r.get("stop_reason"), used
-        body = {"model": self.model, "messages": self._to_openai(system, messages),
+        msgs = self._to_openai(system, messages)
+        if self.prompt_cache():
+            # Claude behind an OpenAI-style API (e.g. OpenRouter) caches only where it's told to:
+            # mark the system prompt and the newest message, so each call re-reads the rest cheaply
+            mark = {"type": "ephemeral"}
+            msgs[0]["content"] = [{"type": "text", "text": system, "cache_control": mark}]
+            last = msgs[-1]
+            if last["role"] in ("user", "tool") and isinstance(last.get("content"), str) and last["content"]:
+                last["content"] = [{"type": "text", "text": last["content"], "cache_control": mark}]
+        body = {"model": self.model, "messages": msgs,
                 "tools": [{"type": "function", "function": {"name": t["name"], "description": t["description"],
                                                             "parameters": t["input_schema"]}} for t in tools]}
         if max_tokens:
             body["max_tokens"] = max_tokens
         if tool_choice == "none":
             body["tool_choice"] = "none"
+        if "openrouter.ai" in self.base:
+            body["usage"] = {"include": True}        # OpenRouter then reports each call's cost
         r = self._post(f"{self.base}/chat/completions", body)
+        self.last_cost = (r.get("usage") or {}).get("cost")
         if "choices" not in r:
             raise ApiError(0, json.dumps(r)[:500])
         choice = r["choices"][0]
@@ -1367,6 +1386,9 @@ class Agent:
                                                             tool_choice=tool_choice)
                 if used:
                     self.state["last_input_tokens"] = used
+                if self.model.last_cost:
+                    self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + float(self.model.last_cost), 6)
+                    self.model.last_cost = None
                 return blocks, stop_reason
             except ApiError as e:
                 if e.status not in RETRY_STATUS:
