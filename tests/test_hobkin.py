@@ -69,6 +69,10 @@ try:
         say(d, "run: cd .. && rmdir deeper")
         wait_for(d, "now in sub/ in your workspace")
         say(d, "run: cd $HOBKIN_WORK && echo back-home"); wait_for(d, "Done. Output was: back-home")
+        # an error inside a 200 response (OpenRouter's 504, Anthropic's overloaded) is retried, not a pause
+        say(d, "hiccup please"); wait_for(d, "echo: hiccup please", 20)
+        check(f"[{api}] an upstream error in a 200 body is retried", "model busy (5" in open(d + "/out").read()
+              and "pausing until you send" not in open(d + "/out").read())
         # secrets + live send via CLI
         open(d + "/secrets.env", "w").write("FOO=bar\n")
         r = subprocess.run([sys.executable, HOB, "send", aid, "run: echo FOO=$FOO"], env={**os.environ, "HOBKIN_HOME": h}, capture_output=True, text=True)

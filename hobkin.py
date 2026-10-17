@@ -456,7 +456,23 @@ def span_text(seconds):
             out.append(f"{s // size}{unit}")
             s %= size
     return " ".join(out[:2]) or f"{s}s"
-RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524, 529}
+# Errors a retry can't fix: pause and wait for the operator. Everything else (timeouts, overload,
+# upstream trouble, anything unknown) is retried with growing waits.
+FATAL_STATUS = {400, 401, 402, 403, 404, 405, 413, 422}
+
+
+def body_error(r):
+    """An error reported inside a 200 response (OpenRouter does this for upstream failures):
+    at the top level or in the first choice. ApiError with the error's own code, or None."""
+    for err in (r.get("error"), ((r.get("choices") or [{}])[0] or {}).get("error")):
+        if err:
+            code = err.get("code") if isinstance(err, dict) else None
+            try:
+                status = int(code)
+            except (TypeError, ValueError):
+                status = 0
+            return ApiError(status, json.dumps(r)[:500])
+    return None
 
 
 def clip(text, head, tail):
@@ -703,6 +719,11 @@ class Model:
             if tool_choice == "none":
                 body["tool_choice"] = {"type": "none"}
             r = self._post(f"{self.base}/v1/messages", body)
+            if r.get("type") == "error":     # an error in a 200 body: overloaded is retried, like any non-fatal
+                kind = (r.get("error") or {}).get("type", "")
+                raise ApiError({"overloaded_error": 529, "rate_limit_error": 429, "invalid_request_error": 400,
+                                "authentication_error": 401, "permission_error": 403, "not_found_error": 404
+                                }.get(kind, 500), json.dumps(r)[:500])
             u = r.get("usage") or {}
             used = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
             return r.get("content") or [], r.get("stop_reason"), used
@@ -726,8 +747,9 @@ class Model:
             body["usage"] = {"include": True}        # OpenRouter then reports each call's cost
         r = self._post(f"{self.base}/chat/completions", body)
         self.last_cost = (r.get("usage") or {}).get("cost")
-        if "choices" not in r:
-            raise ApiError(0, json.dumps(r)[:500])
+        err = body_error(r)
+        if err or "choices" not in r:
+            raise err or ApiError(0, json.dumps(r)[:500])
         choice = r["choices"][0]
         msg = choice.get("message") or {}
         blocks = []
@@ -1446,7 +1468,7 @@ class Agent:
                     self.model.last_cost = None
                 return blocks, stop_reason
             except ApiError as e:
-                if e.status not in RETRY_STATUS:
+                if e.status in FATAL_STATUS:
                     raise
                 wait = e.retry_after or delay
                 self.log("hobkin", f"model busy ({e.status}); retrying in {int(wait)}s")

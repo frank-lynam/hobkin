@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CTX = int(sys.argv[2]) if len(sys.argv) > 2 else 100000
 LIST_CTX = sys.argv[3] != "nolist" if len(sys.argv) > 3 else True
 import os
+HICCUPS = {}
 LOG = open(os.environ.get("FAKE_API_LOG", "fake_api.log"), "a")
 def last_text(blocks):
     return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -39,6 +40,11 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         LOG.write(json.dumps({"path": self.path, "body": body}) + "\n"); LOG.flush()
         size = len(json.dumps(body)) // 4
+        if "hiccup" in json.dumps(body.get("messages", [])[-1:]) and not HICCUPS.get(self.path):
+            HICCUPS[self.path] = True                  # once per API: an error inside a 200 response
+            return self.send(200, {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
+                             if self.path == "/v1/messages" else
+                             {"id": "gen-1", "error": {"message": "Upstream idle timeout exceeded", "code": 504}})
         if self.path == "/v1/messages":
             assert self.headers.get("x-api-key") == "test-key", "missing key"
             msgs = body["messages"]; prev_calls = set()
