@@ -271,7 +271,7 @@ try:
     say(d1, "one"); wait_for(d1, "echo: one")
     say(d2, "two"); wait_for(d2, "echo: two")
     say(d1, "three"); wait_for(d1, "echo: three")
-    say(d2, "four"); wait_for(d2, "rate limit (3/min): waiting", 10)
+    say(d2, "four"); wait_for(d2, "waiting for a request slot (3/min)", 10)
     time.sleep(1)
     check("[rpm] 4th request across two agents waits", "echo: four" not in open(d2 + "/out").read())
     rate_files = [f for f in os.listdir(h + "/_shared") if f.startswith(".requests-")]
@@ -386,6 +386,40 @@ try:
     nudges = sum(b.get("text", "").startswith("[hobkin: that reads like a committee") for m in ctx(d) for b in m["content"] if m["role"] == "user")
     check("[voice] a committee-speak reply gets one nudge", nudges == 1, nudges)
     p.send_signal(signal.SIGTERM); p.wait(10)
+    # provider rate limits (429): wait exactly as long as the API says, guess well when it doesn't,
+    # and share the cooldown so other agents on the same key don't poke it
+    import urllib.request as _ur
+    served = lambda: json.load(_ur.urlopen("http://127.0.0.1:48701/stats"))["rate_429s"]
+    h = home("limits", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+    p1, a1, d1 = start(h); p2, a2, d2 = start(h)
+    for mode, hint in (("header", "retry-after"), ("epoch", "x-ratelimit-reset"), ("body", "x-ratelimit-reset")):
+        before, t0 = served(), time.time()
+        say(d1, f"ratelimit:4:{mode} please"); wait_for(d1, f"echo: ratelimit:4:{mode} please", 30)
+        took, out = time.time() - t0, open(d1 + "/out").read()
+        check(f"[429] reset given as {mode}: one blocked call, then waits it out",
+              served() - before == 1 and 3.5 <= took < 9 and f"the API said when ({hint})" in out, (served() - before, round(took, 1)))
+    before, t0 = served(), time.time()
+    say(d1, "ratelimit:4:none please"); wait_for(d1, "echo: ratelimit:4:none please", 40)
+    check("[429] no reset given: guesses 15s, one blocked call", served() - before == 1 and time.time() - t0 >= 14
+          and "no reset time given, so guessing: waiting 15s" in open(d1 + "/out").read(), (served() - before, round(time.time() - t0, 1)))
+    before = served()
+    marker = "rate limited by the API; the API said when (retry-after)"
+    seen = open(d1 + "/out").read().count(marker)
+    say(d1, "ratelimit:6:header shared")
+    for _ in range(100):                                   # a new occurrence, not one from earlier
+        if open(d1 + "/out").read().count(marker) > seen: break
+        time.sleep(0.1)
+    say(d2, "hello from the second agent")
+    wait_for(d2, "another agent on this key hit it", 10)
+    for _ in range(20):                                    # the log line comes a moment before state.json
+        if json.load(open(d2 + "/state.json")).get("status") == "waiting (rate limited)": break
+        time.sleep(0.1)
+    check("[429] the cooldown is shared: the other agent waits without calling", served() - before == 1
+          and json.load(open(d2 + "/state.json"))["status"] == "waiting (rate limited)", served() - before)
+    wait_for(d1, "echo: ratelimit:6:header shared", 20); wait_for(d2, "echo: hello from the second agent", 20)
+    check("[429] both carry on afterwards, still one blocked call", served() - before == 1, served() - before)
+    for p_ in (p1, p2): p_.send_signal(signal.SIGTERM); p_.wait(10)
+
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"heartbeat_seconds": 1, "idle_prompt": None})

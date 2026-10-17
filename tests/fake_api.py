@@ -1,11 +1,12 @@
 """Fake model API for the tests: Anthropic- and OpenAI-shaped, and strict about message
 structure (alternating roles, every tool call answered). Usage: fake_api.py PORT CONTEXT [list|nolist]"""
-import json, sys, re
+import json, sys, re, time, math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CTX = int(sys.argv[2]) if len(sys.argv) > 2 else 100000
 LIST_CTX = sys.argv[3] != "nolist" if len(sys.argv) > 3 else True
 import os
 HICCUPS = {}
+RATE = {"until": 0.0, "mode": None, "count": 0, "seen": set()}
 LOG = open(os.environ.get("FAKE_API_LOG", "fake_api.log"), "a")
 def last_text(blocks):
     return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -21,10 +22,13 @@ def decide(last_user_texts, tool_results, summary):
     return ("text", "echo: " + t.strip()[:80])
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
-    def send(self, code, obj):
+    def send(self, code, obj, headers=None):
         b = json.dumps(obj).encode(); self.send_response(code); self.send_header("content-type", "application/json")
+        for k, v in (headers or {}).items(): self.send_header(k, v)
         self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if self.path == "/stats":
+            return self.send(200, {"rate_429s": RATE["count"]})
         if self.path.startswith("/v1/models/"):
             return self.send(200, {"id": self.path.split("/")[-1], "max_input_tokens": CTX, "max_tokens": 4096})
         if self.path == "/v1/models":
@@ -40,6 +44,21 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         LOG.write(json.dumps({"path": self.path, "body": body}) + "\n"); LOG.flush()
         size = len(json.dumps(body)) // 4
+        # Rate limiting like a real provider: "ratelimit:SECONDS:MODE" in a message blocks every request
+        # for SECONDS; MODE says how the reset is given (header / epoch / body / none)
+        m = re.search(r"ratelimit:(\d+):(\w+)", json.dumps(body.get("messages", [])[-1:]))
+        if m and m.group(0) not in RATE["seen"]:
+            RATE["seen"].add(m.group(0)); RATE["until"] = time.time() + int(m.group(1)); RATE["mode"] = m.group(2)
+        if time.time() < RATE["until"]:
+            RATE["count"] += 1
+            left, mode = RATE["until"] - time.time(), RATE["mode"]
+            headers = {"Retry-After": str(math.ceil(left))} if mode == "header" else \
+                      {"X-RateLimit-Reset": str(int(RATE["until"] * 1000))} if mode == "epoch" else {}
+            err = {"code": 429, "message": "Rate limit exceeded"}
+            if mode == "body":
+                err["metadata"] = {"headers": {"X-RateLimit-Reset": str(int(RATE["until"] * 1000))}}
+            return self.send(429, {"type": "error", "error": {"type": "rate_limit_error", **err}}
+                             if self.path == "/v1/messages" else {"error": err}, headers)
         if "hiccup" in json.dumps(body.get("messages", [])[-1:]) and not HICCUPS.get(self.path):
             HICCUPS[self.path] = True                  # once per API: an error inside a 200 response
             return self.send(200, {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}

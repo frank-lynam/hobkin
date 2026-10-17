@@ -31,6 +31,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 __version__ = "0.1.1"
 
+import email.utils
 import errno
 import difflib
 import fcntl
@@ -474,7 +475,8 @@ def body_error(r):
                 status = int(code)
             except (TypeError, ValueError):
                 status = 0
-            return ApiError(status, json.dumps(r)[:500])
+            text = json.dumps(r)
+            return ApiError(status, text[:500], *retry_hint({}, text))
     return None
 
 
@@ -612,9 +614,65 @@ def http_json(method, url, headers, body=None, timeout=600):
 
 
 class ApiError(Exception):
-    def __init__(self, status, text, retry_after=None):
+    def __init__(self, status, text, retry_after=None, hint=None):
         super().__init__(f"HTTP {status}: {text[:500]}")
-        self.status, self.text, self.retry_after = status, text, retry_after
+        self.status, self.text, self.retry_after, self.hint = status, text, retry_after, hint
+
+
+RESET_HEADERS = ("retry-after", "x-ratelimit-reset", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+                 "anthropic-ratelimit-requests-reset", "anthropic-ratelimit-tokens-reset",
+                 "anthropic-ratelimit-input-tokens-reset", "anthropic-ratelimit-output-tokens-reset")
+
+
+def reset_seconds(value, now_t):
+    """Seconds until a reset, from any of the forms providers use: seconds ('40'), a duration
+    ('1m30s', '250ms'), an epoch in s or ms (OpenRouter), RFC 3339 (Anthropic) or an HTTP date."""
+    v = str(value).strip()
+    try:
+        x = float(v)
+        return x / 1000 - now_t if x > 1e12 else x - now_t if x > 1e9 else x
+    except ValueError:
+        pass
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h)", v)
+    if parts and "".join(n + u for n, u in parts) == v:
+        return sum(float(n) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[u] for n, u in parts)
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp() - now_t
+    except ValueError:
+        pass
+    try:
+        return email.utils.parsedate_to_datetime(v).timestamp() - now_t
+    except (TypeError, ValueError):
+        return None
+
+
+def retry_hint(headers, text):
+    """(seconds to wait, where that came from) from response headers or an error body, or (None, None).
+    Retry-After wins; otherwise the longest of the reset times (wait until everything has reset)."""
+    now_t, found = time.time(), {}
+    for k, v in (headers or {}).items():
+        if k.lower() in RESET_HEADERS:
+            found[k.lower()] = reset_seconds(v, now_t)
+    def walk(o):                                   # OpenRouter puts the provider's headers in error.metadata
+        if isinstance(o, dict):
+            for k, v in o.items():
+                key = str(k).lower().replace("_", "-")
+                if key in RESET_HEADERS and isinstance(v, (str, int, float)):
+                    found.setdefault(key, reset_seconds(v, now_t))
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    try:
+        walk(json.loads(text))
+    except (ValueError, TypeError):
+        pass
+    found = {k: max(0.0, min(3600.0, v)) for k, v in found.items() if v is not None}
+    if not found:
+        return None, None
+    key = "retry-after" if "retry-after" in found else max(found, key=found.get)
+    return found[key], key
 
 
 # ---------------------------------------------------------------------- model adapters
@@ -653,6 +711,26 @@ class Model:
         """Request log shared by every agent that uses this API, model and key (the key only hashed)."""
         tag = hashlib.sha256(f"{self.base}|{self.model}|{self.key}".encode()).hexdigest()[:16]
         return os.path.join(SHARED, f".requests-{tag}")
+
+    def blocked_until(self):
+        """When the provider's rate limit, as hit by any agent on this API/model/key, lifts (0: not blocked)."""
+        try:
+            return float(read(self.rate_file() + ".blocked", "0").strip() or 0)
+        except ValueError:
+            return 0.0
+
+    def block(self, until):
+        """Tell every agent on this API/model/key to hold off until `until` (keeps the later time)."""
+        with open(self.rate_file() + ".blocked", "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                current = float(f.read().strip() or 0)
+            except ValueError:
+                current = 0.0
+            f.seek(0)
+            f.truncate()
+            f.write(f"{max(current, until):.3f}\n")
 
     def rate_slot(self, rpm):
         """Claim a request slot under the per-minute cap: 0 if claimed, else seconds to wait."""
@@ -776,8 +854,8 @@ class Model:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             text = e.read().decode(errors="replace")
-            ra = e.headers.get("retry-after") if e.headers else None
-            raise ApiError(e.code, text, float(ra) if ra and ra.replace(".", "", 1).isdigit() else None) from None
+            wait, hint = retry_hint(dict(e.headers or {}), text)
+            raise ApiError(e.code, text, wait, hint) from None
 
     @staticmethod
     def _to_openai(system, messages):
@@ -831,6 +909,7 @@ class Agent:
         self.working = False
         self.interrupt = False
         self.compact_requested = False
+        self.waiting_note = None           # for the heartbeat, while waiting out a rate limit
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1449,17 +1528,17 @@ class Agent:
     # --- the model
     def ask(self, messages, tool_choice=None):
         """Call the model, retrying transient failures. Raises ApiError for real ones."""
-        delay = 2
+        delay, limited = 2, 15          # backoff for errors, and for 429s with no reset hint
         while True:
+            until = self.model.blocked_until()
+            if until > time.time() + 0.5:
+                self.wait_out(until, "rate limited by the API (another agent on this key hit it)")
+                continue
             rpm = self.model.cfg.get("requests_per_minute")
             if rpm:
                 wait = self.model.rate_slot(int(rpm))
                 if wait:
-                    self.log("hobkin", f"rate limit ({rpm}/min): waiting {wait:.0f}s")
-                    self.save_state("waiting (rate limit)")
-                    self.poll_input(wait)
-                    if self.stop:
-                        raise ApiError(0, "stopping")
+                    self.wait_out(time.time() + wait, f"waiting for a request slot ({rpm}/min)")
                     continue
             try:
                 blocks, stop_reason, used = self.model.call(self.system_prompt(), messages, self.max_output(),
@@ -1473,6 +1552,16 @@ class Agent:
             except ApiError as e:
                 if e.status in FATAL_STATUS:
                     raise
+                if e.status == 429:
+                    if e.retry_after is not None:
+                        wait, why = e.retry_after + 1, f"the API said when ({e.hint})"
+                    else:
+                        wait, why = limited, "no reset time given, so guessing"
+                        limited = min(limited * 2, 300)
+                    until = time.time() + wait
+                    self.model.block(until)          # every agent on this key holds off too
+                    self.wait_out(until, f"rate limited by the API; {why}")
+                    continue
                 wait = e.retry_after or delay
                 self.log("hobkin", f"model busy ({e.status}); retrying in {int(wait)}s")
             except (urllib.error.URLError, OSError, TimeoutError) as e:
@@ -1482,6 +1571,19 @@ class Agent:
             if self.stop:
                 raise ApiError(0, "stopping")
             delay = min(delay * 2, 300)
+
+    def wait_out(self, until, why):
+        """Wait until `until` (commands still work), saying so in the log, state.json and the heartbeat."""
+        clock = time.strftime("%H:%M:%S", time.localtime(until))
+        self.waiting_note = f"waiting out a rate limit (until {clock})"
+        self.log("hobkin", f"{why}: waiting {max(1, round(until - time.time()))}s (until {clock})")
+        self.save_state("waiting (rate limited)")
+        while not self.stop and time.time() < until:
+            self.poll_input(min(5.0, max(0.05, until - time.time())))
+        self.waiting_note = None
+        if self.stop:
+            raise ApiError(0, "stopping")
+        self.save_state("working")
 
     def needs_compaction(self):
         ctx = self.state.get("context_tokens")
@@ -1625,6 +1727,8 @@ class Agent:
         """What the heartbeat reports, or None when only a message can wake the agent."""
         if self.paused or self.stop:
             return None
+        if self.waiting_note:
+            return self.waiting_note
         if self.working:
             return "working"
         coming = []

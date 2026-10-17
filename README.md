@@ -177,6 +177,23 @@ are; if it's left out and there's only one model, that one is used.
   `_shared/` (holding a hash of the key, never the key). An agent at the cap
   waits, and still answers commands such as `/stop` while it does.
 
+**When the provider rate-limits anyway (HTTP 429):**
+- **It waits exactly as long as the API says.** It reads `Retry-After` (seconds or
+  a date), OpenRouter's `X-RateLimit-Reset`, Anthropic's
+  `anthropic-ratelimit-*-reset`, and reset times inside the error body, then waits
+  until then plus a second.
+- **If the API gives no reset time,** it waits 15 seconds, then 30, 60…, up to 5
+  minutes. A 40-second limit costs two blocked calls at most.
+- **The cooldown is shared.** The first agent to hit a 429 records "blocked until
+  …" in `_shared/`, and every other agent on the same API, model and key waits it
+  out without trying, so a team causes one blocked call, not one each.
+- **It's visible:**
+  - the log says `rate limited by the API; the API said when (retry-after):
+    waiting 41s (until 13:42:10)`;
+  - `state.json` says `waiting (rate limited)`;
+  - the heartbeat says `waiting out a rate limit (until 13:42:10)`.
+  `/stop` and the other commands still work while it waits.
+
 **The context window is asked for, not hard-coded.** At start-up hobkin asks the API:
 
 - Anthropic: `GET /v1/models/{model}` (`max_input_tokens`, `max_tokens`).
