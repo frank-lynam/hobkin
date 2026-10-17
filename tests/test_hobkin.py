@@ -232,6 +232,14 @@ try:
     say(d2, "/stop"); p2.wait(10)
     check("[rpm] /stop works while waiting", p2.returncode == 0)
     p1.send_signal(signal.SIGTERM); p1.wait(10)
+    # a model that expects a key but has none: stop with a clear message, no request sent
+    h = home("nokey", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake",
+                       "key_env": "NO_SUCH_KEY_VAR", "key_file": "~/no-such-key-file"})
+    before = len(open(LOG).read())
+    r = subprocess.run([sys.executable, HOB, "nokey1"], env={**os.environ, "HOBKIN_HOME": h}, capture_output=True, text=True, timeout=20)
+    check("[keys] missing key stops with a clear message", r.returncode != 0 and "no API key for model 'm'" in r.stderr
+          and "NO_SUCH_KEY_VAR" in r.stderr and "~/no-such-key-file" in r.stderr, r.stderr)
+    check("[keys] no request was sent", len(open(LOG).read()) == before)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:

@@ -27,7 +27,7 @@ for the agent's shell: _shared/secrets.env and ID/secrets.env (KEY=value lines).
 Standard library only. No ports: it only makes outgoing HTTP calls to the model API.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import errno
 import difflib
@@ -623,6 +623,16 @@ class Agent:
         if name not in self.cfg["models"]:
             sys.exit(f"hobkin: model {name!r} isn't in config.json 'models'")
         self.model = Model(name, self.cfg["models"][name])
+        if not self.model.key and (self.model.cfg.get("key_env") or self.model.cfg.get("key_file")):
+            where = " or ".join(x for x in (
+                f"the environment variable {self.model.cfg['key_env']}" if self.model.cfg.get("key_env") else "",
+                f"the file {self.model.cfg['key_file']}" if self.model.cfg.get("key_file") else "") if x)
+            others = ", ".join(n for n in self.cfg["models"] if n != name) or "none"
+            msg = (f"no API key for model {name!r} ({self.model.describe()}): put it in {where}. "
+                   f"To use a different model, set \"model\" in {os.path.join(SHARED, 'config.json')} "
+                   f"or {self.p('config.json')} (other models defined: {others}).")
+            self.log("hobkin", msg)
+            sys.exit(f"hobkin: {msg}")
         self.state = self.load_state()
         self.state.update({"id": self.id, "pid": os.getpid(), "model": self.model.describe()})
         self.state.setdefault("created", now())
@@ -1163,7 +1173,9 @@ class Agent:
                     self.state.update({"context_tokens": limit, "context_source": "learned from an error"})
                 self.compact("model said the context is too long")
                 return
-            self.log("hobkin", f"model error, pausing until you send a message or /resume:\n{e}")
+            hint = (f"\nThe API refused the key for model {self.model.name!r} ({self.model.describe()}): "
+                    "check it, and check \"model\" in config.json picks the API you meant.") if e.status in (401, 403) else ""
+            self.log("hobkin", f"model error, pausing until you send a message or /resume:\n{e}{hint}")
             self.paused = self.error = True
             self.save_state("error")
             return
