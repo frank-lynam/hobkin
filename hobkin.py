@@ -628,7 +628,7 @@ class Agent:
                 f"the environment variable {self.model.cfg['key_env']}" if self.model.cfg.get("key_env") else "",
                 f"the file {self.model.cfg['key_file']}" if self.model.cfg.get("key_file") else "") if x)
             others = ", ".join(n for n in self.cfg["models"] if n != name) or "none"
-            msg = (f"no API key for model {name!r} ({self.model.describe()}): put it in {where}. "
+            msg = (f"no API key for model {self.model.describe()}: put it in {where}. "
                    f"To use a different model, set \"model\" in {os.path.join(SHARED, 'config.json')} "
                    f"or {self.p('config.json')} (other models defined: {others}).")
             self.log("hobkin", msg)
@@ -1173,7 +1173,7 @@ class Agent:
                     self.state.update({"context_tokens": limit, "context_source": "learned from an error"})
                 self.compact("model said the context is too long")
                 return
-            hint = (f"\nThe API refused the key for model {self.model.name!r} ({self.model.describe()}): "
+            hint = (f"\nThe API refused the key for model {self.model.describe()}: "
                     "check it, and check \"model\" in config.json picks the API you meant.") if e.status in (401, 403) else ""
             self.log("hobkin", f"model error, pausing until you send a message or /resume:\n{e}{hint}")
             self.paused = self.error = True

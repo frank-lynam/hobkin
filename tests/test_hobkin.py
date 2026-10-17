@@ -237,7 +237,7 @@ try:
                        "key_env": "NO_SUCH_KEY_VAR", "key_file": "~/no-such-key-file"})
     before = len(open(LOG).read())
     r = subprocess.run([sys.executable, HOB, "nokey1"], env={**os.environ, "HOBKIN_HOME": h}, capture_output=True, text=True, timeout=20)
-    check("[keys] missing key stops with a clear message", r.returncode != 0 and "no API key for model 'm'" in r.stderr
+    check("[keys] missing key stops with a clear message", r.returncode != 0 and "no API key for model m (fake via" in r.stderr
           and "NO_SUCH_KEY_VAR" in r.stderr and "~/no-such-key-file" in r.stderr, r.stderr)
     check("[keys] no request was sent", len(open(LOG).read()) == before)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
