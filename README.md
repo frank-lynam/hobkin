@@ -38,7 +38,10 @@ hobkin chat 7f3a91c2
 ```
 
 Its output appears as it comes, and each line you type (or paste) is sent;
-`/stop` and the other commands work, and Ctrl-D leaves. Piped, it sends the
+`/stop` and the other commands work, and Ctrl-D leaves. Output never wipes out
+what you're typing (the line is redrawn below it), and you get the usual line
+editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
+←/→, Ctrl-R to search. Piped, it sends the
 input, prints the reply and exits: `echo "status?" | hobkin chat 7f3a91c2`.
 
 Or with plain files:

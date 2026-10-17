@@ -102,23 +102,39 @@ try:
         r = subprocess.run([sys.executable, HOB, "chat", aid], input="hi from a pipe\n", env={**os.environ, "HOBKIN_HOME": h},
                            capture_output=True, text=True, timeout=30)
         check(f"[{api}] chat (piped) prints the reply", "agent> echo: hi from a pipe" in r.stdout and "operator>" not in r.stdout, r.stdout + r.stderr)
-        # chat, interactive: in a pseudo-terminal
+        # chat, interactive: in a pseudo-terminal (readline: history, input kept on screen)
         import pty
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["HOBKIN_HOME"] = h
+            os.environ["TERM"] = "xterm"
             os.execv(sys.executable, [sys.executable, HOB, "chat", aid])
-        buf = b""; end = time.time() + 20; sent = False
-        while time.time() < end and b"echo: typed in a terminal" not in buf:
-            r_, _, _ = select.select([fd], [], [], 0.2)
-            if r_:
-                try: buf += os.read(fd, 4096)
-                except OSError: break
-            if not sent and b"chatting with" in buf:
-                os.write(fd, b"typed in a terminal\n"); sent = True
+        buf = b""
+        def pump(until, t=20):
+            nonlocal_buf = [b""]
+            end = time.time() + t
+            while time.time() < end:
+                r_, _, _ = select.select([fd], [], [], 0.2)
+                if r_:
+                    try: nonlocal_buf[0] += os.read(fd, 4096)
+                    except OSError: break
+                if until(nonlocal_buf[0]): break
+            return nonlocal_buf[0]
+        buf += pump(lambda b: b"chatting with" in b)
+        os.write(fd, b"typed in a terminal\n")
+        buf += pump(lambda b: b"echo: typed in a terminal" in b)
+        os.write(fd, b"half-typ")                      # start typing; the agent talks meanwhile
+        time.sleep(0.5); say(d, "from elsewhere")
+        later = pump(lambda b: b"echo: from elsewhere" in b and b"> half-typ" in b.split(b"echo: from elsewhere")[-1])
+        check(f"[{api}] chat (terminal) redraws what you were typing after output",
+              b"> half-typ" in later.split(b"echo: from elsewhere")[-1], later[-300:])
+        os.write(fd, b"\x15\x1b[A\r")                 # Ctrl-U clears, up arrow recalls, Enter sends
+        again = pump(lambda b: b"echo: typed in a terminal" in b)
+        check(f"[{api}] chat (terminal) up arrow resends from history", b"echo: typed in a terminal" in again, again[-300:])
         os.write(fd, b"\x04")   # Ctrl-D leaves
         _, status = os.waitpid(pid, 0)
         check(f"[{api}] chat (terminal) round trip and Ctrl-D", b"echo: typed in a terminal" in buf and status == 0, buf[-400:])
+        check(f"[{api}] chat history saved", "typed in a terminal" in open(d + "/.chat_history").read())
         p.send_signal(signal.SIGTERM); p.wait(10)
         # crash repair: context ending in an unanswered tool call
         c = ctx(d); assert c[-1]["role"] == "assistant"; c[-1] = {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_crash", "name": "bash", "input": {"command": "echo never"}}]}

@@ -43,6 +43,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 from datetime import date, datetime, timedelta
@@ -1647,63 +1648,115 @@ def cmd_send(agent_id, text):
 
 def cmd_chat(agent_id):
     """Talk to a running agent in one terminal: its output appears as it comes, and each line
-    you type (or paste) is sent. Piped input: send it all, print the reply, exit."""
+    you type (or paste) is sent. In a terminal, readline gives line editing and history (up
+    arrow), and output never overwrites what you're typing. Piped input: send it all, print
+    the reply, exit."""
     d = os.path.join(HOME, valid_id(agent_id))
     if not os.path.isdir(d) or not is_running(d):
         sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin {agent_id})")
     fifo = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
     os.set_blocking(fifo, True)
     out_path, state_path = os.path.join(d, "out"), os.path.join(d, "state.json")
-    tty = sys.stdin.isatty()
     with open(out_path, "rb") as f:
         recent = f.read().decode(errors="replace").splitlines()[-12:]
         pos = f.tell()
     mine = False                     # inside one of our own entries (not echoed back)
     own = f"{operator_label(load_config(d))}> "
+    short = lambda line: line if line.startswith("    ") else line[11:]   # drop the date
 
-    def show_new():
+    def new_lines():
         nonlocal pos, mine
         with open(out_path, "rb") as f:
             f.seek(pos)
             chunk = f.read()
         cut = chunk.rfind(b"\n") + 1   # whole lines only
         pos += cut
+        shown = []
         for line in chunk[:cut].decode(errors="replace").splitlines():
             if not line.startswith("    "):
                 mine = line[20:].startswith(own)
             if not mine:
-                print(line[11:] if not line.startswith("    ") else line, flush=True)  # drop the date
+                shown.append(short(line))
+        return shown
 
-    if tty:
-        print("\n".join(l[11:] if not l.startswith("    ") else l for l in recent))
-        print(f"-- chatting with {agent_id}: type and press Enter to send; /stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
+    if sys.stdin.isatty():
+        return chat_terminal(agent_id, d, fifo, recent, new_lines, short)
     sent_at, eof = 0.0, False
     try:
         while True:
-            ready = select.select([sys.stdin] if not eof else [], [], [], 0.3)[0]
-            if ready:
+            if not eof and select.select([sys.stdin], [], [], 0.3)[0]:
                 line = sys.stdin.readline()
                 if line:
                     os.write(fifo, line.encode())
                     sent_at = time.time()
                 else:
                     eof = True
-                    if tty:
-                        break
-            show_new()
-            if eof and not tty:
+            for line in new_lines():
+                print(line, flush=True)
+            if eof:
                 # Piped: leave once the agent has gone idle again after our message
                 time.sleep(0.5)
                 st = json.loads(read(state_path, "{}") or "{}")
-                if time.time() - sent_at > 2 and st.get("status") in ("idle", "paused", "error", "stopped"):
-                    show_new()
-                    break
-                if not is_running(d):
-                    show_new()
+                if (time.time() - sent_at > 2 and st.get("status") in ("idle", "paused", "error", "stopped")) \
+                        or not is_running(d):
+                    for line in new_lines():
+                        print(line, flush=True)
                     break
     except KeyboardInterrupt:
         pass
     finally:
+        os.close(fifo)
+
+
+def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
+    """The interactive side of chat: input() with readline, output from a background thread
+    that clears the input line, prints, then redraws the prompt with what you'd typed."""
+    try:
+        import readline
+    except ImportError:              # no line editing then, but everything else works
+        readline = None
+    history = os.path.join(d, ".chat_history")
+    if readline:
+        try:
+            readline.read_history_file(history)
+        except OSError:
+            pass
+        readline.set_history_length(1000)
+    prompt, lock, done = "> ", threading.Lock(), threading.Event()
+    print("\n".join(short(line) for line in recent))
+    print(f"-- chatting with {agent_id}: type and press Enter to send (up arrow for history); "
+          "/stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
+
+    def printer():
+        while not done.is_set():
+            lines = new_lines()
+            if lines:
+                with lock:
+                    typed = readline.get_line_buffer() if readline else ""
+                    sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n" + prompt + typed)
+                    sys.stdout.flush()
+            done.wait(0.3)
+
+    threading.Thread(target=printer, daemon=True).start()
+    try:
+        while True:
+            try:
+                line = input(prompt)
+            except EOFError:
+                break
+            if line.strip():
+                os.write(fifo, (line + "\n").encode())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        done.set()
+        print()
+        if readline:
+            try:
+                readline.write_history_file(history)
+                os.chmod(history, 0o600)
+            except OSError:
+                pass
         os.close(fifo)
 
 
