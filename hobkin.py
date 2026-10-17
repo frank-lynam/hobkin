@@ -456,6 +456,13 @@ def span_text(seconds):
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524, 529}
 
 
+def clip(text, head, tail):
+    """Text with its middle cut out if it's longer than head + tail characters."""
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n...[{len(text) - head - tail} characters cut]...\n{text[-tail:]}"
+
+
 def now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1133,7 +1140,7 @@ class Agent:
             cwd = new_cwd
         self.state["cwd"] = cwd
         status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)}"
-        shown = out if len(out) < 2000 else out[:1000] + "\n...\n" + out[-800:]
+        shown = clip(out, 1000, 800)
         self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
         return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
 
@@ -1386,37 +1393,30 @@ class Agent:
         return result
 
     def run_tool(self, name, inp):
-        """(result text, is_error) for one tool call."""
+        """(result text, is_error) for one tool call. Each tool is one line here; bash logs its
+        own command and output, the rest log the first line of their result."""
+        s = lambda key: str(inp[key])            # a required argument (KeyError if missing)
+        tools = {
+            "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset"))),
+            "read_file": lambda: self.read_file(s("path"), inp.get("offset"), inp.get("limit")),
+            "write_file": lambda: self.voice_check(self.write_file(s("path"), s("content")), s("path"), s("content")),
+            "edit_file": lambda: self.voice_check(self.edit_file(s("path"), s("old_text"), s("new_text"),
+                                                                 bool(inp.get("replace_all"))), s("path"), s("new_text")),
+            "remind": lambda: self.tool_remind(inp),
+            "reminders": lambda: self.tool_reminders(inp),
+            "skill": lambda: self.open_skill(s("name")),
+        }
+        if name not in tools:
+            return f"Unknown tool {name!r}. Tools: {', '.join(tools)}.", True
         try:
-            if name == "bash":
-                return self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")))
-            if name == "read_file":
-                self.log("read", str(inp.get("path")))
-                return self.read_file(str(inp["path"]), inp.get("offset"), inp.get("limit"))
-            if name == "write_file":
-                result = self.write_file(str(inp["path"]), str(inp["content"]))
-                self.log("write", result[0])
-                return self.voice_check(result, inp.get("path"), inp.get("content"))
-            if name == "edit_file":
-                result = self.edit_file(str(inp["path"]), str(inp["old_text"]), str(inp["new_text"]), bool(inp.get("replace_all")))
-                self.log("edit", result[0])
-                return self.voice_check(result, inp.get("path"), inp.get("new_text"))
-            if name == "remind":
-                result = self.tool_remind(inp)
-                self.log("remind", result[0])
-                return result
-            if name == "reminders":
-                result = self.tool_reminders(inp)
-                self.log("reminders", result[0])
-                return result
-            if name == "skill":
-                self.log("skill", str(inp.get("name")))
-                return self.open_skill(str(inp["name"]))
-            return f"Unknown tool {name!r}. Tools: {', '.join(t['name'] for t in TOOLS)}.", True
+            result = tools[name]()
         except KeyError as e:
-            return f"Missing argument {e} for {name}.", True
+            result = (f"Missing argument {e} for {name}.", True)
         except (OSError, ValueError, TypeError) as e:
-            return f"{name} failed: {e}", True
+            result = (f"{name} failed: {e}", True)
+        if name != "bash":
+            self.log(name, result[0].splitlines()[0] if result[0] else "")
+        return result
 
     # --- the model
     def ask(self, messages, tool_choice=None):
@@ -1493,8 +1493,8 @@ class Agent:
                 # Too long even to summarise: shorten old tool output, then drop the oldest turns
                 for m in history[:-2]:
                     for b in m["content"]:
-                        if b.get("type") == "tool_result" and len(b["content"]) > 1500:
-                            b["content"] = b["content"][:700] + "\n...[cut]...\n" + b["content"][-500:]
+                        if b.get("type") == "tool_result":
+                            b["content"] = clip(b["content"], 700, 500)
                 if attempt >= 1:
                     # Drop the oldest third, restarting at a user message; tool results whose
                     # calls were dropped become plain text so the history stays valid
@@ -1514,8 +1514,7 @@ class Agent:
                 if b.get("type") == "text":
                     carry.append(b["text"])
                 elif b.get("type") == "tool_result":
-                    out = b["content"] if len(b["content"]) <= 4000 else b["content"][:2000] + "\n...[cut]...\n" + b["content"][-1500:]
-                    carry.append(f"[Result of your last command]\n{out}")
+                    carry.append(f"[Result of your last command]\n{clip(b['content'], 2000, 1500)}")
         text = f"[Your context was compacted. Your handoff note:]\n\n{note}\n\n" + (
             "\n\n".join(carry) if carry else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
@@ -1564,15 +1563,9 @@ class Agent:
             self.log("hobkin", "reply hit the output limit")
         if not calls:
             said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-            if len(committee_speak(said)) >= 3 and not self.voice_sent:
-                self.voice_sent = True                     # once per turn
-                self.messages.append({"role": "user", "content": [{"type": "text", "text": COMMITTEE}]})
-                self.save_context()
+            if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
                 return
-            if self.turn_used_tools and not self.wrap_up_sent:
-                self.wrap_up_sent = True                   # once per turn: never a loop
-                self.messages.append({"role": "user", "content": [{"type": "text", "text": WRAP_UP}]})
-                self.save_context()
+            if self.turn_used_tools and self.nudge_once("wrap_up_sent", WRAP_UP):
                 return
             self.working = False
             self.save_state()
@@ -1642,6 +1635,16 @@ class Agent:
             self.state["pid"] = None
             self.save_state("stopped")
             self.log("hobkin", "stopped")
+
+    def nudge_once(self, flag, text):
+        """Send a nudge as a user message, at most once per turn (flag), so it can never loop.
+        True if sent: the agent then gets another step to act on it."""
+        if getattr(self, flag):
+            return False
+        setattr(self, flag, True)
+        self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
+        self.save_context()
+        return True
 
     def add_user(self, text):
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn

@@ -134,7 +134,8 @@ try:
         os.write(fd, b"\x04")   # Ctrl-D leaves
         _, status = os.waitpid(pid, 0)
         check(f"[{api}] chat (terminal) round trip and Ctrl-D", b"echo: typed in a terminal" in buf and status == 0, buf[-400:])
-        check(f"[{api}] chat history saved", "typed in a terminal" in open(d + "/.chat_history").read())
+        check(f"[{api}] chat history saved",     # libedit (macOS, some builds) writes spaces as \040
+              "typed in a terminal" in open(d + "/.chat_history").read().replace("\\040", " "))
         p.send_signal(signal.SIGTERM); p.wait(10)
         # crash repair: context ending in an unanswered tool call
         c = ctx(d); assert c[-1]["role"] == "assistant"; c[-1] = {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_crash", "name": "bash", "input": {"command": "echo never"}}]}
