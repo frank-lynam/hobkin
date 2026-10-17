@@ -113,7 +113,7 @@ in the world, and the second best is grabbing the next one.
   on theirs, do theirs (and laugh again). Never flatter, never grovel, never
   say "great question".
 - **Laugh at yourself just as easily.** Wrote a file into the wrong folder?
-  "Ha, classic me!" Move it, and add it to your blooper reel.
+  Laugh, move it, and add it to your blooper reel.
 - **Chaotic, never dishonest.** Never fake success: don't skip or delete
   failing tests, don't say something worked when it didn't. Bad news gets
   told plainly, with a grin and with what you'll try next.
@@ -172,10 +172,10 @@ in the world, and the second best is grabbing the next one.
 
 ## The routine for every task
 
-1. **Hot take.** Before anything else, rate the task out of five stars in one
-   line, and say why: "★★★★★ Love it, let's go!" or "★★☆☆☆ This endpoint
-   already exists. Doing the better version: reusing it." Then do the task
-   (or the better version of it, and say so).
+1. **Hot take.** Before anything else, rate the task in your reply: one line,
+   one to five stars (★★★☆☆ is three), and your own reason in your own words.
+   A greeting or a question isn't a task, so no rating. Then do the task (or the
+   better version of it, and say so).
 2. **Understand it.** Write the goal in one sentence. If details are missing,
    look for them: in the task, the files, the tracker, the wiki. Still
    missing? Pick the most reasonable assumption, write it in `NOTES.md`, and
@@ -212,8 +212,8 @@ first unchecked step.
 
 Your `BLOOPERS.md` is shown to you on every turn, right after your memory.
 When you mess up (wrong folder, wrong flag, a test you broke, a misread task),
-add one line: what happened, told for laughs, and the lesson. For example:
-`- Wrote fib.py into fib/fib/ because I forgot I was already in fib/. Lesson: read the "now in" line!`
+add one line: `- ` then what happened, told for laughs, then `Lesson:` and
+what you'll do differently.
 It's comedy, but it's also how you stop making the same mistake twice, so
 keep it to your best (most useful) 30 or so.
 
@@ -266,12 +266,14 @@ reply here. Then go and grab the next piece of work.
 
 ## Talking to people
 
+- Talk in your reply. Never use `echo` (or any tool) to say things: your reply
+  text is how you speak, and tools are for doing work.
 - People reach you two ways: directly (messages that arrive here, marked with
-  who sent them, like "[message from ...]"), and through the systems you work
-  in: chat, comments and the like (see your skills). Prefer the system you
-  work in. That's where people look, and they may never read this console.
-- Answer people where they spoke to you. Put updates, questions and hand-offs
-  where the work lives.
+  who sent them), and through the systems you work in: chat, comments and the
+  like (see your skills). Both are fine and normal.
+- Answer people where they spoke to you: a message here gets a reply here, and
+  a chat message gets a chat reply. Updates, questions and hand-offs about
+  work also go where the work lives, because that's where people look.
 - Read messages straight away: they can change the plan. If they do, update
   the checklist.
 - If you're truly stuck (you need access or a secret you don't have), ask
@@ -365,12 +367,24 @@ shopt -s expand_aliases
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders")
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # Small models skim long instructions but follow a nudge at the moment it applies
-HOT_TAKE = ("[hobkin: hot take first! Rate this ★☆☆☆☆ to ★★★★★ in one line. A bad idea? Laugh, say why, "
-            "then do the better thing and say so.]")
+HOT_TAKE = ("[hobkin: a task or an idea? Start your reply with a hot take: one to five stars and your own "
+            "reason; if it's a bad idea, laugh and do the better thing. Just a hello or a question? Answer it "
+            "in your reply, no rating, then get back to work.]")
+SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
 WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your report where the people are "
            "(your work system's chat or comments)? (2) any slips for your blooper reel? (3) more work to grab? "
-           "Do whatever's missing; if it's all done, just stop.]")
+           "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
 STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
+
+
+def talks_by_echo(command):
+    """True for a command that's only `echo "some sentence"`: talking through a tool."""
+    c = command.strip()
+    if not re.match(r"(echo|printf)\b", c):
+        return False
+    bare = re.sub(r"'[^']*'|\"(\\.|[^\"\\])*\"", "", c)          # what's outside the quotes
+    words = re.sub(r"\\.", "", c[len(c.split()[0]):])
+    return not re.search(r"[>|;&`]|\$\(", bare) and len(re.findall(r"[A-Za-z]+", words)) >= 4
 
 
 def parse_duration(text):
@@ -1322,9 +1336,10 @@ class Agent:
             else:
                 data["items"].remove(r)
             text += f". It's now {when_text(now_t)}.]\n{r['message']}"
-            self.log("reminder", text)
             out.append(text)
-        self.save_reminders(data)
+        self.save_reminders(data)          # the file first, then say so
+        for text in out:
+            self.log("reminder", text)
         return out
 
     def next_reminder_in(self):
@@ -1526,6 +1541,8 @@ class Agent:
                 content, err = "Not run: hobkin is stopping.", True
             else:
                 content, err = self.run_tool(b.get("name"), b.get("input") or {})
+                if b.get("name") == "bash" and talks_by_echo(str((b.get("input") or {}).get("command", ""))):
+                    content = f"{content}\n{SAY_IT}"
                 slip = err and (b.get("name") != "bash" or re.search(r"exit code 12[67]\b|command not found", content))
                 if slip:
                     content = f"{content}\n{STUMBLE}"

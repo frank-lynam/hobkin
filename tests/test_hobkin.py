@@ -132,14 +132,17 @@ try:
         base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
         h = home(api + "-small", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", "max_output_tokens": 200})
         p, aid, d = start(h)
-        for i in range(10):
+        for i in range(20):                                  # until the window has overflowed and been compacted
             say(d, f"run: seq 1 {1000 + i}")
             wait_for(d, f"{1000 + i}", 20); time.sleep(0.3)
+            if "compacted; note" in open(d + "/out").read() and i >= 3:
+                break
+        last_n = 1000 + i
         out = open(d + "/out").read()
         st = json.load(open(d + "/state.json"))
         check(f"[{api}] compacted", "compacted; note" in out and os.listdir(d + "/archive"), out[-800:])
         check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 12000, st)
-        check(f"[{api}] request survives compaction", "seq 1 1009" in open(d + "/context.jsonl").read() or "1009" in open(d + "/out").read().split("compacted; note")[-1])
+        check(f"[{api}] request survives compaction", f"seq 1 {last_n}" in open(d + "/context.jsonl").read() or str(last_n) in open(d + "/out").read().split("compacted; note")[-1])
         for _ in range(100):                                   # let the last turn finish first
             if json.load(open(d + "/state.json")).get("status") == "idle": break
             time.sleep(0.2)
@@ -325,10 +328,15 @@ try:
     say(d, "hello there"); wait_for(d, "echo: hello there")
     users = [m for m in ctx(d) if m["role"] == "user"]
     texts = [b.get("text", "") for m in users for b in m["content"]]
-    check("[who] direct messages say who sent them", any(t.startswith("[message from frank]\nhello there\n[hobkin: hot take first!") for t in texts), texts)
+    check("[who] direct messages say who sent them", any(t.startswith("[message from frank]\nhello there\n[hobkin: a task or an idea?") for t in texts), texts)
     check("[who] idle prompt is marked automatic", "[from hobkin: idle prompt]\nCheck for new work." in texts, texts)
     check("[who] system prompt names the operator", "Messages that arrive here directly are from frank" in ctx(d)[0]["content"])
     check("[who] out log uses the name", "frank> hello there" in open(d + "/out").read())
+    say(d, 'run: echo "Hi frank, working on the tickets now!"'); wait_for(d, "Done. Output was: Hi frank")
+    say(d, "run: echo done-marker"); wait_for(d, "Done. Output was: done-marker")
+    results = [b["content"] for m in ctx(d) if m["role"] == "user" for b in m["content"] if b.get("type") == "tool_result"]
+    check("[who] talking through echo gets nudged; script echos don't",
+          "just say that in your reply" in results[-2] and "just say that in your reply" not in results[-1], results[-2:])
     r = subprocess.run([sys.executable, HOB, "chat", aid], input="via chat\n", env={**os.environ, "HOBKIN_HOME": h},
                        capture_output=True, text=True, timeout=30)
     check("[who] chat doesn't echo your own (named) messages", "echo: via chat" in r.stdout and "frank> via chat" not in r.stdout, r.stdout)
