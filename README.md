@@ -266,27 +266,35 @@ then its own text.
 ## Keeping agents running
 
 Reminders and idle prompts only fire while the agent's process runs. An idle
-hobkin costs nothing (it sleeps; no API calls), so the simplest approach is to
-keep agents up, e.g. as systemd user services. Save this as
-`~/.config/systemd/user/hobkin@.service`:
+hobkin costs nothing (it sleeps; no API calls), so keep agents up as systemd user
+services:
 
-```ini
-[Unit]
-Description=hobkin agent %i
-
-[Service]
-ExecStart=%h/.local/bin/hobkin %i
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
+```sh
+hobkin service add tickets-1      # start it now, and at every boot
+hobkin service remove tickets-1   # stop it and take it off boot
 ```
 
-Then `systemctl --user enable --now hobkin@tickets-1` starts agent
-`tickets-1` now and at every boot. Run `loginctl enable-linger $USER` once so
-it runs even when you're not logged in. `/stop` exits cleanly and isn't
-restarted; a crash is. `systemctl --user stop hobkin@tickets-1` stops it the
-same way Ctrl-C does.
+`add` does all of this:
+- It writes one template unit, `~/.config/systemd/user/hobkin@.service`, shared
+  by all agents.
+- It points that unit at the hobkin you ran it with (the installed command, or
+  `python3 /path/hobkin.py`).
+- It enables and starts `hobkin@tickets-1`.
+- It turns on linger, so agents keep running when you're logged out. If your
+  system won't allow that without a password, it tells you the command to run.
+
+`hobkin list` shows which agents run as services.
+
+- **Stopping and crashes:** `/stop` exits cleanly and stays stopped. A crash is
+  restarted after 30 seconds, and systemd gives up after 5 failures in 10
+  minutes, so a broken config can't spin.
+- **Logs:** they stay in the agent's `out`; `journalctl --user -u hobkin@ID`
+  shows startup errors.
+- **Keys:** a service doesn't see your shell's environment. `key_file` works
+  as is; for `key_env`, put `NAME=value` lines in `~/.config/hobkin/env`
+  (chmod 600). `add` warns when that's needed.
+- **Another `HOBKIN_HOME`** gets its own template (`hobkin-<hash>@.service`),
+  so homes never clash.
 
 ## Waking up when idle
 

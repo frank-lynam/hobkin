@@ -4,6 +4,8 @@
     hobkin                 start a new agent (prints its id)
     hobkin ID              resume agent ID
     hobkin chat ID         talk to a running agent in this terminal
+    hobkin service add ID      run agent ID as a systemd user service (now and at boot)
+    hobkin service remove ID   stop it and take it off boot
     hobkin send ID TEXT    message an agent (queued if it isn't running)
     hobkin list            list agents
     hobkin --version
@@ -39,6 +41,7 @@ import re
 import secrets
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -1841,20 +1844,131 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
         os.close(fifo)
 
 
+# ---------------------------------------------------------------------- systemd user services
+
+SERVICE_UNIT = """[Unit]
+Description=hobkin agent %i ({home})
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+ExecStart={exec_start} %i
+Environment=PYTHONUNBUFFERED=1
+{home_env}EnvironmentFile=-%h/.config/hobkin/env
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def unit_prefix():
+    """'hobkin' for the default home; each other HOBKIN_HOME gets its own template, so they never clash."""
+    if os.path.realpath(HOME) == os.path.realpath(os.path.expanduser("~/.hobkins")):
+        return "hobkin"
+    return "hobkin-" + hashlib.sha256(os.path.realpath(HOME).encode()).hexdigest()[:6]
+
+
+def systemctl(*args, check=False):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"hobkin: systemctl --user {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def cmd_service(argv):
+    if len(argv) != 2 or argv[0] not in ("add", "remove"):
+        sys.exit("usage: hobkin service add ID | hobkin service remove ID")
+    action, agent_id = argv[0], valid_id(argv[1])
+    if not shutil.which("systemctl") or systemctl("show-environment").returncode != 0:
+        sys.exit("hobkin: systemd user services aren't available here (no systemctl, or no user session: "
+                 "log in over ssh or a desktop session, rather than su/sudo, and try again)")
+    unit = f"{unit_prefix()}@{agent_id}.service"
+    if action == "remove":
+        systemctl("disable", "--now", unit, check=True)
+        return print(f"{agent_id}: service stopped and removed from boot")
+
+    d = os.path.join(HOME, agent_id)
+    if os.path.isdir(d) and is_running(d) and systemctl("is-active", unit).stdout.strip() != "active":
+        sys.exit(f"hobkin: {agent_id} is already running outside systemd: stop it first "
+                 f"(echo /stop > {os.path.join(d, 'in')}), then run this again")
+    # The template unit: run this same hobkin (the installed command, or this file with this Python)
+    me = os.path.abspath(sys.argv[0])
+    if os.path.basename(me) == "hobkin" and os.access(me, os.X_OK):
+        exec_start = me
+    else:
+        exec_start = f"{sys.executable} {os.path.abspath(__file__)}"
+    exec_start = " ".join(f'"{part}"' if " " in part else part for part in exec_start.split(" ", 1))
+    home_env = "" if unit_prefix() == "hobkin" else f'Environment="HOBKIN_HOME={os.path.realpath(HOME)}"\n'
+    text = SERVICE_UNIT.format(home=HOME, exec_start=exec_start, home_env=home_env)
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    template = os.path.join(unit_dir, f"{unit_prefix()}@.service")
+    os.makedirs(unit_dir, exist_ok=True)
+    if read(template) != text:
+        write_atomic(template, text)
+        print(f"wrote {template}")
+    # API keys kept only in your shell's environment won't reach a service
+    cfg = load_config(d)
+    name = cfg.get("model") or (next(iter(cfg["models"])) if len(cfg["models"]) == 1 else None)
+    m = cfg["models"].get(name) or {}
+    if m.get("key_env") and not m.get("key_file") and \
+            m["key_env"] not in load_env_file(os.path.expanduser("~/.config/hobkin/env")):
+        print(f"warning: model {name!r} reads its key only from ${m['key_env']}, which a service doesn't get from "
+              f"your shell. Put {m['key_env']}=... in ~/.config/hobkin/env (chmod 600), or set key_file.")
+    systemctl("daemon-reload", check=True)
+    systemctl("enable", "--now", unit, check=True)
+    # Keep services running when you're logged out
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    linger = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
+    if "Linger=no" in linger.stdout:
+        r = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        print("turned on linger: your agents keep running when you log out" if r.returncode == 0 else
+              f"note: couldn't turn on linger ({(r.stderr or '').strip()}); run `loginctl enable-linger {user}` "
+              "so agents keep running when you're logged out")
+    time.sleep(1.5)
+    state = systemctl("is-active", unit).stdout.strip()
+    print(f"{agent_id}: service {state} ({unit}). Talk: hobkin chat {agent_id}    "
+          f"Logs: journalctl --user -u {unit}" + ("" if state == "active" else
+          "\nIt didn't stay up: see the journal, and the agent's out file"))
+
+
+def service_states(names):
+    """{agent: 'service' / 'service (inactive)' ...} for agents set up as services. Enabled ones have a
+    symlink in default.target.wants; list-units says which are running."""
+    if not names or not shutil.which("systemctl"):
+        return {}
+    prefix = unit_prefix()
+    wants = os.path.expanduser("~/.config/systemd/user/default.target.wants")
+    enabled = {f[len(prefix) + 1:-len(".service")] for f in (os.listdir(wants) if os.path.isdir(wants) else [])
+               if f.startswith(prefix + "@") and f.endswith(".service")}
+    active = {}
+    for line in systemctl("list-units", "--all", "--plain", "--no-legend", f"{prefix}@*").stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].startswith(prefix + "@"):
+            active[parts[0][len(prefix) + 1:-len(".service")]] = parts[2]
+    out = {}
+    for n in names:
+        if n in enabled or active.get(n) == "active":
+            out[n] = "service" if active.get(n) == "active" else f"service ({active.get(n, 'inactive')})"
+    return out
+
+
 def cmd_list():
     if not os.path.isdir(HOME):
         return print("no agents yet")
-    for name in sorted(os.listdir(HOME)):
+    names = [n for n in sorted(os.listdir(HOME)) if not n.startswith("_") and os.path.isdir(os.path.join(HOME, n))]
+    services = service_states(names)
+    for name in names:
         d = os.path.join(HOME, name)
-        if name.startswith("_") or not os.path.isdir(d):
-            continue
         try:
             st = json.loads(read(os.path.join(d, "state.json"), "{}"))
         except json.JSONDecodeError:
             st = {}
         status = (st.get("status") or "?") if is_running(d) else "stopped"
         last = [l for l in read(os.path.join(d, "out")).splitlines() if l and not l.startswith("    ")][-1:]
-        print(f"{name:10} {status:8} {st.get('model', '')[:40]:40} {last[0][:70] if last else ''}")
+        print(f"{name:10} {status:8} {services.get(name, ''):18} {st.get('model', '')[:40]:40} {last[0][:60] if last else ''}")
 
 
 def main(argv):
@@ -1866,6 +1980,8 @@ def main(argv):
         return
     if argv[:1] == ["list"]:
         return cmd_list()
+    if argv[:1] == ["service"]:
+        return cmd_service(argv[1:])
     if argv[:1] == ["chat"]:
         if len(argv) != 2:
             sys.exit("usage: hobkin chat ID")

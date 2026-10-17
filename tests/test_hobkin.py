@@ -382,6 +382,45 @@ try:
     nudges = sum(b.get("text", "").startswith("[hobkin: that reads like a committee") for m in ctx(d) for b in m["content"] if m["role"] == "user")
     check("[voice] a committee-speak reply gets one nudge", nudges == 1, nudges)
     p.send_signal(signal.SIGTERM); p.wait(10)
+    # systemd user services (only where a user session exists; skipped on CI runners)
+    if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0:
+        h = home("svc", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake",
+                         "key_file": os.path.join(BASE, "svc-key")})
+        open(os.path.join(BASE, "svc-key"), "w").write("test-key\n")
+        env = {**os.environ, "HOBKIN_HOME": h}
+        hob = lambda *a: subprocess.run([sys.executable, HOB, *a], env=env, capture_output=True, text=True, timeout=60)
+        r = hob("service", "add", "svc1")
+        unit_line = [l for l in r.stdout.splitlines() if "svc1: service" in l]
+        template = [l.split("wrote ", 1)[1] for l in r.stdout.splitlines() if l.startswith("wrote ")]
+        try:
+            check("[service] add starts it", "svc1: service active" in r.stdout, r.stdout + r.stderr)
+            check("[service] its own unit name for a non-default home", template and "/hobkin-" in template[0]
+                  and f'HOBKIN_HOME={os.path.realpath(h)}' in open(template[0]).read(), template)
+            unit = unit_line[0].split("(")[1].split(")")[0]
+            d = os.path.join(h, "svc1")
+            r = subprocess.run([sys.executable, HOB, "chat", "svc1"], input="hi service\n", env=env, capture_output=True, text=True, timeout=30)
+            check("[service] the agent answers", "echo: hi service" in r.stdout, r.stdout + r.stderr)
+            check("[service] list shows it", "service " in hob("list").stdout)
+            say(d, "/stop"); time.sleep(2)
+            state = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True).stdout.strip()
+            check("[service] /stop stops it and it stays stopped", state == "inactive", state)
+            r = hob("service", "add", "svc1")
+            check("[service] add again starts it again", "svc1: service active" in r.stdout, r.stdout + r.stderr)
+            r = hob("service", "remove", "svc1")
+            state = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True).stdout.strip()
+            wants = os.path.expanduser("~/.config/systemd/user/default.target.wants/" + unit)
+            check("[service] remove stops it and takes it off boot", state == "inactive" and not os.path.lexists(wants), state)
+            p, aid, d2 = start(h, "svc2")
+            r = hob("service", "add", "svc2")
+            check("[service] refuses an agent already running outside systemd", r.returncode != 0 and "already running outside systemd" in r.stderr, r.stderr)
+            p.send_signal(signal.SIGTERM); p.wait(10)
+        finally:
+            hob("service", "remove", "svc1")
+            for t in template:
+                os.remove(t)
+            subprocess.run(["systemctl", "--user", "daemon-reload"])
+    else:
+        print("SKIP [service] no systemd user session here")
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:
