@@ -2,7 +2,7 @@
 
     python3 tests/test_hobkin.py
 """
-import json, os, select, subprocess, sys, time, shutil, signal, tempfile
+import json, os, re, select, subprocess, sys, time, shutil, signal, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOB = os.path.join(HERE, "..", "hobkin.py")
 BASE = tempfile.mkdtemp(prefix="hobkin-test-")
@@ -97,7 +97,7 @@ try:
         wait_for(d, "$> sleep 2"); say(d, "also check the wiki")
         wait_for(d, "Done. Output was: slept")
         last_user = last_results(d)
-        check(f"[{api}] mid-command message added after results", any("[message from operator]\nalso check the wiki" in b.get("text", "") for b in last_user["content"]), last_user)
+        check(f"[{api}] mid-command message added after results", any(re.search(r"\[message from operator, \w+ [\d-]+ [\d:]+\]\nalso check the wiki", b.get("text", "")) for b in last_user["content"]), last_user)
         # stop, queue while stopped, resume
         say(d, "/stop"); p.wait(10)
         check(f"[{api}] /stop exits", p.returncode == 0, p.stderr.read())
@@ -172,6 +172,11 @@ try:
         out = open(d + "/out").read()
         st = json.load(open(d + "/state.json"))
         check(f"[{api}] compacted", "compacted; note" in out and os.listdir(d + "/archive"), out[-800:])
+        arch = [n for n in os.listdir(d + "/archive") if n.startswith("context-")]
+        check(f"[{api}] the archive holds the conversation, not the system prompt", arch and all(
+            json.loads(l)["role"] != "system" for n in arch for l in open(f"{d}/archive/{n}")), arch)
+        check(f"[{api}] out starts afresh at compaction, the old log archived", "up:" not in out
+              and any(n.startswith("out-") and "up:" in open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive")), out[:300])
         check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 12000, st)
         check(f"[{api}] handoff note points at the archive", "Your whole earlier conversation is saved in" in open(d + "/context.jsonl").read())
         check(f"[{api}] request survives compaction", f"seq 1 {last_n}" in open(d + "/context.jsonl").read() or str(last_n) in open(d + "/out").read().split("compacted; note")[-1])
@@ -377,8 +382,8 @@ try:
     say(d, "hello there"); wait_for(d, "echo: hello there")
     users = [m for m in ctx(d) if m["role"] == "user"]
     texts = [b.get("text", "") for m in users for b in m["content"]]
-    check("[who] direct messages say who sent them", any(t.startswith("[message from frank]\nhello there\n[hobkin: a task or an idea?") for t in texts), texts)
-    check("[who] idle prompt is marked automatic", "[from hobkin: idle prompt]\nCheck for new work." in texts, texts)
+    check("[who] direct messages say who sent them", any(re.match(r"\[message from frank, \w+ [\d-]+ [\d:]+\]\nhello there\n\[hobkin: a task or an idea\?", t) for t in texts), texts)
+    check("[who] idle prompt is marked automatic", any(re.match(r"\[from hobkin: idle prompt, \w+ [\d-]+ [\d:]+\]\nCheck for new work\.$", t) for t in texts), texts)
     check("[who] system prompt names the operator", "Messages that arrive here directly are from frank" in ctx(d)[0]["content"])
     check("[memory] the prompt says memory is a sketch to check", "A sketch of where you were, not the truth" in ctx(d)[0]["content"]
           and "Your memory is the enemy, and you love beating it" in ctx(d)[0]["content"])
@@ -583,6 +588,60 @@ try:
     check("[web] DuckDuckGo's bot check is reported plainly", True)
     res = tool("fetch_url", {"url": "https://127.0.0.1:48791/secret"}, "Couldn't fetch")
     check("[web] no certificate configured: the internal host refuses", True)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # a long life: time stamps, size limits, fallback models and alerts, pruning, /restart
+    h = home("long", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake-gone", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "fallback_models": ["n2", "nope"],
+              "alert_command": "echo \"$HOBKIN_ALERT\" >> " + os.path.join(BASE, "alerts.txt")})
+    cfg = json.load(open(h + "/_shared/config.json"))
+    cfg["models"]["n2"] = {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}
+    json.dump(cfg, open(h + "/_shared/config.json", "w"))
+    d = os.path.join(h, "longlived"); os.makedirs(d + "/archive"); os.makedirs(d + "/jobs/1")
+    json.dump({"last_step": time.time() - 3 * 86400 - 7200}, open(d + "/state.json", "w"))
+    open(d + "/BLOOPERS.md", "w").write("".join(f"- slip {i}\n" for i in range(40)))
+    old = time.time() - 40 * 86400
+    for n in ("context-20200101-000000.jsonl", "out-20200101-000000.log", "context-20200102-000000.jsonl"):
+        open(f"{d}/archive/{n}", "w").write("{}\n"); os.utime(f"{d}/archive/{n}", (old, old))
+    open(d + "/jobs/1/exit", "w").write("0\n"); os.utime(d + "/jobs/1/exit", (old, old))
+    p, aid, d = start(h, "longlived")
+    check("[prune] old archives and job folders go; the newest archive stays",
+          sorted(os.listdir(d + "/archive")) == ["context-20200102-000000.jsonl", "out-20200101-000000.log"]
+          and not os.path.exists(d + "/jobs/1"), os.listdir(d + "/archive"))
+    out = open(d + "/out").read()
+    check("[config] an unknown fallback model is warned about", "fallback_models has 'nope'" in out, out[:600])
+    say(d, "hello after the weekend"); wait_for(d, "echo: hello after the weekend")
+    first = [b["text"] for b in ctx(d)[1]["content"] if b.get("type") == "text"][0]
+    check("[time] a message says when, and how long since it last worked", re.match(
+        r"\[message from operator, \w+ [\d-]+ [\d:]+; 3d 2h since you last worked\]\nhello after the weekend", first), first)
+    out = open(d + "/out").read()
+    check("[fallback] a withdrawn model switches to the next", "refused (404), switching to n2" in out
+          and json.load(open(d + "/state.json"))["model"].startswith("n2"), out[-600:])
+    alerts = open(os.path.join(BASE, "alerts.txt")).read()
+    check("[alert] the switch is announced through alert_command", "model m (fake-gone via" in alerts and "switched to n2" in alerts, alerts)
+    check("[limits] an overgrown blooper reel is flagged in the prompt", "your blooper reel is 40 lines, over its 30-line limit"
+          in ctx(d)[0]["content"] and "your memory is" not in ctx(d)[0]["content"])
+    say(d, 'call: read_file {"path": "$HOBKIN_BLOOPERS"}'); wait_for(d, "BLOOPERS.md:     1|")
+    check("[limits] and nudged when it opens it", "over its 30-line limit. Prune it" in last_results(d)["content"][0]["content"])
+    say(d, "run: echo $PPID > pid-before && echo /restart > $HOBKIN_DIR/in"); wait_for(d, "restarting")
+    for _ in range(100):
+        if open(d + "/out").read().count("up:") >= 2 and json.load(open(d + "/state.json")).get("status") == "idle": break
+        time.sleep(0.1)
+    texts = [b.get("text", "") for m in ctx(d) if m["role"] == "user" for b in m["content"]]
+    check("[restart] /restart: same pid, fresh start, and the agent is told", p.poll() is None
+          and json.load(open(d + "/state.json"))["pid"] == p.pid and any(t.startswith("[from hobkin: restarted as asked") for t in texts),
+          open(d + "/out").read()[-500:])
+    out = open(d + "/out").read()
+    check("[restart] starts on the first model again (and falls back again)",
+          out.count("up: m (fake-gone") == 2 and out.count("switching to n2") == 2, out[-800:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    os.makedirs(h + "/lonely"); json.dump({"fallback_models": []}, open(h + "/lonely/config.json", "w"))
+    p, aid, d = start(h, "lonely")
+    say(d, "anyone?"); wait_for(d, "model error, pausing")
+    for _ in range(50):
+        if "paused" in open(os.path.join(BASE, "alerts.txt")).read(): break
+        time.sleep(0.1)
+    check("[alert] no fallback left: the pause is announced", "hobkin lonely paused: model" in open(os.path.join(BASE, "alerts.txt")).read())
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent

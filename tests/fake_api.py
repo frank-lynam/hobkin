@@ -47,6 +47,8 @@ class H(BaseHTTPRequestHandler):
     def _post(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         LOG.write(json.dumps({"path": self.path, "body": body}) + "\n"); LOG.flush()
+        if body.get("model") == "fake-gone":         # a model that's been withdrawn
+            return self.send(404, {"error": {"message": "No endpoints found for fake-gone.", "code": 404}})
         size = len(json.dumps(body)) // 4
         # Rate limiting like a real provider: "ratelimit:SECONDS:MODE" in a message blocks every request
         # for SECONDS; MODE says how the reset is given (header / epoch / body / none)

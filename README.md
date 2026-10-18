@@ -6,7 +6,7 @@ sleeps.
 
 - **One file, standard library only.** `hobkin.py`, Python 3.12+. Nothing to install.
 - **No ports.** It listens on nothing; it only makes outgoing calls to the model API.
-- **Files are the interface.** Talk to it with `echo`, watch it with `tail -f`,
+- **Files are the interface.** Talk to it with `echo`, watch it with `tail -F`,
   and see exactly what the model sees with `cat`.
 - **Many per account.** Each agent has its own id and folder, and a lock stops two
   processes running the same one.
@@ -48,7 +48,7 @@ Or with plain files:
 
 ```sh
 echo "Clone https://example.com/repo and get its tests passing" > ~/.hobkins/7f3a91c2/in
-tail -f ~/.hobkins/7f3a91c2/out
+tail -F ~/.hobkins/7f3a91c2/out
 ```
 
 Run it in the background however you like: `nohup hobkin 7f3a91c2 &`,
@@ -61,10 +61,10 @@ tmux, or a systemd user service.
 | File | What it is |
 |---|---|
 | `in` | A named pipe. `echo text > in` sends a message. A write waits until the agent is running; `hobkin send ID text` queues it instead. |
-| `out` | Everything it says and does, with timestamps: messages, commands, output. `tail -f out` |
+| `out` | Everything it says and does since the last compaction, with timestamps: messages, commands, output. At each compaction it's moved to `archive/` and starts afresh. `tail -F out` |
 | `context.jsonl` | Exactly what the model is sent: line 1 is the system prompt, then one message per line. Rewritten after every change. |
-| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. |
-| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. |
+| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 80 lines, it's told to prune. |
+| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 30 lines, it's told to keep the best. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. |
 | `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |
@@ -72,13 +72,14 @@ tmux, or a systemd user service.
 | `secrets.env` | Optional `KEY=value` lines, set as environment variables in its shell (never put in its context). |
 | `config.json` | Optional per-agent settings over the shared ones. |
 | `*.md` | Optional per-agent instructions; replace shared files of the same name. |
-| `archive/` | Old contexts, kept when it compacts. |
+| `archive/` | At each compaction, the old conversation (`context-*.jsonl`, messages only) and its `out` log (`out-*.log`). Deleted after 30 days, except the newest. |
+| `jobs/` | Background jobs' output and exit codes; a finished job's folder goes after 30 days. |
 | `queue`, `lock` | Messages sent while it was stopped; the process lock. |
 
 `~/.hobkins/_shared/` holds what all agents share: `config.json`, `AGENTS.md` (how
 to work as a hobkin: a task routine with checklists, failure handling,
-organization, memory and tidying up; created on first run, edit freely. Once
-edited it's never touched; an untouched copy of an older default is upgraded), an optional `SOUL.md`,
+organization, memory and tidying up; created on first run, edit freely: it's never
+overwritten, so new defaults reach it only if you delete it), an optional `SOUL.md`,
 any other `.md` instructions, and `secrets.env`.
 
 **The system prompt** is:
@@ -117,11 +118,14 @@ work out where scripts live. Dozens of skills cost a line each.
 ## Talking to it
 
 Anything you write to `in` is a message. The agent sees it labelled with who
-sent it: set `"operator": "frank"` in `config.json` (use the name people know
-you by, e.g. your tracker username) and it reads `[message from frank]`, with
-its system prompt saying who that is; without it, `[message from operator]`.
-Automatic messages are marked too (`[from hobkin: idle prompt]`, `[Reminder
-#3 …]`), so the agent never mistakes them for you. If it's busy running a command, the
+sent it and when: set `"operator": "frank"` in `config.json` (use the name people know
+you by, e.g. your tracker username) and it reads `[message from frank, Sat
+2026-10-17 09:12]`, with its system prompt saying who that is; without it,
+`[message from operator, …]`. After a quiet spell it adds how long it's been
+(`; 3d 2h since you last worked`), so Friday's request isn't mistaken for
+today's. Automatic messages are marked and timed too (`[from hobkin: idle
+prompt, …]`, `[Reminder #3 …]`, finished jobs), so the agent never mistakes
+them for you. If it's busy running a command, the
 message is added to the result of that command, marked "[message from
 operator]". A line that is just one of these is a command instead:
 
@@ -134,6 +138,7 @@ operator]". A line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
+| `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |
 
 `hobkin chat ID` puts both in one terminal (see Quick start). `hobkin list` shows all agents, their status and their last line of output.
 
@@ -217,8 +222,16 @@ learns the limit from the first "context too long" error and remembers it.
 
 When the conversation passes `compact_at` (80%) of the window, the agent writes
 itself a handoff note. The conversation is replaced by that note, with the
-newest unanswered message carried over unchanged, and the old context goes to
-`archive/`.
+newest unanswered message carried over unchanged, and the old conversation goes to
+`archive/` (messages only: the system prompt is rebuilt every turn anyway), along
+with `out`, which starts afresh. The note tells the agent where the archive is,
+so it can grep it.
+
+**Fallback models:** `"fallback_models": ["other", "local"]` (names from
+`models`) are tried in order when the model refuses outright: withdrawn,
+renamed, a bad key, out of credit. Free models on OpenRouter come and go, so
+it's worth having one. Busy and rate-limited models are waited out instead. A
+restart goes back to `model`.
 
 Typos and wrong types in `config.json` are reported at startup (in `out` and on
 stderr), with suggestions such as "unknown setting 'idel_seconds' (did you mean
@@ -395,6 +408,11 @@ hobkin service remove tickets-1   # stop it and take it off boot
   - It's silent while only a message can wake the agent, or when it's paused, so
     a quiet journal means it's waiting for you. There's no heartbeat in a
     terminal; set `heartbeat_seconds` to 0 to turn it off.
+- **Alerts:** when an agent pauses on its own (a model error, the daily budget)
+  or falls back to another model, it may not be able to say so itself. Set
+  `alert_command` to a shell command and it runs with the news in
+  `$HOBKIN_ALERT` and the agent's `secrets.env` in its environment, e.g.
+  `curl -s -H "Authorization: Bearer $TICKETS_TOKEN" --data-urlencode "text=$HOBKIN_ALERT" https://tickets.example/api/comment`.
 - **Keys:** a service doesn't see your shell's environment. `key_file` works
   as is; for `key_env`, put `NAME=value` lines in `~/.config/hobkin/env`
   (chmod 600). `add` warns when that's needed.

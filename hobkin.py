@@ -15,7 +15,7 @@
 Each agent lives in ~/.hobkins/ID/ (or $HOBKIN_HOME/ID/):
 
     in              FIFO: echo "text" > in     (lines like /stop are commands)
-    out             what it says and does:     tail -f out
+    out             what it says and does:     tail -F out
     context.jsonl   exactly what the model sees: the system prompt, then one message per line
     MEMORY.md       the agent's own notes; part of its instructions, kept across compaction
     state.json      model, context size, status, pid
@@ -88,6 +88,9 @@ USER_AGENT = "hobkin/0.1"
 
 DEFAULT_CONFIG = {
     "model": "claude",
+    # Tried in order when the model refuses outright (gone, renamed, out of credit): names from "models".
+    # The agent goes back to "model" when it restarts.
+    "fallback_models": [],
     "models": {
         "claude": {
             "api": "anthropic",
@@ -128,6 +131,9 @@ DEFAULT_CONFIG = {
         "send email or messages": r"\b(sendmail|mailx?|mutt)\b|hooks\.slack\.com|discord(app)?\.com/api/webhooks",
     },
     "announce_delay": 120,
+    # A shell command run when the agent pauses on its own (a model error, the daily budget) or falls
+    # back to another model, with the news in $HOBKIN_ALERT; e.g. a curl to your chat. Gets secrets.env.
+    "alert_command": None,
     # Pause for the day once this much is spent (where the API reports cost, e.g. OpenRouter)
     "daily_budget_usd": None,
     # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
@@ -157,7 +163,8 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
-                "daily_budget_usd": (int, float, type(None)), "web": dict}
+                "daily_budget_usd": (int, float, type(None)), "web": dict,
+                "fallback_models": list, "alert_command": (str, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -248,6 +255,9 @@ in the world, and the second best is grabbing the next one.
   one. Waiting on something slow? Don't `sleep` in bash: run it with
   `background: true` (or set a reminder), note it
   in your checklist, and go do other work (or end your turn).
+- **Restarting yourself** (to pick up a new hobkin, say after a `git pull`):
+  `echo /restart > $HOBKIN_DIR/in`. It happens once your current step is done,
+  and you carry on where you were.
 - **skill** opens a skill by name (see the Skills list). Always open the skill
   before doing a task it covers, and follow its steps in order. Its files are
   in the folder it tells you; use those full paths.
@@ -497,7 +507,12 @@ shopt -s expand_aliases
 """
 
 
-COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto")
+COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart")
+
+
+# Files shown on every turn get a size limit, so months of notes don't ride along forever
+LINE_LIMITS = {"MEMORY.md": ("memory", 80), "BLOOPERS.md": ("blooper reel", 30)}
+KEEP_DAYS = 30            # old archives (contexts, out logs) and finished jobs' folders are deleted after this
 
 
 # ---- nudges: the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
@@ -526,6 +541,10 @@ COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehens
                    "synerg", "best practice", "key success factor", "stakeholder", "holistic", "streamlin",
                    "significant achievement", "it is important to note", "delve", "world-class", "cutting-edge",
                    "enterprise-grade", "paradigm", "actionable insight", "going forward", "in conclusion")
+
+
+PRUNE = ("[hobkin: your {what} is {n} lines, over its {limit}-line limit. Prune it: keep what still earns its "
+         "place, merge repeats, cut what's stale or fixed. Then carry on.]")
 
 
 STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
@@ -684,6 +703,9 @@ def config_warnings(cfg: dict) -> list[str]:
             check(f"models.{name}.", m, MODEL_TYPES)
             if m.get("api") not in (None, "anthropic", "openai"):
                 out.append(f"models.{name}.api is {m.get('api')!r}: use \"anthropic\" or \"openai\" (treated as openai)")
+    for name in cfg.get("fallback_models") or []:
+        if name not in (cfg.get("models") or {}):
+            out.append(f"fallback_models has {name!r}, which isn't one of the models defined (ignored)")
     ca = cfg.get("compact_at")
     if isinstance(ca, (int, float)) and not 0 < ca < 1:
         out.append(f"compact_at is {ca}: it's a share of the context window, between 0 and 1 (e.g. 0.8)")
@@ -1249,6 +1271,7 @@ class Agent:
         self.waiting_note = None           # for the heartbeat, while waiting out a rate limit
         self.job_procs = {}                # background jobs started by this process
         self.budget_paused = False
+        self.restart_requested = False
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1291,6 +1314,7 @@ class Agent:
             sys.exit(f"hobkin: {what} isn't one of the models defined in {files}: {', '.join(models)}. "
                      f"Set \"model\" to one of those.")
         self.model = Model(name, self.cfg["models"][name])
+        self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in models and f != name]
         self.who = operator_label(self.cfg)
         if not self.model.key and (self.model.cfg.get("key_env") or self.model.cfg.get("key_file")):
             where = " or ".join(x for x in (
@@ -1308,10 +1332,13 @@ class Agent:
         self.messages = self.load_context()
         self.discover_limits()
         self.repair_context()
+        if self.state.pop("restarting", None):
+            self.add_user(f"[from hobkin: restarted as asked, now hobkin {__version__}, at {when_text(time.time())}.]")
+        self.prune()
         self.save_state("starting")
         self.log("hobkin", f"{self.id} up: {self.model.describe()}, context "
                  f"{self.state.get('context_tokens') or 'unknown'} ({self.state.get('context_source') or 'will learn from errors'})")
-        self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -f {self.p('out')}")
+        self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
 
     def _on_signal(self, signum, frame):
         if self.stop:  # second signal: leave now
@@ -1380,12 +1407,24 @@ class Agent:
             data, ok = self.load_reminders()
             if ok and data["items"]:
                 parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
+        over = {f: PRUNE.format(what=w, n=n, limit=lim) + "\n\n" for f, w, n, lim in self.over_limit()}
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\nA sketch of where you were, not the truth: check the "
-                     f"real thing before you act on it, and enjoy catching it out.\n\n{memory or '(empty)'}")
+                     f"real thing before you act on it, and enjoy catching it out.\n\n{over.get('MEMORY.md', '')}"
+                     f"{memory or '(empty)'}")
         bloopers = read(self.p("BLOOPERS.md")).strip()
-        parts.append(f"# Your blooper reel ({self.p('BLOOPERS.md')})\n\n{bloopers or '(empty so far!)'}")
+        parts.append(f"# Your blooper reel ({self.p('BLOOPERS.md')})\n\n{over.get('BLOOPERS.md', '')}"
+                     f"{bloopers or '(empty so far!)'}")
         return "\n\n---\n\n".join(parts)
+
+    def over_limit(self) -> list[tuple[str, str, int, int]]:
+        """(file, what, lines, limit) for each always-shown file that's grown past its limit."""
+        out = []
+        for f, (what, limit) in LINE_LIMITS.items():
+            n = len([l for l in read(self.p(f)).splitlines() if l.strip()])
+            if n > limit:
+                out.append((f, what, n, limit))
+        return out
 
     def load_context(self):
         msgs = []
@@ -1431,7 +1470,7 @@ class Agent:
     def poll_input(self, timeout):
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
-        before = (len(self.pending), self.paused, self.compact_requested)
+        before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested)
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -1455,7 +1494,7 @@ class Agent:
                 self._take(self.fifo_buf.decode(errors="replace"))
                 self.fifo_buf = b""
             self._drain_queue()
-            if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested) != before:
+            if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested) != before:
                 return
 
     def _drain_queue(self):
@@ -1496,6 +1535,8 @@ class Agent:
             self.save_state("working" if self.working else "idle")
         elif cmd == "/compact":
             self.compact_requested = True   # done between steps, never mid-command
+        elif cmd == "/restart":
+            self.restart_requested = True   # once the current step is done: same process, fresh code
         elif cmd == "/interrupt":
             self.interrupt = True
         elif cmd == "/veto":
@@ -1556,8 +1597,10 @@ class Agent:
             if not os.path.exists(exit_file):
                 continue
             code = read(exit_file).strip() or "?"
+            ended = os.path.getmtime(exit_file)
             tail = clip(read(os.path.join(job["dir"], "out.log")), 0, 2000).lstrip("\n")
-            text = (f"[Background job #{n} finished: exit {code} after {span_text(time.time() - job['started'])}. "
+            text = (f"[Background job #{n} finished: exit {code} after {span_text(max(0, ended - job['started']))}, "
+                    f"at {when_text(ended)}. "
                     f"Command: {job['command']}\nLast of its output ({job['dir']}/out.log):]\n{tail.strip() or '(no output)'}")
             del self.state["jobs"][n]
             self.job_procs.pop(int(n), None)
@@ -1934,7 +1977,12 @@ class Agent:
         """A message from the operator as the model sees it: who sent it, and the hot-take hint, unless
         the agent is busy (mid-task) or managing itself (a reminder or job of its own coming)."""
         hint = "" if busy or self.scheduled() else f"\n{HOT_TAKE}"
-        return f"[message from {self.who}]\n{text}{hint}"
+        return f"[message from {self.who}, {self.stamp()}]\n{text}{hint}"
+
+    def stamp(self) -> str:
+        """The time now, for anything that wakes the agent, plus how long it's been when that's a while."""
+        gap = time.time() - (self.state.get("last_step") or time.time())
+        return when_text(time.time()) + (f"; {span_text(gap)} since you last worked" if gap >= 3600 else "")
 
     def tool_nudges(self, name: str, inp: dict, content, err: bool):
         """A tool's result, with any hint for what the agent just did added at the end."""
@@ -1948,6 +1996,10 @@ class Agent:
         if prose and not err and str(inp.get("path", "")).lower().endswith((".md", ".txt", ".rst")) \
                 and len(committee_speak(str(prose))) >= 3:
             content += f"\n{COMMITTEE}"                    # writing for people that lost its voice
+        said = json.dumps(inp)
+        for f, what, n, limit in self.over_limit():     # working on a file that's grown too long
+            if f in said or f.split(".")[0] in said:
+                content += "\n" + PRUNE.format(what=what, n=n, limit=limit)
         return content
 
     def turn_end_nudge(self, blocks: list) -> bool:
@@ -2137,6 +2189,7 @@ class Agent:
             try:
                 blocks, stop_reason, used = self.model.call(self.system_prompt(), messages, self.max_output(),
                                                             tool_choice=tool_choice)
+                self.state["last_step"] = time.time()
                 if used:
                     self.state["last_input_tokens"] = used
                 if self.model.last_cost:
@@ -2255,7 +2308,11 @@ class Agent:
             "\n\n".join(carry) if carry else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
         archived = self.p(f"archive/context-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
-        os.replace(self.p("context.jsonl"), archived)
+        # The conversation only: the system prompt is rebuilt every turn, and would only clutter a grep
+        write_atomic(archived, "".join(json.dumps(m, ensure_ascii=False) + "\n" for m in self.messages))
+        old_log = archived.replace("/context-", "/out-").replace(".jsonl", ".log")
+        shutil.copyfile(self.p("out"), old_log)              # out holds the current context's story only
+        open(self.p("out"), "w").close()                      # truncated in place, so tail -F and chat follow
         text += (f"\n\n(Your whole earlier conversation is saved in {archived}, one message per line: grep it if "
                  "you need a detail the note doesn't have.)")
         self.messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
@@ -2264,7 +2321,25 @@ class Agent:
         self.working = True
         self.save_context()
         self.save_state()
+        self.log("hobkin", f"earlier log: {old_log}")
         self.log("hobkin", f"compacted; note:\n{note}")
+        self.prune()
+
+    def prune(self) -> None:
+        """Delete archives and finished jobs' folders older than KEEP_DAYS (the newest archive stays: the
+        context points at it)."""
+        cutoff = time.time() - KEEP_DAYS * 86400
+        names = sorted(os.listdir(self.p("archive"))) if os.path.isdir(self.p("archive")) else []
+        newest = {max((n for n in names if n.startswith(k)), default=None) for k in ("context-", "out-")}
+        for name in names:
+            f = self.p(f"archive/{name}")
+            if name not in newest and os.path.isfile(f) and os.path.getmtime(f) < cutoff:
+                os.remove(f)
+        running = {j["dir"] for j in (self.state.get("jobs") or {}).values()}
+        for name in os.listdir(self.p("jobs")) if os.path.isdir(self.p("jobs")) else []:
+            jdir, exit_file = self.p(f"jobs/{name}"), self.p(f"jobs/{name}/exit")
+            if jdir not in running and os.path.exists(exit_file) and os.path.getmtime(exit_file) < cutoff:
+                shutil.rmtree(jdir, ignore_errors=True)
 
     # --- the loop: one step at a time; the heartbeat; run()
     def over_budget(self) -> bool:
@@ -2286,6 +2361,8 @@ class Agent:
                 self.paused = self.budget_paused = True
                 self.save_state("paused (budget)")
                 self.log("hobkin", f"daily budget used up (${self.state['spend_today']:.2f}): pausing until tomorrow")
+                self.alert(f"hobkin {self.id} paused until tomorrow: today's budget (${self.cfg['daily_budget_usd']}) "
+                           f"is used up (${self.state['spend_today']:.2f} spent)")
                 return
         if self.compact_requested:
             self.compact_requested = False
@@ -2305,9 +2382,20 @@ class Agent:
                 return
             hint = (f"\nThe API refused the key for model {self.model.describe()}: "
                     "check it, and check \"model\" in config.json picks the API you meant.") if e.status in (401, 403) else ""
+            if self.fallbacks:
+                old, name = self.model.describe(), self.fallbacks.pop(0)
+                self.model = Model(name, self.cfg["models"][name])
+                self.state["model"] = self.model.describe()
+                self.discover_limits()
+                self.save_state()
+                self.log("hobkin", f"model {old} refused ({e.status}), switching to {self.model.describe()}:\n{e}{hint}")
+                self.alert(f"hobkin {self.id}: model {old} refused ({e}); switched to {self.model.describe()}")
+                return
             self.log("hobkin", f"model error, pausing until you send a message or /resume:\n{e}{hint}")
             self.paused = self.error = True
             self.save_state("error")
+            self.alert(f"hobkin {self.id} paused: model {self.model.describe()} refused ({e}). "
+                       "A message or /resume makes it try again.")
             return
         if not blocks:
             blocks = [{"type": "text", "text": "(no reply)"}]
@@ -2343,6 +2431,21 @@ class Agent:
         self.messages.append({"role": "user", "content": results})
         self.save_context()
         self.save_state()
+
+    def alert(self, text: str) -> None:
+        """Run alert_command with the news in $HOBKIN_ALERT: for what the agent can't say itself."""
+        cmd = self.cfg.get("alert_command")
+        if not cmd:
+            return
+        env = self.tool_env()
+        env["HOBKIN_ALERT"] = text
+        try:
+            r = subprocess.run(["bash", "-c", cmd], cwd=self.work, env=env, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode:
+                self.log("hobkin", f"alert_command failed (exit {r.returncode}): {clip(r.stderr + r.stdout, 300, 200)}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.log("hobkin", f"alert_command failed: {e}")
 
     def duty(self) -> str | None:
         """What the heartbeat reports, or None when only a message can wake the agent."""
@@ -2391,7 +2494,7 @@ class Agent:
         self.start_heartbeat()
         idle_since = time.time()
         try:
-            while not self.stop:
+            while not self.stop and not self.restart_requested:
                 if self.paused:
                     if self.budget_paused and not self.over_budget():      # a new day
                         self.paused = self.budget_paused = False
@@ -2429,15 +2532,20 @@ class Agent:
                 self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
                     self.log("hobkin", "idle prompt")
-                    self.add_user(f"[from hobkin: idle prompt]\n{prompt}")
+                    self.add_user(f"[from hobkin: idle prompt, {self.stamp()}]\n{prompt}")
                     idle_since = time.time()
         except KeyboardInterrupt:
             pass
         finally:
             self.save_context()
-            self.state["pid"] = None
-            self.save_state("stopped")
-            self.log("hobkin", "stopped")
+            if self.restart_requested and not self.stop:
+                self.state["restarting"] = True
+                self.save_state("restarting")
+                self.log("hobkin", "restarting")
+            else:
+                self.state["pid"] = None
+                self.save_state("stopped")
+                self.log("hobkin", "stopped")
 
     def add_user(self, text: str) -> None:
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
@@ -2611,6 +2719,8 @@ def cmd_chat(agent_id):
     def new_lines():
         nonlocal pos, mine
         with open(out_path, "rb") as f:
+            if os.fstat(f.fileno()).st_size < pos:   # cleared at compaction: start from the top
+                pos = 0
             f.seek(pos)
             chunk = f.read()
         cut = chunk.rfind(b"\n") + 1   # whole lines only
@@ -2750,7 +2860,14 @@ def main(argv):
             agent_id = secrets.token_hex(4)
         print(agent_id, flush=True)
     os.makedirs(os.path.join(HOME, agent_id), exist_ok=True)
-    Agent(agent_id).run()
+    agent = Agent(agent_id)
+    agent.run()
+    if agent.state.get("restarting"):    # /restart: the same process (and pid) starts over on the code on disk now
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, SCRIPT, agent_id])
+
+
+SCRIPT = os.path.abspath(sys.argv[0])     # for /restart
 
 
 def cli():
