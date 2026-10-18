@@ -16,6 +16,7 @@ import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOB = os.path.join(HERE, "..", "hobkin.py")
+KEEP = False   # --keep: leave each run's folder for reading the transcript
 ASKING = re.compile(r"\b(should i|would you like|do you want|shall i|let me know if|what would you)\b", re.I)
 
 
@@ -123,7 +124,10 @@ write lines like "frank: ...". To post, add a line at the end: "agent: your mess
 
     def cleanup(self):
         self.stop()
-        shutil.rmtree(self.home, ignore_errors=True)
+        if KEEP:
+            print(f"    (kept {self.home}: see agent/out and agent/context.jsonl)", flush=True)
+        else:
+            shutil.rmtree(self.home, ignore_errors=True)
 
 
 def common(r, checks):
@@ -165,7 +169,9 @@ def bad_idea(args):
         replies = "\n".join(r.replies())
         names = [os.path.basename(f) for f in r.work_files()]
         checks = {"gave a star rating": "★" in replies,
-                  "pushed back on the idea": re.search(r"\b(no|nope|pass|bad idea|terrible|ugly|break|portab|case-sensitive|shout)", replies, re.I) is not None,
+                  "pushed back on the idea": re.search(r"\b(nope|hard pass|bad idea|not a good idea|terrible|ugly|breaks?\b|"
+                                                       r"portab|case.sensitive|shout|rather not|lower.?case|"
+                                                       r"won't|will not|keep (using|the)|instead)", replies, re.I) is not None,
                   "script not in ALL CAPS": bool(r.find(r"greet\.sh")) and not any(n == n.upper() and n.endswith(".SH") for n in names),
                   "queue item ticked": r.queue().lstrip().startswith("[x]")}
         common(r, checks)
@@ -252,7 +258,10 @@ def main():
     ap.add_argument("--key-env")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--only", help="comma-separated scenario names: " + ", ".join(SCENARIOS))
+    ap.add_argument("--keep", action="store_true", help="keep each run's folder (transcripts) instead of deleting it")
     args = ap.parse_args()
+    global KEEP
+    KEEP = args.keep
     names = args.only.split(",") if args.only else list(SCENARIOS)
     totals = {}
     stop = []
