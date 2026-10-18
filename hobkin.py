@@ -29,6 +29,8 @@ for the agent's shell: _shared/secrets.env and ID/secrets.env (KEY=value lines).
 Standard library only. No ports: it only makes outgoing HTTP calls to the model API.
 """
 
+from __future__ import annotations
+
 __version__ = "0.1.1"
 
 import email.utils
@@ -53,9 +55,28 @@ import urllib.error
 from datetime import date, datetime, timedelta
 import urllib.request
 
+# ---- map: `grep -n '^# ----' hobkin.py` lists these sections; the Agent's own parts are marked '    # --- '.
+#   settings      defaults, the config.json types, and the default AGENTS.md
+#   tools         what the model can call (TOOLS), the saved-shell script, operator commands
+#   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
+#   helpers       time and text helpers, files
+#   config        config.json, warnings, secrets, skills, the shared folder, the lock
+#   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
+#   agent         the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
+#   service       systemd user services
+#   command line  send, chat, list, main
+
+
+# ---- settings: defaults, the config.json types, and the default AGENTS.md
+
 HOME = os.path.expanduser(os.environ.get("HOBKIN_HOME", "~/.hobkins"))
+
+
 SHARED = os.path.join(HOME, "_shared")
+
+
 USER_AGENT = "hobkin/0.1"
+
 
 DEFAULT_CONFIG = {
     "model": "claude",
@@ -100,6 +121,18 @@ DEFAULT_CONFIG = {
     "skill_dirs": [],
     "max_output_tokens": 16000,
 }
+
+
+CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
+                "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
+                "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
+                "heartbeat_seconds": (int, float)}
+
+
+MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
+               "context_tokens": (int, type(None)), "requests_per_minute": (int, float, type(None)), "headers": dict,
+               "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None))}
+
 
 DEFAULT_AGENTS_MD = """# How you are
 
@@ -307,6 +340,12 @@ reply here. Then go and grab the next piece of work.
   system if it has a way to raise questions. Then go do other work while you
   wait. Never just sit there.
 """
+
+
+# ---- tools: what the model can call (TOOLS), the saved-shell script, operator commands
+
+ToolResult = tuple[str, bool]  # (text for the model, is_error): what every tool returns
+
 TOOLS = [
     {"name": "bash",
      "description": ("Run a bash command. You get its output (stdout and stderr), its exit code and the folder "
@@ -361,6 +400,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 ]
 
+
 # Saved after every command, restored before the next: the shell's folder, variables,
 # functions and aliases (see run_bash). Bash's own variables and readonly ones are skipped.
 SHELL_SAVE = r"""__hobkin_save() {
@@ -390,34 +430,46 @@ trap __hobkin_save EXIT
 shopt -s expand_aliases
 """
 
+
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders")
-TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+# ---- nudges: the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
+
 # Small models skim long instructions but follow a nudge at the moment it applies
 HOT_TAKE = ("[hobkin: a task or an idea? Start your reply with a hot take: one to five stars and your own "
             "reason; if it's a bad idea, laugh and do the better thing. Just a hello or a question? Answer it "
             "in your reply, no rating, then get back to work.]")
+
+
 SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
+
+
 WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your report where the people are "
            "(your work system's chat or comments)? (2) any slips for your blooper reel? (3) more work to grab? "
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
+
+
 COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a gremlin: the verdict first, the "
              "specific things you saw, jokes allowed, filler out.]")
+
+
 COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehensive", "seamless", "leverag",
                    "synerg", "best practice", "key success factor", "stakeholder", "holistic", "streamlin",
                    "significant achievement", "it is important to note", "delve", "world-class", "cutting-edge",
                    "enterprise-grade", "paradigm", "actionable insight", "going forward", "in conclusion")
 
 
-def committee_speak(text):
+STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
+
+
+def committee_speak(text: str) -> list[str]:
     """The committee words in a text (distinct), to spot writing that lost its voice."""
     low = text.lower()
     return [w for w in COMMITTEE_WORDS if w in low]
 
 
-STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
-
-
-def talks_by_echo(command):
+def talks_by_echo(command: str) -> bool:
     """True for a command that's only `echo "some sentence"`: talking through a tool."""
     c = command.strip()
     if not re.match(r"(echo|printf)\b", c):
@@ -427,7 +479,12 @@ def talks_by_echo(command):
     return not re.search(r"[>|;&`]|\$\(", bare) and len(re.findall(r"[A-Za-z]+", words)) >= 4
 
 
-def parse_duration(text):
+# ---- helpers: time and text helpers, files
+
+TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def parse_duration(text: str) -> float:
     """'20m', '2h', '1d', '1h30m', '90s', '2 weeks' -> seconds."""
     t = str(text).strip().lower().replace(" ", "")
     parts = re.findall(r"(\d+(?:\.\d+)?)(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w)", t)
@@ -436,7 +493,7 @@ def parse_duration(text):
     return sum(float(n) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[u[0]] for n, u in parts)
 
 
-def parse_at(text, now_t):
+def parse_at(text: str, now_t: float) -> float:
     """A local time: 'YYYY-MM-DD HH:MM[:SS]' (or with T), 'HH:MM' (the next one), 'tomorrow HH:MM'."""
     t, tomorrow = str(text).strip(), False
     if t.lower().startswith("tomorrow"):
@@ -469,27 +526,9 @@ def span_text(seconds):
             out.append(f"{s // size}{unit}")
             s %= size
     return " ".join(out[:2]) or f"{s}s"
-# Errors a retry can't fix: pause and wait for the operator. Everything else (timeouts, overload,
-# upstream trouble, anything unknown) is retried with growing waits.
-FATAL_STATUS = {400, 401, 402, 403, 404, 405, 413, 422}
 
 
-def body_error(r):
-    """An error reported inside a 200 response (OpenRouter does this for upstream failures):
-    at the top level or in the first choice. ApiError with the error's own code, or None."""
-    for err in (r.get("error"), ((r.get("choices") or [{}])[0] or {}).get("error")):
-        if err:
-            code = err.get("code") if isinstance(err, dict) else None
-            try:
-                status = int(code)
-            except (TypeError, ValueError):
-                status = 0
-            text = json.dumps(r)
-            return ApiError(status, text[:500], *retry_hint({}, text))
-    return None
-
-
-def clip(text, head, tail):
+def clip(text: str, head: int, tail: int) -> str:
     """Text with its middle cut out if it's longer than head + tail characters."""
     if len(text) <= head + tail:
         return text
@@ -522,7 +561,9 @@ def merged(base, over):
     return out
 
 
-def load_config(agent_dir):
+# ---- config: config.json, warnings, secrets, skills, the shared folder, the lock
+
+def load_config(agent_dir: str) -> dict:
     """Settings: built-in defaults, then _shared/config.json, then the agent's config.json.
     Models are different: they come only from the files (the built-in ones are just the starter
     config.json), so deleting a model from your config really removes it. An agent's file can add
@@ -544,6 +585,39 @@ def load_config(agent_dir):
         cfg["models"], cfg["model"] = DEFAULT_CONFIG["models"], DEFAULT_CONFIG["model"]
     cfg["_files"] = files
     return cfg
+
+
+def config_warnings(cfg: dict) -> list[str]:
+    """Typos and wrong types in config.json: warned about, never refused."""
+    out = []
+
+    def check(where, data, types):
+        for key, val in data.items():
+            if key.startswith("_"):
+                continue
+            if key not in types:
+                near = difflib.get_close_matches(key, list(types), n=1, cutoff=0.6)
+                out.append(f"unknown setting '{where}{key}'" + (f" (did you mean '{where}{near[0]}'?)" if near else " (ignored)"))
+            elif not isinstance(val, types[key]) or (isinstance(val, bool) and types[key] in (int, (int, float))):
+                want = types[key] if isinstance(types[key], type) else " or ".join(
+                    "null" if t is type(None) else t.__name__ for t in types[key])
+                want = getattr(want, "__name__", want)
+                out.append(f"setting '{where}{key}' should be {want}, not {json.dumps(val)}")
+    check("", cfg, CONFIG_TYPES)
+    for name, m in (cfg.get("models") or {}).items():
+        if isinstance(m, dict):
+            check(f"models.{name}.", m, MODEL_TYPES)
+            if m.get("api") not in (None, "anthropic", "openai"):
+                out.append(f"models.{name}.api is {m.get('api')!r}: use \"anthropic\" or \"openai\" (treated as openai)")
+    ca = cfg.get("compact_at")
+    if isinstance(ca, (int, float)) and not 0 < ca < 1:
+        out.append(f"compact_at is {ca}: it's a share of the context window, between 0 and 1 (e.g. 0.8)")
+    return out
+
+
+def operator_label(cfg):
+    """The name direct messages are from (in the context and the out log)."""
+    return str(cfg.get("operator") or "operator").strip() or "operator"
 
 
 def load_env_file(path):
@@ -575,7 +649,7 @@ def skill_header(path):
     return meta.get("name"), meta.get("description")
 
 
-def find_skills(agent_dir, extra_dirs=()):
+def find_skills(agent_dir: str, extra_dirs=()) -> dict[str, tuple[str, str]]:
     """{name: (description, path to SKILL.md)}. Later folders replace earlier ones by name:
     config skill_dirs, then _shared/skills, then the agent's own skills/."""
     skills = {}
@@ -614,6 +688,8 @@ def is_running(agent_dir):
         os.close(fd)
 
 
+# ---- model api: HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
+
 def http_json(method, url, headers, body=None, timeout=600):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -628,12 +704,32 @@ class ApiError(Exception):
         self.status, self.text, self.retry_after, self.hint = status, text, retry_after, hint
 
 
+# Errors a retry can't fix: pause and wait for the operator. Everything else (timeouts, overload,
+# upstream trouble, anything unknown) is retried with growing waits.
+FATAL_STATUS = {400, 401, 402, 403, 404, 405, 413, 422}
+
+
+def body_error(r):
+    """An error reported inside a 200 response (OpenRouter does this for upstream failures):
+    at the top level or in the first choice. ApiError with the error's own code, or None."""
+    for err in (r.get("error"), ((r.get("choices") or [{}])[0] or {}).get("error")):
+        if err:
+            code = err.get("code") if isinstance(err, dict) else None
+            try:
+                status = int(code)
+            except (TypeError, ValueError):
+                status = 0
+            text = json.dumps(r)
+            return ApiError(status, text[:500], *retry_hint({}, text))
+    return None
+
+
 RESET_HEADERS = ("retry-after", "x-ratelimit-reset", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
                  "anthropic-ratelimit-requests-reset", "anthropic-ratelimit-tokens-reset",
                  "anthropic-ratelimit-input-tokens-reset", "anthropic-ratelimit-output-tokens-reset")
 
 
-def reset_seconds(value, now_t):
+def reset_seconds(value, now_t: float) -> float | None:
     """Seconds until a reset, from any of the forms providers use: seconds ('40'), a duration
     ('1m30s', '250ms'), an epoch in s or ms (OpenRouter), RFC 3339 (Anthropic) or an HTTP date."""
     v = str(value).strip()
@@ -655,7 +751,7 @@ def reset_seconds(value, now_t):
         return None
 
 
-def retry_hint(headers, text):
+def retry_hint(headers: dict, text: str) -> tuple[float | None, str | None]:
     """(seconds to wait, where that came from) from response headers or an error body, or (None, None).
     Retry-After wins; otherwise the longest of the reset times (wait until everything has reset)."""
     now_t, found = time.time(), {}
@@ -683,8 +779,6 @@ def retry_hint(headers, text):
     key = "retry-after" if "retry-after" in found else max(found, key=found.get)
     return found[key], key
 
-
-# ---------------------------------------------------------------------- model adapters
 
 class Model:
     """One configured model. Messages are kept in Anthropic's shape (content blocks:
@@ -761,7 +855,7 @@ class Model:
         return f"{self.name} ({self.model} via {self.base})"
 
     # --- limits: ask the API; None when it won't say
-    def query_limits(self):
+    def query_limits(self) -> tuple[int | None, int | None, str | None]:
         """(context_tokens, max_output_tokens, source) from the API, or (None, None, None)."""
         h = self.headers()
         try:
@@ -797,7 +891,8 @@ class Model:
         return None, None, None
 
     # --- one request
-    def call(self, system, messages, max_tokens, tools=TOOLS, tool_choice=None):
+    def call(self, system: str, messages: list[dict], max_tokens: int, tools=TOOLS,
+             tool_choice: str | None = None) -> tuple[list[dict], str | None, int]:
         """Returns (content_blocks, stop_reason, input_tokens)."""
         if self.api == "anthropic":
             msgs = json.loads(json.dumps(messages))
@@ -904,7 +999,7 @@ def is_too_long(err):
     return err.status in (400, 413) and re.search(r"too long|context length|context window|maximum context|too many tokens", err.text, re.I)
 
 
-# ---------------------------------------------------------------------- the agent
+# ---- agent: the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
 
 class Agent:
     def __init__(self, agent_id):
@@ -1196,7 +1291,7 @@ class Agent:
         rel = os.path.relpath(cwd, self.work)
         return "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
 
-    def run_bash(self, command, timeout=None, reset=False):
+    def run_bash(self, command: str, timeout: int | None = None, reset: bool = False) -> ToolResult:
         """Each command is its own bash process, so a hung or crashed one can't take the shell
         with it. The shell still behaves like one that persists: the first runs as a login shell,
         and every command starts from the state the last one left (shell.sh)."""
@@ -1269,7 +1364,7 @@ class Agent:
                       lambda m: names[m.group(1)], path.strip())
         return os.path.normpath(os.path.join(self.cwd(), os.path.expanduser(path)))
 
-    def read_file(self, path, offset=None, limit=None):
+    def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
         full = self.resolve(path)
         if os.path.isdir(full):
             entries = sorted(os.listdir(full))
@@ -1293,7 +1388,7 @@ class Agent:
             "anything about the rest.]" if end < len(lines) else ""
         return f"{full}{more}:\n{body}{unread}", False
 
-    def write_file(self, path, content):
+    def write_file(self, path: str, content: str) -> ToolResult:
         full = self.resolve(path)
         existed = os.path.exists(full)
         if os.path.isdir(full):
@@ -1308,7 +1403,7 @@ class Agent:
                     "If you meant new lines, write real line breaks in content.")
         return f"{'Replaced' if existed else 'Created'} {full} ({n} lines){note}", False
 
-    def edit_file(self, path, old, new, replace_all=False):
+    def edit_file(self, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
         full = self.resolve(path)
         if not os.path.isfile(full):
             return f"No such file: {full}. Use write_file to create it.", True
@@ -1363,7 +1458,7 @@ class Agent:
         shown = "\n".join(f"{k:>5}| {l}" for k, l in enumerate(lines[i:i + n], i + 1))
         return f" The closest text in the file is lines {i + 1}-{i + n}:\n{shown}"
 
-    def open_skill(self, name):
+    def open_skill(self, name: str) -> ToolResult:
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
         key = name.strip().lower()
         match = next((n for n in skills if n.lower() == key), None)
@@ -1412,7 +1507,7 @@ class Agent:
                 + (f", repeats every {r['every']}" if r.get("every") else "") + f": {r['message']}"
                 for r in sorted(items, key=lambda r: r["_due"])]
 
-    def tool_remind(self, inp):
+    def tool_remind(self, inp: dict) -> ToolResult:
         message = str(inp.get("message") or "").strip()
         if not message:
             return "A reminder needs a message: what to check or do when it fires.", True
@@ -1451,7 +1546,7 @@ class Agent:
         return (f"Reminder #{rid} set for {when_text(due)} (in {span_text(max(0, due - now_t))})"
                 + (f", then every {inp['every']}" if every else "") + f". It's now {when_text(now_t)}.{hint}"), False
 
-    def tool_reminders(self, inp):
+    def tool_reminders(self, inp: dict) -> ToolResult:
         data, ok = self.load_reminders()
         note = ""
         if inp.get("cancel") is not None:
@@ -1466,7 +1561,7 @@ class Agent:
         return note + (("Your reminders:\n" + "\n".join(lines)) if lines else "You have no reminders.") \
             + f"\nIt's now {when_text(time.time())}.", False
 
-    def take_due_reminders(self):
+    def take_due_reminders(self) -> list[str]:
         """Messages for reminders that are due; repeating ones move to their next time."""
         if not os.path.exists(self.p("reminders.json")):
             return []
@@ -1502,23 +1597,50 @@ class Agent:
         data, ok = self.load_reminders()
         return max(0.0, min(r["_due"] for r in data["items"]) - time.time()) if ok and data["items"] else None
 
-    def voice_check(self, result, path, text):
-        """Prose written for people (.md, .txt) full of committee words gets a nudge."""
-        if not result[1] and str(path or "").lower().endswith((".md", ".txt", ".rst")) \
-                and len(committee_speak(str(text or ""))) >= 3:
-            return f"{result[0]}\n{COMMITTEE}", result[1]
-        return result
+    # --- nudges: where the [hobkin: ...] hints (texts and detectors: the "nudges" section) get attached.
+    # Small models skim long instructions but follow a hint at the moment it applies.
+    def from_operator(self, text: str) -> str:
+        """A message from the operator as the model sees it: who sent it, and the hot-take hint."""
+        return f"[message from {self.who}]\n{text}\n{HOT_TAKE}"
 
-    def run_tool(self, name, inp):
+    def tool_nudges(self, name: str, inp: dict, content: str, err: bool) -> str:
+        """A tool's result, with any hint for what the agent just did added at the end."""
+        if name == "bash" and talks_by_echo(str(inp.get("command", ""))):
+            content += f"\n{SAY_IT}"                       # talking through echo
+        if err and (name != "bash" or re.search(r"exit code 12[67]\b|command not found", content)):
+            content += f"\n{STUMBLE}"                      # a clear slip: blooper reel
+        prose = inp.get("content") if name == "write_file" else inp.get("new_text") if name == "edit_file" else None
+        if prose and not err and str(inp.get("path", "")).lower().endswith((".md", ".txt", ".rst")) \
+                and len(committee_speak(str(prose))) >= 3:
+            content += f"\n{COMMITTEE}"                    # writing for people that lost its voice
+        return content
+
+    def turn_end_nudge(self, blocks: list) -> bool:
+        """At the end of a turn: a committee-voiced reply, or the wrap-up check after a working turn.
+        True if a nudge was sent (the agent gets one more step to act on it)."""
+        said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
+            return True
+        return bool(self.turn_used_tools) and self.nudge_once("wrap_up_sent", WRAP_UP)
+
+    def nudge_once(self, flag: str, text: str) -> bool:
+        """Send a nudge as a user message, at most once per turn (flag), so it can never loop."""
+        if getattr(self, flag):
+            return False
+        setattr(self, flag, True)
+        self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
+        self.save_context()
+        return True
+
+    def run_tool(self, name: str, inp: dict) -> ToolResult:
         """(result text, is_error) for one tool call. Each tool is one line here; bash logs its
         own command and output, the rest log the first line of their result."""
         s = lambda key: str(inp[key])            # a required argument (KeyError if missing)
         tools = {
             "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset"))),
             "read_file": lambda: self.read_file(s("path"), inp.get("offset"), inp.get("limit")),
-            "write_file": lambda: self.voice_check(self.write_file(s("path"), s("content")), s("path"), s("content")),
-            "edit_file": lambda: self.voice_check(self.edit_file(s("path"), s("old_text"), s("new_text"),
-                                                                 bool(inp.get("replace_all"))), s("path"), s("new_text")),
+            "write_file": lambda: self.write_file(s("path"), s("content")),
+            "edit_file": lambda: self.edit_file(s("path"), s("old_text"), s("new_text"), bool(inp.get("replace_all"))),
             "remind": lambda: self.tool_remind(inp),
             "reminders": lambda: self.tool_reminders(inp),
             "skill": lambda: self.open_skill(s("name")),
@@ -1535,8 +1657,8 @@ class Agent:
             self.log(name, result[0].splitlines()[0] if result[0] else "")
         return result
 
-    # --- the model
-    def ask(self, messages, tool_choice=None):
+    # --- the model: one call (with rate limits and retries)
+    def ask(self, messages: list[dict], tool_choice: str | None = None) -> tuple[list[dict], str | None]:
         """Call the model, retrying transient failures. Raises ApiError for real ones."""
         delay, limited = 2, 15          # backoff for errors, and for 429s with no reset hint
         while True:
@@ -1582,7 +1704,7 @@ class Agent:
                 raise ApiError(0, "stopping")
             delay = min(delay * 2, 300)
 
-    def wait_out(self, until, why):
+    def wait_out(self, until: float, why: str) -> None:
         """Wait until `until` (commands still work), saying so in the log, state.json and the heartbeat."""
         clock = time.strftime("%H:%M:%S", time.localtime(until))
         self.waiting_note = f"waiting out a rate limit (until {clock})"
@@ -1595,7 +1717,7 @@ class Agent:
             raise ApiError(0, "stopping")
         self.save_state("working")
 
-    def needs_compaction(self):
+    def needs_compaction(self) -> bool:
         ctx = self.state.get("context_tokens")
         used = self.state.get("last_input_tokens") or 0
         if not ctx or used <= float(self.cfg["compact_at"]) * (ctx - self.max_output()):
@@ -1608,7 +1730,29 @@ class Agent:
             return False
         return True
 
-    def compact(self, why):
+    # --- compaction: the conversation, summarised into a handoff note when it gets too big
+    @staticmethod
+    def shrink_history(history: list, attempt: int) -> list:
+        """A history too long even to summarise, made shorter: always clip old command output; from the
+        second try, also drop the oldest third, restarting at a user message. Tool results whose calls
+        were dropped become plain text, so the history stays valid (every call answered)."""
+        for m in history[:-2]:
+            for b in m["content"]:
+                if b.get("type") == "tool_result":
+                    b["content"] = clip(b["content"], 700, 500)
+        if attempt < 1:
+            return history
+        start = max(1, len(history) // 3)
+        while start < len(history) - 1 and history[start]["role"] != "user":
+            start += 1
+        if start >= len(history) - 1:
+            return history
+        first = [{"type": "text", "text": "[earliest messages dropped]"}] + [
+            {"type": "text", "text": "[output of an earlier command dropped]"} if b.get("type") == "tool_result" else b
+            for b in history[start]["content"]]
+        return [{"role": "user", "content": first}] + history[start + 1:]
+
+    def compact(self, why: str) -> None:
         """Replace the conversation with the agent's own summary of it; archive the old one."""
         if not self.messages:
             return
@@ -1630,22 +1774,7 @@ class Agent:
                 if not is_too_long(e) or attempt == 3:
                     self.log("hobkin", f"compaction failed: {e}")
                     return
-                # Too long even to summarise: shorten old tool output, then drop the oldest turns
-                for m in history[:-2]:
-                    for b in m["content"]:
-                        if b.get("type") == "tool_result":
-                            b["content"] = clip(b["content"], 700, 500)
-                if attempt >= 1:
-                    # Drop the oldest third, restarting at a user message; tool results whose
-                    # calls were dropped become plain text so the history stays valid
-                    start = max(1, len(history) // 3)
-                    while start < len(history) - 1 and history[start]["role"] != "user":
-                        start += 1
-                    if start < len(history) - 1:
-                        first = [{"type": "text", "text": "[earliest messages dropped]"}] + [
-                            {"type": "text", "text": "[output of an earlier command dropped]"} if b.get("type") == "tool_result" else b
-                            for b in history[start]["content"]]
-                        history = [{"role": "user", "content": first}] + history[start + 1:]
+                history = self.shrink_history(history, attempt)
         note = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
         # The newest turn isn't answered yet: carry it over as it is (results shortened)
         carry = []
@@ -1668,7 +1797,8 @@ class Agent:
         self.save_state()
         self.log("hobkin", f"compacted; note:\n{note}")
 
-    def step(self):
+    # --- the loop: one step at a time; the heartbeat; run()
+    def step(self) -> None:
         """One model call, then run any commands it asked for."""
         if self.compact_requested:
             self.compact_requested = False
@@ -1703,10 +1833,7 @@ class Agent:
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
         if not calls:
-            said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-            if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
-                return
-            if self.turn_used_tools and self.nudge_once("wrap_up_sent", WRAP_UP):
+            if self.turn_end_nudge(blocks):
                 return
             self.working = False
             self.save_state()
@@ -1718,23 +1845,19 @@ class Agent:
                 content, err = "Not run: hobkin is stopping.", True
             else:
                 content, err = self.run_tool(b.get("name"), b.get("input") or {})
-                if b.get("name") == "bash" and talks_by_echo(str((b.get("input") or {}).get("command", ""))):
-                    content = f"{content}\n{SAY_IT}"
-                slip = err and (b.get("name") != "bash" or re.search(r"exit code 12[67]\b|command not found", content))
-                if slip:
-                    content = f"{content}\n{STUMBLE}"
+                content = self.tool_nudges(b.get("name"), b.get("input") or {}, content, err)
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
         # Reminders that came due and operator messages that came in meanwhile ride along
         for text in self.take_due_reminders():
             results.append({"type": "text", "text": text})
         for text in self.pending:
-            results.append({"type": "text", "text": f"[message from {self.who}]\n{text}\n{HOT_TAKE}"})
+            results.append({"type": "text", "text": self.from_operator(text)})
         self.pending = []
         self.messages.append({"role": "user", "content": results})
         self.save_context()
         self.save_state()
 
-    def duty(self):
+    def duty(self) -> str | None:
         """What the heartbeat reports, or None when only a message can wake the agent."""
         if self.paused or self.stop:
             return None
@@ -1792,7 +1915,7 @@ class Agent:
                     self.compact("requested")
                 due = self.take_due_reminders()
                 if due or self.pending:
-                    self.add_user("\n\n".join(due + [f"[message from {self.who}]\n{t}\n{HOT_TAKE}" for t in self.pending]))
+                    self.add_user("\n\n".join(due + [self.from_operator(t) for t in self.pending]))
                     self.pending = []
                 if self.working:
                     self.save_state("working")
@@ -1818,17 +1941,7 @@ class Agent:
             self.save_state("stopped")
             self.log("hobkin", "stopped")
 
-    def nudge_once(self, flag, text):
-        """Send a nudge as a user message, at most once per turn (flag), so it can never loop.
-        True if sent: the agent then gets another step to act on it."""
-        if getattr(self, flag):
-            return False
-        setattr(self, flag, True)
-        self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
-        self.save_context()
-        return True
-
-    def add_user(self, text):
+    def add_user(self, text: str) -> None:
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
         block = {"type": "text", "text": text}
         if self.messages and self.messages[-1]["role"] == "user":
@@ -1839,49 +1952,118 @@ class Agent:
         self.save_context()
 
 
-# ---------------------------------------------------------------------- command line
+# ---- service: systemd user services
 
-CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
-                "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
-                "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
-                "heartbeat_seconds": (int, float)}
-MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
-               "context_tokens": (int, type(None)), "requests_per_minute": (int, float, type(None)), "headers": dict,
-               "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None))}
+SERVICE_UNIT = """[Unit]
+Description=hobkin agent %i ({home})
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+ExecStart={exec_start} %i
+Environment=PYTHONUNBUFFERED=1
+{home_env}EnvironmentFile=-%h/.config/hobkin/env
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+"""
 
 
-def config_warnings(cfg):
-    """Typos and wrong types in config.json: warned about, never refused."""
-    out = []
+def unit_prefix():
+    """'hobkin' for the default home; each other HOBKIN_HOME gets its own template, so they never clash."""
+    if os.path.realpath(HOME) == os.path.realpath(os.path.expanduser("~/.hobkins")):
+        return "hobkin"
+    return "hobkin-" + hashlib.sha256(os.path.realpath(HOME).encode()).hexdigest()[:6]
 
-    def check(where, data, types):
-        for key, val in data.items():
-            if key.startswith("_"):
-                continue
-            if key not in types:
-                near = difflib.get_close_matches(key, list(types), n=1, cutoff=0.6)
-                out.append(f"unknown setting '{where}{key}'" + (f" (did you mean '{where}{near[0]}'?)" if near else " (ignored)"))
-            elif not isinstance(val, types[key]) or (isinstance(val, bool) and types[key] in (int, (int, float))):
-                want = types[key] if isinstance(types[key], type) else " or ".join(
-                    "null" if t is type(None) else t.__name__ for t in types[key])
-                want = getattr(want, "__name__", want)
-                out.append(f"setting '{where}{key}' should be {want}, not {json.dumps(val)}")
-    check("", cfg, CONFIG_TYPES)
-    for name, m in (cfg.get("models") or {}).items():
-        if isinstance(m, dict):
-            check(f"models.{name}.", m, MODEL_TYPES)
-            if m.get("api") not in (None, "anthropic", "openai"):
-                out.append(f"models.{name}.api is {m.get('api')!r}: use \"anthropic\" or \"openai\" (treated as openai)")
-    ca = cfg.get("compact_at")
-    if isinstance(ca, (int, float)) and not 0 < ca < 1:
-        out.append(f"compact_at is {ca}: it's a share of the context window, between 0 and 1 (e.g. 0.8)")
+
+def systemctl(*args, check=False):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"hobkin: systemctl --user {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def cmd_service(argv):
+    if len(argv) != 2 or argv[0] not in ("add", "remove"):
+        sys.exit("usage: hobkin service add ID | hobkin service remove ID")
+    action, agent_id = argv[0], valid_id(argv[1])
+    if not shutil.which("systemctl") or systemctl("show-environment").returncode != 0:
+        sys.exit("hobkin: systemd user services aren't available here (no systemctl, or no user session: "
+                 "log in over ssh or a desktop session, rather than su/sudo, and try again)")
+    unit = f"{unit_prefix()}@{agent_id}.service"
+    if action == "remove":
+        systemctl("disable", "--now", unit, check=True)
+        return print(f"{agent_id}: service stopped and removed from boot")
+
+    d = os.path.join(HOME, agent_id)
+    if os.path.isdir(d) and is_running(d) and systemctl("is-active", unit).stdout.strip() != "active":
+        sys.exit(f"hobkin: {agent_id} is already running outside systemd: stop it first "
+                 f"(echo /stop > {os.path.join(d, 'in')}), then run this again")
+    # The template unit: run this same hobkin (the installed command, or this file with this Python)
+    me = os.path.abspath(sys.argv[0])
+    if os.path.basename(me) == "hobkin" and os.access(me, os.X_OK):
+        exec_start = me
+    else:
+        exec_start = f"{sys.executable} {os.path.abspath(__file__)}"
+    exec_start = " ".join(f'"{part}"' if " " in part else part for part in exec_start.split(" ", 1))
+    home_env = "" if unit_prefix() == "hobkin" else f'Environment="HOBKIN_HOME={os.path.realpath(HOME)}"\n'
+    text = SERVICE_UNIT.format(home=HOME, exec_start=exec_start, home_env=home_env)
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    template = os.path.join(unit_dir, f"{unit_prefix()}@.service")
+    os.makedirs(unit_dir, exist_ok=True)
+    if read(template) != text:
+        write_atomic(template, text)
+        print(f"wrote {template}")
+    # API keys kept only in your shell's environment won't reach a service
+    cfg = load_config(d)
+    name = cfg.get("model") or (next(iter(cfg["models"])) if len(cfg["models"]) == 1 else None)
+    m = cfg["models"].get(name) or {}
+    if m.get("key_env") and not m.get("key_file") and \
+            m["key_env"] not in load_env_file(os.path.expanduser("~/.config/hobkin/env")):
+        print(f"warning: model {name!r} reads its key only from ${m['key_env']}, which a service doesn't get from "
+              f"your shell. Put {m['key_env']}=... in ~/.config/hobkin/env (chmod 600), or set key_file.")
+    systemctl("daemon-reload", check=True)
+    systemctl("enable", "--now", unit, check=True)
+    # Keep services running when you're logged out
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    linger = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
+    if "Linger=no" in linger.stdout:
+        r = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        print("turned on linger: your agents keep running when you log out" if r.returncode == 0 else
+              f"note: couldn't turn on linger ({(r.stderr or '').strip()}); run `loginctl enable-linger {user}` "
+              "so agents keep running when you're logged out")
+    time.sleep(1.5)
+    state = systemctl("is-active", unit).stdout.strip()
+    print(f"{agent_id}: service {state} ({unit}). Talk: hobkin chat {agent_id}    "
+          f"Logs: journalctl --user -u {unit}" + ("" if state == "active" else
+          "\nIt didn't stay up: see the journal, and the agent's out file"))
+
+
+def service_states(names):
+    """{agent: 'service' / 'service (inactive)' ...} for agents set up as services. Enabled ones have a
+    symlink in default.target.wants; list-units says which are running."""
+    if not names or not shutil.which("systemctl"):
+        return {}
+    prefix = unit_prefix()
+    wants = os.path.expanduser("~/.config/systemd/user/default.target.wants")
+    enabled = {f[len(prefix) + 1:-len(".service")] for f in (os.listdir(wants) if os.path.isdir(wants) else [])
+               if f.startswith(prefix + "@") and f.endswith(".service")}
+    active = {}
+    for line in systemctl("list-units", "--all", "--plain", "--no-legend", f"{prefix}@*").stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].startswith(prefix + "@"):
+            active[parts[0][len(prefix) + 1:-len(".service")]] = parts[2]
+    out = {}
+    for n in names:
+        if n in enabled or active.get(n) == "active":
+            out[n] = "service" if active.get(n) == "active" else f"service ({active.get(n, 'inactive')})"
     return out
 
 
-def operator_label(cfg):
-    """The name direct messages are from (in the context and the out log)."""
-    return str(cfg.get("operator") or "operator").strip() or "operator"
-
+# ---- command line: send, chat, list, main
 
 def valid_id(agent_id):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id or ""):
@@ -2022,117 +2204,6 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
             except OSError:
                 pass
         os.close(fifo)
-
-
-# ---------------------------------------------------------------------- systemd user services
-
-SERVICE_UNIT = """[Unit]
-Description=hobkin agent %i ({home})
-After=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=5
-
-[Service]
-ExecStart={exec_start} %i
-Environment=PYTHONUNBUFFERED=1
-{home_env}EnvironmentFile=-%h/.config/hobkin/env
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=default.target
-"""
-
-
-def unit_prefix():
-    """'hobkin' for the default home; each other HOBKIN_HOME gets its own template, so they never clash."""
-    if os.path.realpath(HOME) == os.path.realpath(os.path.expanduser("~/.hobkins")):
-        return "hobkin"
-    return "hobkin-" + hashlib.sha256(os.path.realpath(HOME).encode()).hexdigest()[:6]
-
-
-def systemctl(*args, check=False):
-    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
-    if check and r.returncode != 0:
-        sys.exit(f"hobkin: systemctl --user {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
-    return r
-
-
-def cmd_service(argv):
-    if len(argv) != 2 or argv[0] not in ("add", "remove"):
-        sys.exit("usage: hobkin service add ID | hobkin service remove ID")
-    action, agent_id = argv[0], valid_id(argv[1])
-    if not shutil.which("systemctl") or systemctl("show-environment").returncode != 0:
-        sys.exit("hobkin: systemd user services aren't available here (no systemctl, or no user session: "
-                 "log in over ssh or a desktop session, rather than su/sudo, and try again)")
-    unit = f"{unit_prefix()}@{agent_id}.service"
-    if action == "remove":
-        systemctl("disable", "--now", unit, check=True)
-        return print(f"{agent_id}: service stopped and removed from boot")
-
-    d = os.path.join(HOME, agent_id)
-    if os.path.isdir(d) and is_running(d) and systemctl("is-active", unit).stdout.strip() != "active":
-        sys.exit(f"hobkin: {agent_id} is already running outside systemd: stop it first "
-                 f"(echo /stop > {os.path.join(d, 'in')}), then run this again")
-    # The template unit: run this same hobkin (the installed command, or this file with this Python)
-    me = os.path.abspath(sys.argv[0])
-    if os.path.basename(me) == "hobkin" and os.access(me, os.X_OK):
-        exec_start = me
-    else:
-        exec_start = f"{sys.executable} {os.path.abspath(__file__)}"
-    exec_start = " ".join(f'"{part}"' if " " in part else part for part in exec_start.split(" ", 1))
-    home_env = "" if unit_prefix() == "hobkin" else f'Environment="HOBKIN_HOME={os.path.realpath(HOME)}"\n'
-    text = SERVICE_UNIT.format(home=HOME, exec_start=exec_start, home_env=home_env)
-    unit_dir = os.path.expanduser("~/.config/systemd/user")
-    template = os.path.join(unit_dir, f"{unit_prefix()}@.service")
-    os.makedirs(unit_dir, exist_ok=True)
-    if read(template) != text:
-        write_atomic(template, text)
-        print(f"wrote {template}")
-    # API keys kept only in your shell's environment won't reach a service
-    cfg = load_config(d)
-    name = cfg.get("model") or (next(iter(cfg["models"])) if len(cfg["models"]) == 1 else None)
-    m = cfg["models"].get(name) or {}
-    if m.get("key_env") and not m.get("key_file") and \
-            m["key_env"] not in load_env_file(os.path.expanduser("~/.config/hobkin/env")):
-        print(f"warning: model {name!r} reads its key only from ${m['key_env']}, which a service doesn't get from "
-              f"your shell. Put {m['key_env']}=... in ~/.config/hobkin/env (chmod 600), or set key_file.")
-    systemctl("daemon-reload", check=True)
-    systemctl("enable", "--now", unit, check=True)
-    # Keep services running when you're logged out
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-    linger = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
-    if "Linger=no" in linger.stdout:
-        r = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        print("turned on linger: your agents keep running when you log out" if r.returncode == 0 else
-              f"note: couldn't turn on linger ({(r.stderr or '').strip()}); run `loginctl enable-linger {user}` "
-              "so agents keep running when you're logged out")
-    time.sleep(1.5)
-    state = systemctl("is-active", unit).stdout.strip()
-    print(f"{agent_id}: service {state} ({unit}). Talk: hobkin chat {agent_id}    "
-          f"Logs: journalctl --user -u {unit}" + ("" if state == "active" else
-          "\nIt didn't stay up: see the journal, and the agent's out file"))
-
-
-def service_states(names):
-    """{agent: 'service' / 'service (inactive)' ...} for agents set up as services. Enabled ones have a
-    symlink in default.target.wants; list-units says which are running."""
-    if not names or not shutil.which("systemctl"):
-        return {}
-    prefix = unit_prefix()
-    wants = os.path.expanduser("~/.config/systemd/user/default.target.wants")
-    enabled = {f[len(prefix) + 1:-len(".service")] for f in (os.listdir(wants) if os.path.isdir(wants) else [])
-               if f.startswith(prefix + "@") and f.endswith(".service")}
-    active = {}
-    for line in systemctl("list-units", "--all", "--plain", "--no-legend", f"{prefix}@*").stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0].startswith(prefix + "@"):
-            active[parts[0][len(prefix) + 1:-len(".service")]] = parts[2]
-    out = {}
-    for n in names:
-        if n in enabled or active.get(n) == "active":
-            out[n] = "service" if active.get(n) == "active" else f"service ({active.get(n, 'inactive')})"
-    return out
 
 
 def cmd_list():
