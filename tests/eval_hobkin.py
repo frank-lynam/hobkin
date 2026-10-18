@@ -85,7 +85,8 @@ write lines like "frank: ...". To post, add a line at the end: "agent: your mess
             now_size = len(self.read("out"))
             if now_size != size:
                 size, last_change = now_size, time.time()
-            if st.get("status") in ("idle", "paused", "error") and time.time() - last_change >= quiet:
+            if st.get("status") in ("idle", "paused", "error") and not st.get("jobs") \
+                    and time.time() - last_change >= quiet:           # a running job will wake it
                 return True
             time.sleep(2)
         return False
@@ -232,7 +233,8 @@ def slow_command(args):
     r = Run(args, "slow", extra_cfg={"bash_timeout": 30})
     try:
         slow = os.path.join(r.home, "slow.sh")
-        open(slow, "w").write("#!/bin/bash\nsleep 75\necho 'the answer is purple'\n")
+        # The answer is computed, so reading the script doesn't give it away
+        open(slow, "w").write("#!/bin/bash\nsleep 75\necho \"the answer is $(echo cHVycGxl | base64 -d)\"\n")
         os.chmod(slow, 0o755)
         r.say(f"Please run {slow} (it takes a little over a minute) and tell me the last line it prints.")
         r.settle(quiet=30, limit=420)

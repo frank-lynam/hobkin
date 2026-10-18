@@ -485,6 +485,8 @@ SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
 
 WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your report where the people are "
            "(your work system's chat or comments)? (2) any slips for your blooper reel? (3) more work to grab? "
+           "(4) does what you did match what you said? Check the files, names and claims in your report with ls "
+           "or read_file; if they don't match, fix whichever is wrong. "
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
 
 
