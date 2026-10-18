@@ -34,6 +34,7 @@ from __future__ import annotations
 __version__ = "0.1.1"
 
 import email.utils
+import base64
 import errno
 import difflib
 import fcntl
@@ -131,7 +132,8 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
                "context_tokens": (int, type(None)), "requests_per_minute": (int, float, type(None)), "headers": dict,
-               "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None))}
+               "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None)),
+               "thinking": (str, int, dict, type(None)), "effort": (str, type(None)), "extra_body": dict}
 
 
 DEFAULT_AGENTS_MD = """# How you are
@@ -395,6 +397,10 @@ TOOLS = [
     {"name": "reminders",
      "description": "List your reminders, or cancel one by id.",
      "input_schema": {"type": "object", "properties": {"cancel": {"type": "integer", "description": "Id of a reminder to cancel."}}}},
+    {"name": "view_image",
+     "description": ("Look at an image file (PNG, JPEG, GIF or WebP, up to 5 MB): a screenshot, a chart, a photo. "
+                     "To see a web page, take a screenshot of it first (e.g. with a headless browser)."),
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "skill",
      "description": "Open a skill by name: its instructions, its folder and its files. Open the skill before a task it covers.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
@@ -526,6 +532,13 @@ def span_text(seconds):
             out.append(f"{s // size}{unit}")
             s %= size
     return " ".join(out[:2]) or f"{s}s"
+
+
+def result_text(content) -> str:
+    """A tool result as text: results can be a list of blocks when they carry an image."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") if b.get("type") == "text" else f"[{b.get('type', 'block')}]" for b in content)
 
 
 def clip(text: str, head: int, tail: int) -> str:
@@ -903,6 +916,13 @@ class Model:
                     "tools": list(tools)}
             if tool_choice == "none":
                 body["tool_choice"] = {"type": "none"}
+            thinking = self.cfg.get("thinking")
+            if thinking is not None:          # "adaptive", a budget in tokens, or the API's own object
+                body["thinking"] = thinking if isinstance(thinking, dict) else \
+                    {"type": "enabled", "budget_tokens": thinking} if isinstance(thinking, int) else {"type": thinking}
+            if self.cfg.get("effort"):
+                body["output_config"] = {"effort": self.cfg["effort"]}
+            body = merged(body, self.cfg.get("extra_body") or {})
             r = self._post(f"{self.base}/v1/messages", body)
             if r.get("type") == "error":     # an error in a 200 body: overloaded is retried, like any non-fatal
                 kind = (r.get("error") or {}).get("type", "")
@@ -930,6 +950,12 @@ class Model:
             body["tool_choice"] = "none"
         if "openrouter.ai" in self.base:
             body["usage"] = {"include": True}        # OpenRouter then reports each call's cost
+        if self.cfg.get("effort"):                   # OpenRouter's name for it, else OpenAI's
+            if "openrouter.ai" in self.base:
+                body["reasoning"] = {"effort": self.cfg["effort"]}
+            else:
+                body["reasoning_effort"] = self.cfg["effort"]
+        body = merged(body, self.cfg.get("extra_body") or {})
         r = self._post(f"{self.base}/chat/completions", body)
         self.last_cost = (r.get("usage") or {}).get("cost")
         err = body_error(r)
@@ -976,11 +1002,19 @@ class Model:
                     msg["tool_calls"] = calls
                 out.append(msg)
             else:
+                images = []
                 for b in blocks:
                     if b["type"] == "tool_result":
-                        out.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": b["content"]})
+                        out.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": result_text(b["content"])})
+                        if not isinstance(b["content"], str):   # tool messages can't hold images: send them next
+                            images += [{"type": "image_url", "image_url": {
+                                "url": f"data:{x['source']['media_type']};base64,{x['source']['data']}"}}
+                                for x in b["content"] if x.get("type") == "image"]
                 text = "\n\n".join(b["text"] for b in blocks if b["type"] == "text")
-                if text:
+                if images:
+                    out.append({"role": "user", "content": [{"type": "text", "text": text or "The image you asked to see:"}]
+                                + images})
+                elif text:
                     out.append({"role": "user", "content": text})
         return out
 
@@ -1603,8 +1637,10 @@ class Agent:
         """A message from the operator as the model sees it: who sent it, and the hot-take hint."""
         return f"[message from {self.who}]\n{text}\n{HOT_TAKE}"
 
-    def tool_nudges(self, name: str, inp: dict, content: str, err: bool) -> str:
+    def tool_nudges(self, name: str, inp: dict, content, err: bool):
         """A tool's result, with any hint for what the agent just did added at the end."""
+        if not isinstance(content, str):            # an image result: nothing to add
+            return content
         if name == "bash" and talks_by_echo(str(inp.get("command", ""))):
             content += f"\n{SAY_IT}"                       # talking through echo
         if err and (name != "bash" or re.search(r"exit code 12[67]\b|command not found", content)):
@@ -1632,6 +1668,24 @@ class Agent:
         self.save_context()
         return True
 
+    def view_image(self, path: str) -> ToolResult:
+        full = self.resolve(path)
+        if not os.path.isfile(full):
+            return f"No such file: {full}", True
+        data = open(full, "rb").read()
+        kinds = {b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"GIF8": "image/gif"}
+        media = next((t for magic, t in kinds.items() if data.startswith(magic)), None)
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            media = "image/webp"
+        if not media:
+            return f"{full} isn't a PNG, JPEG, GIF or WebP image.", True
+        if len(data) > 5 * 1024 * 1024:
+            return (f"{full} is {len(data) // 1024} KB; images must be under 5 MB. Make a smaller copy first, e.g. "
+                    f"`convert {full} -resize 1600x1600 small.png` (ImageMagick), and look at that."), True
+        return [{"type": "text", "text": f"{full} ({len(data) // 1024} KB):"},
+                {"type": "image", "source": {"type": "base64", "media_type": media,
+                                             "data": base64.b64encode(data).decode()}}], False
+
     def run_tool(self, name: str, inp: dict) -> ToolResult:
         """(result text, is_error) for one tool call. Each tool is one line here; bash logs its
         own command and output, the rest log the first line of their result."""
@@ -1644,6 +1698,7 @@ class Agent:
             "remind": lambda: self.tool_remind(inp),
             "reminders": lambda: self.tool_reminders(inp),
             "skill": lambda: self.open_skill(s("name")),
+            "view_image": lambda: self.view_image(s("path")),
         }
         if name not in tools:
             return f"Unknown tool {name!r}. Tools: {', '.join(tools)}.", True
@@ -1654,7 +1709,7 @@ class Agent:
         except (OSError, ValueError, TypeError) as e:
             result = (f"{name} failed: {e}", True)
         if name != "bash":
-            self.log(name, result[0].splitlines()[0] if result[0] else "")
+            self.log(name, (result_text(result[0]).splitlines() or [""])[0])
         return result
 
     # --- the model: one call (with rate limits and retries)
@@ -1739,7 +1794,7 @@ class Agent:
         for m in history[:-2]:
             for b in m["content"]:
                 if b.get("type") == "tool_result":
-                    b["content"] = clip(b["content"], 700, 500)
+                    b["content"] = clip(result_text(b["content"]), 700, 500)
         if attempt < 1:
             return history
         start = max(1, len(history) // 3)
@@ -1783,12 +1838,15 @@ class Agent:
                 if b.get("type") == "text":
                     carry.append(b["text"])
                 elif b.get("type") == "tool_result":
-                    carry.append(f"[Result of your last command]\n{clip(b['content'], 2000, 1500)}")
+                    carry.append(f"[Result of your last command]\n{clip(result_text(b['content']), 2000, 1500)}")
         text = (f"[Your context was compacted. Your handoff note (written by you, so check it against the real "
                 f"thing before you trust it):]\n\n{note}\n\n") + (
             "\n\n".join(carry) if carry else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
-        os.replace(self.p("context.jsonl"), self.p(f"archive/context-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
+        archived = self.p(f"archive/context-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+        os.replace(self.p("context.jsonl"), archived)
+        text += (f"\n\n(Your whole earlier conversation is saved in {archived}, one message per line: grep it if "
+                 "you need a detail the note doesn't have.)")
         self.messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
         self.state["compactions"] = self.state.get("compactions", 0) + 1
         self.state["last_input_tokens"] = 0

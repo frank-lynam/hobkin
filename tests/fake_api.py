@@ -8,6 +8,10 @@ import os
 HICCUPS = {}
 RATE = {"until": 0.0, "mode": None, "count": 0, "seen": set()}
 LOG = open(os.environ.get("FAKE_API_LOG", "fake_api.log"), "a")
+def flat(content):
+    """A tool result or user content as text (lists hold text and image parts)."""
+    if isinstance(content, str): return content
+    return " ".join(b.get("text", "") if b.get("type") == "text" else "[" + b.get("type", "") + "]" for b in content)
 def last_text(blocks):
     return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
 def decide(last_user_texts, tool_results, summary):
@@ -80,7 +84,7 @@ class H(BaseHTTPRequestHandler):
             if size > CTX:
                 return self.send(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"prompt is too long: {size} tokens > {CTX} maximum"}})
             last = msgs[-1]["content"]
-            kind, val = decide(last_text(last), [b["content"] for b in last if b["type"] == "tool_result"], body.get("tool_choice", {}).get("type") == "none")
+            kind, val = decide(last_text(last), [flat(b["content"]) for b in last if b["type"] == "tool_result"], body.get("tool_choice", {}).get("type") == "none")
             content = [{"type": "text", "text": val}] if kind == "text" else [{"type": "text", "text": "Running it."}, {"type": "tool_use", "id": f"toolu_{len(msgs)}", "name": val[0], "input": val[1]}]
             return self.send(200, {"content": content, "stop_reason": "tool_use" if kind == "tool" else "end_turn", "usage": {"input_tokens": size}})
         if self.path == "/v1/chat/completions":
@@ -97,7 +101,7 @@ class H(BaseHTTPRequestHandler):
             for m in reversed(msgs):
                 if m["role"] == "assistant": break
                 tail.insert(0, m)
-            texts = "\n".join(m["content"] for m in tail if m["role"] == "user")
+            texts = "\n".join(flat(m["content"]) for m in tail if m["role"] == "user")
             kind, val = decide(texts, [m["content"] for m in tail if m["role"] == "tool"], body.get("tool_choice") == "none")
             msg = {"role": "assistant", "content": val} if kind == "text" else {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{len(msgs)}", "type": "function", "function": {"name": val[0], "arguments": json.dumps(val[1])}}]}
             return self.send(200, {"choices": [{"message": msg, "finish_reason": "tool_calls" if kind == "tool" else "stop"}], "usage": {"prompt_tokens": size}})

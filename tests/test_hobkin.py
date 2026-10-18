@@ -69,6 +69,13 @@ try:
         say(d, "run: cd .. && rmdir deeper")
         wait_for(d, "now in sub/ in your workspace")
         say(d, "run: cd $HOBKIN_WORK && echo back-home"); wait_for(d, "Done. Output was: back-home")
+        if api == "anthropic":   # images arrive inside the tool result
+            import base64 as _b64
+            open(d + "/work/dot.png", "wb").write(_b64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="))
+            say(d, 'call: view_image {"path": "dot.png"}'); wait_for(d, '"media_type": "image/png"', 10, file="context.jsonl")
+            res = last_results(d)["content"][0]["content"]
+            check("[image] anthropic: an image block inside the tool result", isinstance(res, list)
+                  and res[1]["type"] == "image" and res[1]["source"]["media_type"] == "image/png", str(res)[:200])
         # an error inside a 200 response (OpenRouter's 504, Anthropic's overloaded) is retried, not a pause
         say(d, "hiccup please"); wait_for(d, "echo: hiccup please", 20)
         check(f"[{api}] an upstream error in a 200 body is retried", "model busy (5" in open(d + "/out").read()
@@ -166,6 +173,7 @@ try:
         st = json.load(open(d + "/state.json"))
         check(f"[{api}] compacted", "compacted; note" in out and os.listdir(d + "/archive"), out[-800:])
         check(f"[{api}] context size known ({st.get('context_source')})", st.get("context_tokens") == 12000, st)
+        check(f"[{api}] handoff note points at the archive", "Your whole earlier conversation is saved in" in open(d + "/context.jsonl").read())
         check(f"[{api}] request survives compaction", f"seq 1 {last_n}" in open(d + "/context.jsonl").read() or str(last_n) in open(d + "/out").read().split("compacted; note")[-1])
         for _ in range(100):                                   # let the last turn finish first
             if json.load(open(d + "/state.json")).get("status") == "idle": break
@@ -255,6 +263,19 @@ try:
     call("edit_file", {"path": "$HOBKIN_MEMORY", "old_text": "nothing", "new_text": "x"}, "The file is empty")
     call("write_file", {"path": "$HOBKIN_MEMORY", "content": "Current task: test\n"}, "Replaced ")
     check("[files] $HOBKIN_MEMORY path works", open(d + "/MEMORY.md").read() == "Current task: test\n")
+    # images: an image result reaches an OpenAI-style API as a user message after the tool result
+    import base64 as _b64
+    png = _b64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==")
+    open(d + "/work/t/dot.png", "wb").write(png)
+    before = open(LOG).read().count('"image_url"')
+    call("view_image", {"path": "t/dot.png"}, "Done. Output was: ")
+    for _ in range(50):
+        if open(LOG).read().count('"image_url"') > before: break
+        time.sleep(0.1)
+    check("[image] openai-style: sent as image_url after the tool result", open(LOG).read().count('"image_url"') > before)
+    open(d + "/work/t/big.png", "wb").write(png + b"0" * (6 * 1024 * 1024))
+    call("view_image", {"path": "t/big.png"}, "images must be under 5 MB")
+    call("view_image", {"path": "t/a.txt"}, "isn't a PNG, JPEG, GIF or WebP")
     call("write_file", {"path": "$HOBKIN_BLOOPERS", "content": "- Tripped over my own heredoc. Lesson: use write_file!\n"}, "BLOOPERS.md (1 lines)")
     say(d, "hi"); wait_for(d, "echo: hi")
     check("[bloopers] the reel is in the prompt", "Tripped over my own heredoc" in ctx(d)[0]["content"])
@@ -371,6 +392,20 @@ try:
                        capture_output=True, text=True, timeout=30)
     check("[who] chat doesn't echo your own (named) messages", "echo: via chat" in r.stdout and "frank> via chat" not in r.stdout, r.stdout)
     p.send_signal(signal.SIGTERM); p.wait(10)
+    # thinking, effort and extra_body reach the request, in each API's own shape
+    for api, port, path_ in (("anthropic", 48701, "/v1/messages"), ("openai", 48702, "/chat/completions")):
+        base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
+        h = home("think-" + api, {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY",
+                                   "thinking": "adaptive", "effort": "high", "extra_body": {"metadata": {"user_id": "t"}}})
+        p, aid, d = start(h)
+        say(d, "think about it"); wait_for(d, "echo: think about it")
+        sent = [json.loads(l) for l in open(LOG) if path_ in l and "think about it" in l][-1]["body"]
+        want = ({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}} if api == "anthropic"
+                else {"reasoning_effort": "high"})
+        check(f"[{api}] thinking/effort/extra_body in the request", all(sent.get(k) == v for k, v in want.items())
+              and sent.get("metadata") == {"user_id": "t"}, {k: sent.get(k) for k in ("thinking", "output_config", "reasoning_effort", "metadata")})
+        p.send_signal(signal.SIGTERM); p.wait(10)
+
     # config: typos and wrong types are warned about, and the agent still starts
     h = home("warn", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
                       "requests_per_minut": 5}, {"idel_seconds": 3, "compact_at": "0.8"})
