@@ -138,6 +138,7 @@ operator]". A line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
+| `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
 | `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |
 
 `hobkin chat ID` puts both in one terminal (see Quick start). `hobkin list` shows all agents, their status and their last line of output.
@@ -218,6 +219,9 @@ are; if it's left out and there's only one model, that one is used.
 given; leave it out (or `null`) and it's detected. If the API doesn't say,
 set it. Failing that, hobkin
 learns the limit from the first "context too long" error and remembers it.
+Windows can change (a local server restarted with a different size): the API is
+asked again before each compaction, after a "too long" error that doesn't say the
+limit, and on `/limits`.
 `state.json` records where the number came from.
 
 When the conversation passes `compact_at` (80%) of the window, the agent writes

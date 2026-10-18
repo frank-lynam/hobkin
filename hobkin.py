@@ -507,7 +507,7 @@ shopt -s expand_aliases
 """
 
 
-COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart")
+COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
@@ -1272,6 +1272,7 @@ class Agent:
         self.job_procs = {}                # background jobs started by this process
         self.budget_paused = False
         self.restart_requested = False
+        self.limits_requested = False
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1373,6 +1374,27 @@ class Agent:
             if out:
                 self.state["api_max_output"] = int(out)
 
+    def refresh_limits(self, why: str) -> None:
+        """Ask the API for the limits again: windows can change (a local server restarted with another
+        size, a provider's update). A number from config stays; so does the old one if the API won't say."""
+        old = self.state.get("context_tokens")
+        if self.state.get("context_source") == "config":
+            self.log("hobkin", f"limits ({why}): context {old} is set in config, so it stays")
+            return
+        ctx, out, src = self.model.query_limits()
+        if out:
+            self.state["api_max_output"] = int(out)
+        if ctx and why != "/limits" and self.state.get("context_source") == "learned from an error" and int(ctx) >= (old or 0):
+            ctx = None          # the API overstated it before: the error's number stands until /limits
+        if ctx:
+            self.state["context_tokens"], self.state["context_source"] = int(ctx), src
+        if ctx and int(ctx) != old:
+            self.log("hobkin", f"limits ({why}): context window now {ctx} (was {old or 'unknown'}; {src})")
+        elif why == "/limits":
+            self.log("hobkin", f"limits ({why}): context {old or 'unknown'} "
+                     + (f"(unchanged; {src})" if ctx else f"(the API doesn't say; {self.state.get('context_source') or 'none'})"))
+        self.save_state()
+
     def max_output(self):
         want = int(self.model.cfg.get("max_output_tokens") or self.cfg.get("max_output_tokens") or 16000)
         api = self.state.get("api_max_output")
@@ -1470,7 +1492,7 @@ class Agent:
     def poll_input(self, timeout):
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
-        before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested)
+        before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested)
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -1494,7 +1516,7 @@ class Agent:
                 self._take(self.fifo_buf.decode(errors="replace"))
                 self.fifo_buf = b""
             self._drain_queue()
-            if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested) != before:
+            if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested) != before:
                 return
 
     def _drain_queue(self):
@@ -1535,6 +1557,8 @@ class Agent:
             self.save_state("working" if self.working else "idle")
         elif cmd == "/compact":
             self.compact_requested = True   # done between steps, never mid-command
+        elif cmd == "/limits":
+            self.limits_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/restart":
             self.restart_requested = True   # once the current step is done: same process, fresh code
         elif cmd == "/interrupt":
@@ -2368,7 +2392,9 @@ class Agent:
             self.compact_requested = False
             self.compact("requested")
         elif self.needs_compaction():
-            self.compact("context nearly full")
+            self.refresh_limits("context nearly full")     # it may have grown
+            if self.needs_compaction():
+                self.compact("context nearly full")
         try:
             blocks, stop_reason = self.ask(self.messages)
         except ApiError as e:
@@ -2378,6 +2404,8 @@ class Agent:
                 limit = context_limit_from_error(e.text)
                 if limit:
                     self.state.update({"context_tokens": limit, "context_source": "learned from an error"})
+                else:
+                    self.refresh_limits("model said the context is too long")     # it may have shrunk
                 self.compact("model said the context is too long")
                 return
             hint = (f"\nThe API refused the key for model {self.model.describe()}: "
@@ -2506,6 +2534,9 @@ class Agent:
                     if self.error and len(self.pending) > waiting:
                         self.paused = self.error = False      # a message after an error: try again
                     continue
+                if self.limits_requested:
+                    self.limits_requested = False
+                    self.refresh_limits("/limits")
                 if self.compact_requested and not self.working:
                     self.compact_requested = False
                     self.compact("requested")

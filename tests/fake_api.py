@@ -31,6 +31,8 @@ class H(BaseHTTPRequestHandler):
         for k, v in (headers or {}).items(): self.send_header(k, v)
         self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if self.path.startswith("/set_ctx/"):          # the window changes (a server restarted)
+            global CTX; CTX = int(self.path.split("/")[-1]); return self.send(200, {"ctx": CTX})
         if self.path == "/stats":
             return self.send(200, {"rate_429s": RATE["count"]})
         if self.path.startswith("/v1/models/"):

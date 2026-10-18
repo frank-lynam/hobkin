@@ -2,7 +2,7 @@
 
     python3 tests/test_hobkin.py
 """
-import json, os, re, select, subprocess, sys, time, shutil, signal, tempfile
+import json, os, re, select, urllib.request, subprocess, sys, time, shutil, signal, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOB = os.path.join(HERE, "..", "hobkin.py")
 BASE = tempfile.mkdtemp(prefix="hobkin-test-")
@@ -642,6 +642,17 @@ try:
         if "paused" in open(os.path.join(BASE, "alerts.txt")).read(): break
         time.sleep(0.1)
     check("[alert] no fallback left: the pause is announced", "hobkin lonely paused: model" in open(os.path.join(BASE, "alerts.txt")).read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # /limits: the context window asked for again on demand
+    mock(48705, 100000)
+    h = home("limits", {"api": "anthropic", "base_url": "http://127.0.0.1:48705", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    p, aid, d = start(h)
+    say(d, "/limits"); wait_for(d, "limits (/limits): context 100000 (unchanged")
+    urllib.request.urlopen("http://127.0.0.1:48705/set_ctx/60000").read()
+    say(d, "/limits"); wait_for(d, "context window now 60000 (was 100000")
+    check("[limits] /limits picks up a changed window", json.load(open(d + "/state.json"))["context_tokens"] == 60000)
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
