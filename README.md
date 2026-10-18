@@ -447,6 +447,34 @@ Releases go to PyPI from GitHub Actions with Trusted Publishing (no token stored
 Running the workflow by hand (Actions → Publish → Run workflow) uploads to
 TestPyPI instead, for a dry run.
 
+## Measuring behaviour
+
+The tests check that hobkin works; `tests/eval_hobkin.py` checks how well an agent
+behaves on it, so changes to AGENTS.md or the nudges can be measured, not
+eyeballed. It runs a real model (it costs calls; free models are fine) through
+six scenarios with a tiny work system (a queue, a team chat, a skill) and scores
+what it does:
+
+| Scenario | What it checks |
+|---|---|
+| `queue` | does the job, ticks it off, reports in the team chat |
+| `badidea` | rates your bad idea, pushes back, keeps sane filenames |
+| `memory` | does work its stale memory says isn't there, and fixes that memory |
+| `hello` | answers a hello, with no rating, no busywork, no talking through echo |
+| `reading` | finds an answer far beyond the first page of a file |
+| `slow` | doesn't block on a command longer than the timeout |
+
+Most scenarios also check that it didn't ask what to do and kept its workspace
+tidy.
+
+```sh
+python3 tests/eval_hobkin.py --model nvidia/nemotron-3.5-super-vl:free \
+    --key-file ~/openrouter.key --runs 3            # --only queue,hello for some
+```
+
+It prints a line per run and a score per check across runs (e.g. `queue 2/3
+reported in the team chat`). Run it before and after a change.
+
 ## Tests
 
 ```sh
