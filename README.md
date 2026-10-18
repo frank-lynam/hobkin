@@ -271,22 +271,20 @@ default; the agent can ask for any longer timeout on a command),
 
 ### The web
 
-Normal sites need no setup. For an internal wiki behind client certificates
-(PEM files), list them in config by host:
+Normal sites need no setup. For an internal wiki behind a client certificate
+(PEM files), set it in config:
 
 ```json
 "web": {
-  "client_certs": [
-    {"hosts": ["wiki.corp.example", "*.sso.corp.example"],
-     "cert": "~/certs/me.pem", "key": "~/certs/me.key",
-     "ca": "~/certs/corp-ca.pem", "password_file": "~/certs/key-password"}
-  ]
+  "client_cert": {"cert": "~/certs/me.pem", "key": "~/certs/me.key",
+                  "ca": "~/certs/corp-ca.pem", "password_file": "~/certs/key-password"}
 }
 ```
 
-- **Every hop** picks its certificate by host, so one that redirects through an
-  SSO server works when that server is listed too. `ca` and `password_file` are
-  optional.
+- **One certificate for everything:** it's offered to any site that asks for
+  one, including SSO servers along a redirect chain. Most public sites never ask.
+  `ca` (your internal CA, trusted alongside the usual ones) and `password_file`
+  are optional.
 - **SSO logins** that need no typing are followed: redirects, meta refreshes,
   and the auto-submitting forms that SAML and OpenID logins use (up to 8 steps).
   Cookies are kept in the agent's `cookies.txt`, so the next page skips the login.

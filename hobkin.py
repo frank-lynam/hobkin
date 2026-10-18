@@ -38,7 +38,6 @@ import base64
 import errno
 import difflib
 import fcntl
-import fnmatch
 import html
 import html.parser
 import http.client
@@ -69,7 +68,7 @@ import urllib.request
 #   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
 #   helpers       time and text helpers, files
 #   config        config.json, warnings, secrets, skills, the shared folder, the lock
-#   web           pages as text, client certificates per host, SSO, search (for fetch_url, web_search)
+#   web           pages as text, client certificates, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
 #   agent         the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
 #   service       systemd user services
@@ -131,11 +130,11 @@ DEFAULT_CONFIG = {
     "announce_delay": 120,
     # Pause for the day once this much is spent (where the API reports cost, e.g. OpenRouter)
     "daily_budget_usd": None,
-    # fetch_url and web_search. client_certs: x509 for internal sites, chosen per host (fnmatch
-    # patterns) at every hop, so an SSO login server in a redirect chain gets them too.
+    # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
+    # for one (so an SSO login server in a redirect chain gets it too):
+    # {"cert": "~/.certs/me.pem", "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem", "password_file": ...}
     "web": {
-        "client_certs": [],   # [{"hosts": ["*.corp.example.com"], "cert": "~/.certs/me.pem",
-                              #   "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem"}]
+        "client_cert": None,
         "search_url": "https://html.duckduckgo.com/html/",
     },
     "idle_prompt": ("You're idle. Unacceptable! Grab work from your work sources (your skills say where), "
@@ -764,7 +763,7 @@ def is_running(agent_dir):
         os.close(fd)
 
 
-# ---- web: pages as text, client certificates per host, SSO, search (for fetch_url, web_search)
+# ---- web: pages as text, client certificates, SSO, search (for fetch_url, web_search)
 
 WEB_AGENT = "Mozilla/5.0 (X11; Linux x86_64) hobkin/0.1"
 WEB_MAX = 10 * 1024 * 1024
@@ -869,31 +868,16 @@ class PageText(html.parser.HTMLParser):
         return ("get", self.refresh, None) if self.refresh else None
 
 
-class CertHTTPSHandler(urllib.request.HTTPSHandler):
-    """HTTPS with a client certificate chosen per host, at every hop (redirects included)."""
-
-    def __init__(self, entries):
-        super().__init__()
-        self.entries, self.plain = entries, ssl.create_default_context()
-
-    def https_open(self, req):
-        host = req.host.rsplit(":", 1)[0] if req.host.count(":") == 1 else req.host
-        ctx = next((c for pats, c in self.entries if any(fnmatch.fnmatch(host, p_) for p_ in pats)), self.plain)
-        return self.do_open(http.client.HTTPSConnection, req, context=ctx)
-
-
-def cert_contexts(entries):
-    """[(host patterns, SSL context with the client certificate)] from config web.client_certs."""
-    out = []
-    for e in entries or []:
-        ctx = ssl.create_default_context()
-        if e.get("ca"):
-            ctx.load_verify_locations(os.path.expanduser(e["ca"]))     # the internal CA, as well as the usual ones
-        password = read(os.path.expanduser(e["password_file"])).strip() if e.get("password_file") else None
-        ctx.load_cert_chain(os.path.expanduser(e["cert"]), os.path.expanduser(e["key"]) if e.get("key") else None,
-                            password=password)
-        out.append((e.get("hosts") or [], ctx))
-    return out
+def tls_context(cert):
+    """The SSL context for every HTTPS request: the usual CAs, plus config web.client_cert if set."""
+    ctx = ssl.create_default_context()
+    if cert:
+        x = lambda k: os.path.expanduser(cert[k]) if cert.get(k) else None
+        if cert.get("ca"):
+            ctx.load_verify_locations(x("ca"))         # the internal CA, as well as the usual ones
+        password = read(x("password_file")).strip() if cert.get("password_file") else None
+        ctx.load_cert_chain(x("cert"), x("key"), password=password)
+    return ctx
 
 
 def search_results(page, base):
@@ -1985,7 +1969,7 @@ class Agent:
 
     # --- the web: fetch_url and web_search
     def web_opener(self):
-        """One opener per agent: client certificates per host, and a cookie jar kept on disk so an SSO
+        """One opener per agent: the client certificate, and a cookie jar kept on disk so an SSO
         login carries over from one fetch to the next."""
         if getattr(self, "_opener", None) is None:
             self.cookies = http.cookiejar.MozillaCookieJar(self.p("cookies.txt"))
@@ -1995,7 +1979,7 @@ class Agent:
                 except (OSError, http.cookiejar.LoadError):
                     pass
             web = self.cfg.get("web") or {}
-            self._opener = urllib.request.build_opener(CertHTTPSHandler(cert_contexts(web.get("client_certs"))),
+            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=tls_context(web.get("client_cert"))),
                                                        urllib.request.HTTPCookieProcessor(self.cookies))
         return self._opener
 

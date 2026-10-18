@@ -18,8 +18,8 @@
 - **Never put secrets in context:** model keys are removed from the agent's shell
   environment, and `secrets.env` values only ever reach it as environment variables.
 - **The web is stdlib too:** `fetch_url` turns HTML into text with `html.parser`
-  (`PageText`) and follows SSO steps that need no typing; client certificates are
-  chosen per host at every hop (`CertHTTPSHandler`). Anything needing JavaScript or
+  (`PageText`) and follows SSO steps that need no typing; one client certificate
+  (`tls_context`) is offered to any site that asks. Anything needing JavaScript or
   a site-specific login belongs in a skill, not hobkin.py.
 - **Tests:** `python3 tests/test_hobkin.py` (real processes against
   `tests/fake_api.py`; no key, no cost). Add a check for every behaviour you change.

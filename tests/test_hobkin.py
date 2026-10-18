@@ -544,9 +544,9 @@ try:
     time.sleep(0.8)
     W = "http://127.0.0.1:48790"
     h = home("web", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
-             {"idle_prompt": None, "web": {"search_url": W + "/ddg", "client_certs": [
-                 {"hosts": ["127.0.0.1"], "cert": os.path.join(certs, "client.pem"), "key": os.path.join(certs, "client.key"),
-                  "ca": os.path.join(certs, "ca.pem")}]}})
+             {"idle_prompt": None, "web": {"search_url": W + "/ddg", "client_cert":
+                 {"cert": os.path.join(certs, "client.pem"), "key": os.path.join(certs, "client.key"),
+                  "ca": os.path.join(certs, "ca.pem")}}})
     p, aid, d = start(h)
     def tool(name, args, marker):                          # waits for a *new* occurrence of the marker
         seen = open(d + "/context.jsonl").read().count(marker)
@@ -570,7 +570,7 @@ try:
     check("[web] SSO: redirect, auto-submitted login form, cookie, back to the page", "# Secret" in page, page)
     check("[web] the SSO cookie is kept for next time", "session" in open(d + "/cookies.txt").read())
     page = tool("fetch_url", {"url": "https://127.0.0.1:48791/secret"}, "read with the certificate of")
-    check("[web] client certificate for a matching host", "certificate of hobkin-client" in page, page)
+    check("[web] the client certificate, offered where asked", "certificate of hobkin-client" in page, page)
     res = tool("web_search", {"query": "python html parser"}, "html.parser")
     check("[web] search: titles, real URLs (not DuckDuckGo redirects), snippets; ads skipped",
           "1. html.parser — Simple HTML and XHTML parser\n   https://docs.python.org/3/library/html.parser.html" in res
