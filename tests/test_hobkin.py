@@ -530,6 +530,61 @@ try:
     check("[budget] a notice turn, then paused for the day", json.load(open(d + "/state.json")).get("status") == "paused (budget)")
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # the web: pages as text, paging, JSON, downloads, meta refresh, SSO with cookies, search, client certificates
+    certs = os.path.join(BASE, "certs"); os.makedirs(certs)
+    def ossl(*a):
+        subprocess.run(["openssl", *a], cwd=certs, check=True, capture_output=True)
+    ossl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=Test CA")
+    open(os.path.join(certs, "san.cnf"), "w").write("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
+    for who, extra in (("server", ["-extfile", "san.cnf"]), ("client", [])):
+        ossl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{who}.key", "-out", f"{who}.csr", "-subj", f"/CN=hobkin-{who}")
+        ossl("x509", "-req", "-in", f"{who}.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+             "-out", f"{who}.pem", "-days", "2", *extra)
+    web = subprocess.Popen([sys.executable, os.path.join(HERE, "fake_web.py"), "48790", "48791", certs]); procs.append(web)
+    time.sleep(0.8)
+    W = "http://127.0.0.1:48790"
+    h = home("web", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "web": {"search_url": W + "/ddg", "client_certs": [
+                 {"hosts": ["127.0.0.1"], "cert": os.path.join(certs, "client.pem"), "key": os.path.join(certs, "client.key"),
+                  "ca": os.path.join(certs, "ca.pem")}]}})
+    p, aid, d = start(h)
+    def tool(name, args, marker):                          # waits for a *new* occurrence of the marker
+        seen = open(d + "/context.jsonl").read().count(marker)
+        say(d, f"call: {name} " + json.dumps(args))
+        for _ in range(150):
+            if open(d + "/context.jsonl").read().count(marker) > seen: return last_results(d)["content"][0]["content"]
+            time.sleep(0.1)
+        raise AssertionError(f"no new {marker!r}: " + open(d + "/out").read()[-600:])
+    page = tool("fetch_url", {"url": W + "/page"}, "Team Wiki: Deploys")
+    check("[web] a page as text: title, links numbered, scripts gone", "# Deploys" in page and "the runbook [2]" in page
+          and "[2] http://127.0.0.1:48790/runbook" in page and "alert" not in page and "- check the dashboard" in page, page)
+    page = tool("fetch_url", {"url": W + "/long", "offset": 401, "limit": 100}, "lines 401-500 of 1000")
+    check("[web] long pages come in parts", "line 401" in page and "500 more lines (offset=501)" in page, page[-200:])
+    page = tool("fetch_url", {"url": W + "/data.json"}, '\\"team\\": \\"blue\\"')
+    check("[web] JSON pretty-printed", '"deploys": [' in page, page)
+    tool("fetch_url", {"url": W + "/img.png", "save_as": "dl/dot.png"}, "Saved http://127.0.0.1:48790/img.png")
+    check("[web] save_as downloads the file", open(d + "/work/dl/dot.png", "rb").read().startswith(b"\x89PNG"))
+    page = tool("fetch_url", {"url": W + "/refresh"}, "Team Wiki: Deploys")
+    check("[web] meta refresh followed", "make deploy" in page)
+    page = tool("fetch_url", {"url": W + "/wiki/secret"}, "deploy password is in the vault")
+    check("[web] SSO: redirect, auto-submitted login form, cookie, back to the page", "# Secret" in page, page)
+    check("[web] the SSO cookie is kept for next time", "session" in open(d + "/cookies.txt").read())
+    page = tool("fetch_url", {"url": "https://127.0.0.1:48791/secret"}, "read with the certificate of")
+    check("[web] client certificate for a matching host", "certificate of hobkin-client" in page, page)
+    res = tool("web_search", {"query": "python html parser"}, "html.parser")
+    check("[web] search: titles, real URLs (not DuckDuckGo redirects), snippets; ads skipped",
+          "1. html.parser — Simple HTML and XHTML parser\n   https://docs.python.org/3/library/html.parser.html" in res
+          and "2. Parsing HTML in Python\n   https://example.org/parsing" in res and "Buy parsers" not in res, res)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    h = home("web2", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "web": {"search_url": W + "/ddg-blocked"}})
+    p, aid, d = start(h)
+    res = tool("web_search", {"query": "anything"}, "asking for a human check")
+    check("[web] DuckDuckGo's bot check is reported plainly", True)
+    res = tool("fetch_url", {"url": "https://127.0.0.1:48791/secret"}, "Couldn't fetch")
+    check("[web] no certificate configured: the internal host refuses", True)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"heartbeat_seconds": 1, "idle_prompt": None})

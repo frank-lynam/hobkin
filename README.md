@@ -262,6 +262,43 @@ default; the agent can ask for any longer timeout on a command),
   screenshot of the UI it built, a chart, a photo. On OpenAI-style APIs the image
   follows the tool result as a user message, because tool messages can't hold
   images.
+- **`fetch_url`** reads a web page as text: headings, lists and tables kept,
+  scripts and menus' styling dropped, links numbered with a list at the end. Long
+  pages come in parts (`offset`, `limit`), JSON is pretty-printed, and
+  `save_as` downloads anything else (a PDF, an image) into the workspace.
+- **`web_search`** searches DuckDuckGo and returns the top ten results: title,
+  URL, snippet.
+
+### The web
+
+Normal sites need no setup. For an internal wiki behind client certificates
+(PEM files), list them in config by host:
+
+```json
+"web": {
+  "client_certs": [
+    {"hosts": ["wiki.corp.example", "*.sso.corp.example"],
+     "cert": "~/certs/me.pem", "key": "~/certs/me.key",
+     "ca": "~/certs/corp-ca.pem", "password_file": "~/certs/key-password"}
+  ]
+}
+```
+
+- **Every hop** picks its certificate by host, so one that redirects through an
+  SSO server works when that server is listed too. `ca` and `password_file` are
+  optional.
+- **SSO logins** that need no typing are followed: redirects, meta refreshes,
+  and the auto-submitting forms that SAML and OpenID logins use (up to 8 steps).
+  Cookies are kept in the agent's `cookies.txt`, so the next page skips the login.
+  A login that wants a password shows up as the login page's text.
+- **Pages built by JavaScript** come back nearly empty. Give the agent a skill
+  for those (an API, or a headless browser).
+- **Search** uses DuckDuckGo's HTML page (`web.search_url`, no key). DuckDuckGo
+  sometimes answers servers and VPNs with a "bots use DuckDuckGo too" check
+  instead of results; the agent is told so, and searching from a home connection
+  usually works. To check a machine:
+  `curl -s -A Mozilla/5.0 -d q=test https://html.duckduckgo.com/html/ | grep -c result__a`
+  (a number above 0 means results).
 
 ### Background jobs
 

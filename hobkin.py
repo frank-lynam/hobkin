@@ -38,6 +38,11 @@ import base64
 import errno
 import difflib
 import fcntl
+import fnmatch
+import html
+import html.parser
+import http.client
+import http.cookiejar
 import hashlib
 import json
 import os
@@ -46,6 +51,7 @@ import secrets
 import select
 import shlex
 import shutil
+import ssl
 import signal
 import subprocess
 import sys
@@ -53,6 +59,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 from datetime import date, datetime, timedelta
 import urllib.request
 
@@ -62,6 +69,7 @@ import urllib.request
 #   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
 #   helpers       time and text helpers, files
 #   config        config.json, warnings, secrets, skills, the shared folder, the lock
+#   web           pages as text, client certificates per host, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
 #   agent         the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
 #   service       systemd user services
@@ -123,6 +131,13 @@ DEFAULT_CONFIG = {
     "announce_delay": 120,
     # Pause for the day once this much is spent (where the API reports cost, e.g. OpenRouter)
     "daily_budget_usd": None,
+    # fetch_url and web_search. client_certs: x509 for internal sites, chosen per host (fnmatch
+    # patterns) at every hop, so an SSO login server in a redirect chain gets them too.
+    "web": {
+        "client_certs": [],   # [{"hosts": ["*.corp.example.com"], "cert": "~/.certs/me.pem",
+                              #   "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem"}]
+        "search_url": "https://html.duckduckgo.com/html/",
+    },
     "idle_prompt": ("You're idle. Unacceptable! Grab work from your work sources (your skills say where), "
                     "or hunt for something useful to do."),
     "idle_seconds": 60,
@@ -143,7 +158,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
-                "daily_budget_usd": (int, float, type(None))}
+                "daily_budget_usd": (int, float, type(None)), "web": dict}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -429,6 +444,20 @@ TOOLS = [
     {"name": "reminders",
      "description": "List your reminders, or cancel one by id.",
      "input_schema": {"type": "object", "properties": {"cancel": {"type": "integer", "description": "Id of a reminder to cancel."}}}},
+    {"name": "fetch_url",
+     "description": ("Read a web page as text, with its links numbered so you can follow them (or a JSON / plain "
+                     "text URL). Long pages come in parts: use offset for more. Internal sites that need a client "
+                     "certificate or an SSO login work when they're set up in config. save_as downloads the file "
+                     "instead (a PDF, an image: then view_image it)."),
+     "input_schema": {"type": "object", "properties": {
+         "url": {"type": "string"},
+         "offset": {"type": "integer", "description": "First line to show (1 = the start)."},
+         "limit": {"type": "integer", "description": "How many lines to show (default 400)."},
+         "save_as": {"type": "string", "description": "Save the raw file at this path instead of showing it."}},
+         "required": ["url"]}},
+    {"name": "web_search",
+     "description": "Search the web. You get titles, links and snippets: read the useful ones with fetch_url.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "view_image",
      "description": ("Look at an image file (PNG, JPEG, GIF or WebP, up to 5 MB): a screenshot, a chart, a photo. "
                      "To see a web page, take a screenshot of it first (e.g. with a headless browser)."),
@@ -733,6 +762,158 @@ def is_running(agent_dir):
         return True
     finally:
         os.close(fd)
+
+
+# ---- web: pages as text, client certificates per host, SSO, search (for fetch_url, web_search)
+
+WEB_AGENT = "Mozilla/5.0 (X11; Linux x86_64) hobkin/0.1"
+WEB_MAX = 10 * 1024 * 1024
+
+
+class PageText(html.parser.HTMLParser):
+    """HTML as readable text: headings, lists, tables and paragraphs kept, links numbered [n] with a
+    list at the end; scripts, styles and the like dropped. Also notes forms and meta refreshes,
+    which SSO logins use to move the browser along."""
+    SKIP = {"script", "style", "noscript", "svg", "template", "iframe", "canvas"}
+    BLOCK = {"p", "div", "section", "article", "header", "footer", "main", "nav", "aside", "ul", "ol", "table",
+             "tr", "blockquote", "pre", "dl", "dt", "dd", "hr", "form", "fieldset", "figure", "figcaption", "h1",
+             "h2", "h3", "h4", "h5", "h6", "li", "br", "body"}
+
+    def __init__(self, base):
+        super().__init__(convert_charrefs=True)
+        self.base, self.out, self.links, self.skip, self.pre = base, [], [], 0, 0
+        self.title, self.in_title, self.href = "", False, None
+        self.forms, self.form, self.refresh, self.onload_submit = [], None, None, False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in self.SKIP:
+            self.skip += 1
+        if tag == "title":
+            self.in_title = True
+        if tag == "body" and "submit()" in (a.get("onload") or ""):
+            self.onload_submit = True
+        if tag == "meta" and (a.get("http-equiv") or "").lower() == "refresh":
+            m = re.search(r"url\s*=\s*['\"]?([^'\"]+)", a.get("content") or "", re.I)
+            if m:
+                self.refresh = urllib.parse.urljoin(self.base, m.group(1).strip())
+        if tag == "form":
+            self.form = {"action": urllib.parse.urljoin(self.base, a.get("action") or self.base),
+                         "method": (a.get("method") or "get").lower(), "fields": [], "visible": 0}
+            self.forms.append(self.form)
+        if tag in ("input", "button", "select", "textarea") and self.form is not None:
+            kind = (a.get("type") or ("submit" if tag == "button" else "text")).lower()
+            if kind == "hidden" and a.get("name"):
+                self.form["fields"].append((a["name"], a.get("value") or ""))
+            elif kind not in ("submit", "button", "image", "hidden"):
+                self.form["visible"] += 1        # something a person would fill in: not an auto-submit
+        if self.skip:
+            return
+        if tag in self.BLOCK:
+            self.out.append("\n")
+        if re.fullmatch(r"h[1-6]", tag):
+            self.out.append("#" * int(tag[1]) + " ")
+        elif tag == "li":
+            self.out.append("- ")
+        elif tag in ("td", "th"):
+            self.out.append(" | ")
+        elif tag == "pre":
+            self.pre += 1
+        elif tag == "img" and a.get("alt"):
+            self.out.append(f"[image: {a['alt']}]")
+        elif tag == "a" and a.get("href") and not a["href"].startswith(("javascript:", "#")):
+            self.href = urllib.parse.urljoin(self.base, a["href"])
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self.skip:
+            self.skip -= 1
+        if tag == "title":
+            self.in_title = False
+        if tag == "form":
+            self.form = None
+        if self.skip:
+            return
+        if tag == "pre" and self.pre:
+            self.pre -= 1
+        if tag == "a" and self.href:
+            if self.href not in self.links:
+                self.links.append(self.href)
+            self.out.append(f" [{self.links.index(self.href) + 1}]")
+            self.href = None
+        if tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+        elif not self.skip:
+            # code keeps its layout, marked with four spaces like a markdown code block
+            self.out.append("\n".join("    " + l for l in data.split("\n")) if self.pre else re.sub(r"\s+", " ", data))
+
+    def text(self):
+        lines = [l.strip() if not l.startswith("    ") else l.rstrip() for l in "".join(self.out).split("\n")]
+        body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+        body = re.sub(r"\n\n(?=- |\| )", "\n", body)        # list items and table rows stay together
+        head = f"# {self.title.strip()}\n\n" if self.title.strip() else ""
+        tail = ("\n\nLinks:\n" + "\n".join(f"[{i}] {u}" for i, u in enumerate(self.links, 1))) if self.links else ""
+        return head + body + tail
+
+    def sso_step(self):
+        """The next request an SSO login page wants from a browser: an auto-submitting form of hidden
+        fields (SAML and friends), or a meta refresh. (method, url, data) or None."""
+        for f in self.forms:
+            names = {n.lower() for n, _ in f["fields"]}
+            looks_like_sso = names & {"samlresponse", "samlrequest", "relaystate", "wresult", "wa", "code", "state"}
+            if f["fields"] and not f["visible"] and (self.onload_submit or looks_like_sso):
+                return f["method"], f["action"], urllib.parse.urlencode(f["fields"]).encode()
+        return ("get", self.refresh, None) if self.refresh else None
+
+
+class CertHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS with a client certificate chosen per host, at every hop (redirects included)."""
+
+    def __init__(self, entries):
+        super().__init__()
+        self.entries, self.plain = entries, ssl.create_default_context()
+
+    def https_open(self, req):
+        host = req.host.rsplit(":", 1)[0] if req.host.count(":") == 1 else req.host
+        ctx = next((c for pats, c in self.entries if any(fnmatch.fnmatch(host, p_) for p_ in pats)), self.plain)
+        return self.do_open(http.client.HTTPSConnection, req, context=ctx)
+
+
+def cert_contexts(entries):
+    """[(host patterns, SSL context with the client certificate)] from config web.client_certs."""
+    out = []
+    for e in entries or []:
+        ctx = ssl.create_default_context()
+        if e.get("ca"):
+            ctx.load_verify_locations(os.path.expanduser(e["ca"]))     # the internal CA, as well as the usual ones
+        password = read(os.path.expanduser(e["password_file"])).strip() if e.get("password_file") else None
+        ctx.load_cert_chain(os.path.expanduser(e["cert"]), os.path.expanduser(e["key"]) if e.get("key") else None,
+                            password=password)
+        out.append((e.get("hosts") or [], ctx))
+    return out
+
+
+def search_results(page, base):
+    """DuckDuckGo's HTML (or lite) results page as (title, url, snippet) tuples."""
+    out = []
+    for m in re.finditer(r'<a[^>]*class=["\'][^"\']*result(?:__a|-link)[^"\']*["\'][^>]*>(.*?)</a>(.*?)'
+                         r'(?=<a[^>]*class=["\'][^"\']*result(?:__a|-link)|$)', page, re.S):
+        tag = m.group(0)[:m.group(0).index(">") + 1]
+        href = re.search(r'href=["\']([^"\']+)', tag)
+        if not href:
+            continue
+        url = html.unescape(href.group(1))
+        target = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("uddg")   # DuckDuckGo's redirect
+        url = target[0] if target else urllib.parse.urljoin(base, url)
+        if "duckduckgo.com/y.js" in url:                                              # an ad
+            continue
+        snip = re.search(r'class=["\'][^"\']*result(?:__snippet|-snippet)[^"\']*["\'][^>]*>(.*?)</(?:a|td|div)>', m.group(2), re.S)
+        clean = lambda t: re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", t))).strip()
+        out.append((clean(m.group(1)), url, clean(snip.group(1)) if snip else ""))
+    return out
 
 
 # ---- model api: HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
@@ -1802,6 +1983,111 @@ class Agent:
         self.save_context()
         return True
 
+    # --- the web: fetch_url and web_search
+    def web_opener(self):
+        """One opener per agent: client certificates per host, and a cookie jar kept on disk so an SSO
+        login carries over from one fetch to the next."""
+        if getattr(self, "_opener", None) is None:
+            self.cookies = http.cookiejar.MozillaCookieJar(self.p("cookies.txt"))
+            if os.path.exists(self.p("cookies.txt")):
+                try:
+                    self.cookies.load(ignore_discard=True)
+                except (OSError, http.cookiejar.LoadError):
+                    pass
+            web = self.cfg.get("web") or {}
+            self._opener = urllib.request.build_opener(CertHTTPSHandler(cert_contexts(web.get("client_certs"))),
+                                                       urllib.request.HTTPCookieProcessor(self.cookies))
+        return self._opener
+
+    def web_get(self, url: str, data: bytes | None = None):
+        """(final url, content type, body bytes), following redirects and SSO's auto-submit forms
+        and meta refreshes (up to 8 steps)."""
+        opener = self.web_opener()
+        method = "post" if data else "get"
+        for _ in range(8):
+            req = urllib.request.Request(url, data=data if method == "post" else None, headers={
+                "User-Agent": WEB_AGENT, "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*"})
+            with opener.open(req, timeout=30) as r:
+                body, final, ctype = r.read(WEB_MAX), r.geturl(), r.headers.get("content-type", "")
+            try:
+                self.cookies.save(ignore_discard=True)
+                os.chmod(self.p("cookies.txt"), 0o600)
+            except OSError:
+                pass
+            if "html" not in ctype:
+                return final, ctype, body
+            page = PageText(final)
+            page.feed(body.decode(r.headers.get_content_charset() or "utf-8", errors="replace"))
+            step = page.sso_step()
+            if not step:
+                return final, ctype, body
+            method, url, data = step
+            if method == "get" and data:
+                url, data = f"{url}{'&' if '?' in url else '?'}{data.decode()}", None
+        return final, ctype, body
+
+    def fetch_url(self, url: str, offset: int | None = None, limit: int | None = None,
+                  save_as: str | None = None) -> ToolResult:
+        if not re.match(r"https?://", url):
+            return "fetch_url reads http:// and https:// URLs (for a local file, use read_file).", True
+        cache = getattr(self, "_pages", {})
+        if save_as or url not in cache or not offset:
+            try:
+                final, ctype, body = self.web_get(url)
+            except urllib.error.HTTPError as e:
+                text = e.read(4000).decode(errors="replace")
+                page = PageText(url)
+                page.feed(text)
+                return f"HTTP {e.code} from {url}:\n{clip(page.text(), 1500, 500)}", True
+            except (urllib.error.URLError, OSError, ValueError, ssl.SSLError) as e:
+                return f"Couldn't fetch {url}: {e}", True
+            if save_as:
+                full = self.resolve(save_as)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                open(full, "wb").write(body)
+                return f"Saved {final} ({ctype or 'unknown type'}, {len(body) // 1024} KB) to {full}", False
+            charset = re.search(r"charset=([\w-]+)", ctype)
+            raw = body.decode(charset.group(1) if charset else "utf-8", errors="replace")
+            if "html" in ctype:
+                page = PageText(final)
+                page.feed(raw)
+                text = page.text()
+            elif "json" in ctype:
+                try:
+                    text = json.dumps(json.loads(raw), indent=1, ensure_ascii=False)
+                except ValueError:
+                    text = raw
+            elif ctype.startswith("text/") or not ctype:
+                text = raw
+            else:
+                return (f"{final} is {ctype} ({len(body) // 1024} KB), not text. To keep it, fetch it again "
+                        "with save_as (then view_image it if it's an image)."), True
+            self._pages = cache = {url: (final, text)}          # only the latest page, for paging
+        final, text = cache[url]
+        lines = text.splitlines()
+        start, count = max(1, int(offset or 1)), max(1, int(limit or 400))
+        chunk, end = lines[start - 1:start - 1 + count], min(len(lines), start - 1 + count)
+        where = f" (lines {start}-{end} of {len(lines)})" if end < len(lines) or start > 1 else ""
+        more = (f"\n[hobkin: {len(lines) - end} more lines (offset={end + 1}). Read them before saying anything "
+                "about the rest.]") if end < len(lines) else ""
+        return f"{final}{where}:\n" + "\n".join(chunk) + more, False
+
+    def web_search(self, query: str) -> ToolResult:
+        base = (self.cfg.get("web") or {}).get("search_url") or "https://html.duckduckgo.com/html/"
+        url = f"{base}{'&' if '?' in base else '?'}{urllib.parse.urlencode({'q': query})}"
+        try:
+            _, _, body = self.web_get(url)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return f"Search failed: {e}", True
+        page = body.decode(errors="replace")
+        if "anomaly-modal" in page or "anomaly.js" in page:
+            return ("DuckDuckGo is asking for a human check from this machine (it does that to some servers), so "
+                    "search isn't available right now. Try again later, or fetch_url pages you already know.", True)
+        hits = search_results(page, base)[:10]
+        if not hits:
+            return f"No results for {query!r}.", False
+        return "\n".join(f"{i}. {t}\n   {u}\n   {sn}" for i, (t, u, sn) in enumerate(hits, 1)), False
+
     def view_image(self, path: str) -> ToolResult:
         full = self.resolve(path)
         if not os.path.isfile(full):
@@ -1834,6 +2120,8 @@ class Agent:
             "reminders": lambda: self.tool_reminders(inp),
             "skill": lambda: self.open_skill(s("name")),
             "view_image": lambda: self.view_image(s("path")),
+            "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
+            "web_search": lambda: self.web_search(s("query")),
         }
         if name not in tools:
             return f"Unknown tool {name!r}. Tools: {', '.join(tools)}.", True
