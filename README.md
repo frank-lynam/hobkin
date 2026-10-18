@@ -133,6 +133,7 @@ operator]". A line that is just one of these is a command instead:
 | `/compact` | Summarise and clear the conversation now. |
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
+| `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
 
 `hobkin chat ID` puts both in one terminal (see Quick start). `hobkin list` shows all agents, their status and their last line of output.
 
@@ -165,6 +166,13 @@ are; if it's left out and there's only one model, that one is used.
 - The key comes from the environment variable `key_env`, or else from the file
   `key_file`. It's removed from the agent's shell environment.
 - `headers` (optional): extra HTTP headers.
+- `thinking` (optional): `"adaptive"`, a token budget (`8000`), or the API's own
+  object. Anthropic only; it must be smaller than `max_output_tokens`.
+- `effort` (optional): `"low"` to `"max"`. It goes to Anthropic as
+  `output_config.effort`, to OpenRouter as `reasoning.effort`, and to other
+  OpenAI-style APIs as `reasoning_effort`.
+- `extra_body` (optional): anything else your provider takes, merged into every
+  request as is.
 - `prompt_cache` (optional): on OpenAI-style APIs, mark the system prompt and the
   newest message for caching. It's on by default for Claude models (e.g. on
   OpenRouter), where re-reading the conversation then costs about 5% of the
@@ -250,6 +258,44 @@ default; the agent can ask for any longer timeout on a command),
 - **`remind`** sets a reminder to wake itself later, and **`reminders`** lists
   or cancels them (see below).
 - **`skill`** opens a skill by name.
+- **`view_image`** shows it an image (PNG, JPEG, GIF, WebP, under 5 MB): a
+  screenshot of the UI it built, a chart, a photo. On OpenAI-style APIs the image
+  follows the tool result as a user message, because tool messages can't hold
+  images.
+
+### Background jobs
+
+`bash` with `background: true` returns at once ("background job #3 started"),
+and when the job ends the agent gets a message with its exit code, how long it
+took, and the last of its output. Jobs run detached in the shell's current
+state, with their output in `jobs/N/out.log`. They outlive a hobkin restart: a
+job that finished while hobkin was stopped is reported when it starts again.
+That suits builds, test suites, downloads, and "naps", where a job switches off
+a local model, uses the GPU, and starts the model again: nothing calls the model
+while the job runs, and its end wakes the agent.
+
+### Announce first
+
+Commands whose effects leave the machine are announced before they run:
+- **What counts** (`announce_first` in config, a name and a regex each): force
+  pushes, pushes to main, publishing packages, releases, image pushes,
+  infrastructure changes, cloud deletions, and sending email or webhook messages.
+- **The first try isn't run.** hobkin tells the agent to post what it's about to
+  do and why where people will see it, then run the same command again with
+  `announced` set.
+- **Then it waits** `announce_delay` (2 minutes), long enough for someone to
+  object in chat. After that, the same command runs.
+- **To stop it,** send `/veto`, which blocks everything waiting. Or just object
+  where it posted: the agent is told to check before it runs the command.
+
+Everything else, anything inside the box, needs no announcement.
+
+### Daily budget
+
+`daily_budget_usd` pauses an agent for the rest of the day once it has spent
+that much. First it gets one last turn to say so where people will see it.
+Spend counts only where the API reports each call's cost (OpenRouter does);
+`state.json` keeps `spend_today` and the all-time `spend_usd`.
 
 **Nothing asks for approval:** an agent can do anything your account can. Agents
 in one account stay apart by convention (their own folders), not by enforcement.
@@ -325,7 +371,8 @@ hobkin service remove tickets-1   # stop it and take it off boot
 Hobkins don't nap. After `idle_seconds` (60) of quiet, an idle agent gets
 `idle_prompt`, labelled `[from hobkin: idle prompt]`. The default is "You're
 idle. Unacceptable! Grab work from your work sources, or hunt for something
-useful to do." Set `idle_prompt` to `null` to let it rest until a message or
+useful to do." It stays quiet while the agent has a reminder set or a background
+job running. Set `idle_prompt` to `null` to let it rest until a message or
 reminder arrives. Each nudge is a model call, so pair a short `idle_seconds`
 with a `requests_per_minute` you're happy with.
 
@@ -342,7 +389,8 @@ cheeky little gremlin:
 
 Small models skim long instructions, so hobkin also nudges at the moment each
 behaviour matters:
-- **Every message from you** carries a reminder to give a hot take first.
+- **A message from you** carries a reminder to give a hot take first (a hello
+  or a question just gets answered).
 - **A clear slip** (a file-tool error, a command that wasn't found) gets a
   nudge towards the blooper reel.
 - **Writing that loses its voice** (a reply, or a `.md`/`.txt` file, heavy with
@@ -353,6 +401,13 @@ behaviour matters:
 - **When a working turn ends,** there's one wrap-up check: did you report where
   the people are, any bloopers, more work to grab? It's sent once per turn, so
   it can't loop.
+
+**Busy or self-managing agents get no chatter.** If the agent has set up its own
+next wake-up (a reminder, or a background job still running), the hot take, the
+wrap-up check and the idle nag stay quiet; it's clearly managing itself. A
+message that arrives mid-task gets no hot-take reminder either. The corrective
+nudges (echo, slips, committee voice, unread lines) still apply, since they cost
+nothing extra.
 
 All of it is plain text in hobkin.py and AGENTS.md, so rein it in as you like.
 

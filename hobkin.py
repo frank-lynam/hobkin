@@ -108,6 +108,21 @@ DEFAULT_CONFIG = {
     # Who sends the messages that arrive directly (in, chat, send). Use the name people know
     # you by elsewhere (e.g. your tracker username). Unset: "operator".
     "operator": None,
+    # Outward-facing commands (their effects leave this machine) are announced first: the agent
+    # posts what it's about to do, waits announce_delay seconds for objections, then runs it.
+    "announce_first": {
+        "force push": r"\bgit\s+push\b[^\n;|&]*\s(--force\b|-f\b|--force-with-lease\b)",
+        "push to main": r"\bgit\s+push\b[^\n;|&]*\s(main|master)\b",
+        "publish a package": r"\b(npm|pnpm|yarn)\s+publish\b|\btwine\s+upload\b|\b(flit|poetry|cargo)\s+publish\b|\bgem\s+push\b",
+        "make a release": r"\bgh\s+release\s+create\b",
+        "push an image": r"\bdocker\s+push\b",
+        "change infrastructure": r"\bterraform\s+(apply|destroy)\b|\bkubectl\s+(apply|delete|scale)\b|\bhelm\s+(install|upgrade|uninstall)\b",
+        "delete cloud resources": r"\b(aws|gcloud|az)\b[^\n]*\s(delete|terminate|remove|rm)\b",
+        "send email or messages": r"\b(sendmail|mailx?|mutt)\b|hooks\.slack\.com|discord(app)?\.com/api/webhooks",
+    },
+    "announce_delay": 120,
+    # Pause for the day once this much is spent (where the API reports cost, e.g. OpenRouter)
+    "daily_budget_usd": None,
     "idle_prompt": ("You're idle. Unacceptable! Grab work from your work sources (your skills say where), "
                     "or hunt for something useful to do."),
     "idle_seconds": 60,
@@ -127,7 +142,8 @@ DEFAULT_CONFIG = {
 CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
-                "heartbeat_seconds": (int, float)}
+                "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
+                "daily_budget_usd": (int, float, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -215,15 +231,26 @@ in the world, and the second best is grabbing the next one.
   is once at a time ("at": "tomorrow 09:00"); `every` repeats ("every": "5m").
   When it fires you get a message with your text, so put everything you'll
   need in it: what to check, ids, paths. **reminders** lists them or cancels
-  one. Waiting on something slow? Don't `sleep` in bash: set a reminder, note it
+  one. Waiting on something slow? Don't `sleep` in bash: run it with
+  `background: true` (or set a reminder), note it
   in your checklist, and go do other work (or end your turn).
 - **skill** opens a skill by name (see the Skills list). Always open the skill
   before doing a task it covers, and follow its steps in order. Its files are
   in the folder it tells you; use those full paths.
 - Paths in the file tools are relative to the folder bash is in;
   `$HOBKIN_WORK`, `$HOBKIN_MEMORY`, `$HOBKIN_BLOOPERS` and `~` work too.
-- Run anything long (installs, builds, servers) in the background and check on
-  it: `nohup make build > build.log 2>&1 &`, then later `tail -20 build.log`.
+- Run anything long (installs, builds, test suites, servers, naps) with bash's
+  `background: true`: you get the result straight back as "job #N started", and a
+  message with its exit code and last lines of output when it finishes. Do
+  other work meanwhile, or end your turn.
+- **view_image** shows you an image: a screenshot, a chart, a photo. To check a
+  web page or UI you built, screenshot it (a headless browser) and look.
+- **Announce first, then act** for commands whose effects leave this machine:
+  force-pushing, pushing to main, publishing, releasing, deploying, deleting
+  cloud resources, sending messages. hobkin will stop you and explain: post
+  what you're about to do and why where people will see it, run the same
+  command again with `announced`, wait the short delay, check for objections,
+  then run it. Everything inside this box needs no announcement.
 - Never run anything that waits for keyboard input (editors, `less`, prompts).
   Use non-interactive flags: `-y`, `git --no-pager`, `PAGER=cat`.
 - Read the output before moving on. For long output use `head`, `tail`,
@@ -357,7 +384,12 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "command": {"type": "string", "description": "The command to run."},
          "timeout": {"type": "integer", "description": "Seconds before it's killed (default: the configured bash_timeout; ask for as long as you need)."},
-         "reset": {"type": "boolean", "description": "Start a fresh login shell first, in your workspace (use if the shell is in a bad state)."}},
+         "reset": {"type": "boolean", "description": "Start a fresh login shell first, in your workspace (use if the shell is in a bad state)."},
+         "background": {"type": "boolean", "description": ("Run it in the background and carry on: you get a message "
+                        "with its exit code and last lines of output when it finishes (builds, test suites, downloads, naps).")},
+         "announced": {"type": "string", "description": ("For commands whose effects leave this machine (pushing, "
+                       "publishing, deploying, messaging): where you announced it, e.g. 'chat with frank'. hobkin tells "
+                       "you when one needs this.")}},
          "required": ["command"]}},
     {"name": "read_file",
      "description": ("Show a file with line numbers (or list a folder). Long files come in pages: use offset "
@@ -437,7 +469,7 @@ shopt -s expand_aliases
 """
 
 
-COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders")
+COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto")
 
 
 # ---- nudges: the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
@@ -1048,6 +1080,8 @@ class Agent:
         self.interrupt = False
         self.compact_requested = False
         self.waiting_note = None           # for the heartbeat, while waiting out a rate limit
+        self.job_procs = {}                # background jobs started by this process
+        self.budget_paused = False
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1297,6 +1331,13 @@ class Agent:
             self.compact_requested = True   # done between steps, never mid-command
         elif cmd == "/interrupt":
             self.interrupt = True
+        elif cmd == "/veto":
+            pending = self.state.get("announced") or {}
+            self.state["vetoed"] = (self.state.get("vetoed", []) + list(pending))[-100:]
+            self.state["announced"] = {}
+            self.save_state()
+            self.log("hobkin", f"vetoed {len(pending)} announced command(s): " +
+                     ("; ".join(a["command"] for a in pending.values()) or "nothing was waiting"))
         elif cmd == "/reminders":
             data, _ = self.load_reminders()
             self.log("hobkin", "\n".join(self.reminder_lines(data["items"])) or "no reminders")
@@ -1317,6 +1358,56 @@ class Agent:
                     "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md")})
         return env
 
+    # --- background jobs: started by bash with background: true; a message arrives when each finishes
+    def start_job(self, command: str) -> ToolResult:
+        """Run a command detached (it outlives hobkin if need be), in the shell's current state, with its
+        output and exit code in jobs/N/. The exit file appearing is how we know it finished."""
+        n = self.state["next_job"] = self.state.get("next_job", 0) + 1
+        jdir = self.p(f"jobs/{n}")
+        os.makedirs(jdir, exist_ok=True)
+        state_file = self.p("shell.sh")
+        script = (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if os.path.exists(state_file) else "") + command
+        env = self.tool_env()
+        env.update({"HOBKIN_JOB": script, "HOBKIN_JOB_OUT": os.path.join(jdir, "out.log"),
+                    "HOBKIN_JOB_EXIT": os.path.join(jdir, "exit")})
+        proc = subprocess.Popen(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"'],
+                                cwd=self.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        self.job_procs[n] = proc            # kept so it's reaped; the exit file is what counts
+        self.state.setdefault("jobs", {})[str(n)] = {"command": command[:500], "started": time.time(), "dir": jdir,
+                                                    "pid": proc.pid}
+        self.save_state()
+        self.log("$", f"(background job #{n}) {command}")
+        return (f"Started background job #{n} (pid {proc.pid}); its output goes to {jdir}/out.log. You'll get a "
+                "message when it finishes: do other work meanwhile, or end your turn."), False
+
+    def finished_jobs(self) -> list[str]:
+        """Messages for background jobs that have finished since we last looked."""
+        out = []
+        for n, job in list((self.state.get("jobs") or {}).items()):
+            exit_file = os.path.join(job["dir"], "exit")
+            if not os.path.exists(exit_file):
+                continue
+            code = read(exit_file).strip() or "?"
+            tail = clip(read(os.path.join(job["dir"], "out.log")), 0, 2000).lstrip("\n")
+            text = (f"[Background job #{n} finished: exit {code} after {span_text(time.time() - job['started'])}. "
+                    f"Command: {job['command']}\nLast of its output ({job['dir']}/out.log):]\n{tail.strip() or '(no output)'}")
+            del self.state["jobs"][n]
+            self.job_procs.pop(int(n), None)
+            self.save_state()
+            self.log("job", text)
+            out.append(text)
+        return out
+
+    def due_events(self) -> list[str]:
+        """What's come due on its own: reminders and finished background jobs."""
+        return self.take_due_reminders() + self.finished_jobs()
+
+    def scheduled(self) -> bool:
+        """True when the agent has set up its own next wake-up: a reminder, or a job still running.
+        Then it's managing itself, and the hot-take, wrap-up and idle nudges stay quiet."""
+        return bool(self.state.get("jobs")) or self.next_reminder_in() is not None
+
     def cwd(self):
         cwd = self.state.get("cwd") or self.work
         return cwd if os.path.isdir(cwd) else self.work
@@ -1325,10 +1416,49 @@ class Agent:
         rel = os.path.relpath(cwd, self.work)
         return "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
 
-    def run_bash(self, command: str, timeout: int | None = None, reset: bool = False) -> ToolResult:
+    def announce_check(self, command: str, announced: str | None) -> ToolResult | None:
+        """Outward-facing commands are announced first and run after announce_delay unless vetoed.
+        None: go ahead. Otherwise the (not-run) result to give the agent."""
+        label = next((name for name, rx in (self.cfg.get("announce_first") or {}).items()
+                      if re.search(rx, command)), None)
+        if not label:
+            return None
+        key = hashlib.sha256(command.strip().encode()).hexdigest()[:16]
+        pending, delay = self.state.setdefault("announced", {}), float(self.cfg.get("announce_delay") or 0)
+        if key in self.state.get("vetoed", []):
+            return (f"Not run: {self.who} vetoed this ({label}). Don't run it; ask what they'd prefer, or find "
+                    "another way."), True
+        if not announced:
+            return (f"Not run yet: this looks outward-facing ({label}), so announce it first. Post where people will "
+                    f"see it (your work system's chat) what you're about to do and why, then run exactly the same "
+                    f"command again with `announced` set to where you posted. It can run {span_text(delay)} after "
+                    "that, if nobody objects."), True
+        when = pending.get(key, {}).get("at")
+        if when is None:
+            pending[key] = {"at": time.time(), "where": announced, "label": label, "command": command[:200]}
+            self.save_state()
+            self.log("hobkin", f"announced ({label}, in {announced}); can run from "
+                     f"{time.strftime('%H:%M:%S', time.localtime(time.time() + delay))} unless {self.who} sends /veto")
+            return (f"Announced. It can run from {time.strftime('%H:%M:%S', time.localtime(time.time() + delay))}: until "
+                    f"then, check where you posted for objections (a reminder works), then run exactly the same "
+                    "command again with `announced` set."), True
+        if time.time() < when + delay:
+            return f"Not yet: it can run from {time.strftime('%H:%M:%S', time.localtime(when + delay))}.", True
+        del pending[key]
+        self.log("hobkin", f"announced in {announced} and nobody objected: running it")
+        return None
+
+    def run_bash(self, command: str, timeout: int | None = None, reset: bool = False,
+                 background: bool = False, announced: str | None = None) -> ToolResult:
         """Each command is its own bash process, so a hung or crashed one can't take the shell
         with it. The shell still behaves like one that persists: the first runs as a login shell,
         and every command starts from the state the last one left (shell.sh)."""
+        refused = self.announce_check(command, announced)
+        if refused:
+            self.log("$", f"(not run) {command}")
+            return refused
+        if background:
+            return self.start_job(command)
         timeout = max(1, int(timeout or self.cfg["bash_timeout"]))   # the agent can ask for any length
         state_file, cwd_file = self.p("shell.sh"), self.p(".cwd")
         if reset:
@@ -1633,9 +1763,11 @@ class Agent:
 
     # --- nudges: where the [hobkin: ...] hints (texts and detectors: the "nudges" section) get attached.
     # Small models skim long instructions but follow a hint at the moment it applies.
-    def from_operator(self, text: str) -> str:
-        """A message from the operator as the model sees it: who sent it, and the hot-take hint."""
-        return f"[message from {self.who}]\n{text}\n{HOT_TAKE}"
+    def from_operator(self, text: str, busy: bool = False) -> str:
+        """A message from the operator as the model sees it: who sent it, and the hot-take hint, unless
+        the agent is busy (mid-task) or managing itself (a reminder or job of its own coming)."""
+        hint = "" if busy or self.scheduled() else f"\n{HOT_TAKE}"
+        return f"[message from {self.who}]\n{text}{hint}"
 
     def tool_nudges(self, name: str, inp: dict, content, err: bool):
         """A tool's result, with any hint for what the agent just did added at the end."""
@@ -1657,7 +1789,7 @@ class Agent:
         said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
             return True
-        return bool(self.turn_used_tools) and self.nudge_once("wrap_up_sent", WRAP_UP)
+        return bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP)
 
     def nudge_once(self, flag: str, text: str) -> bool:
         """Send a nudge as a user message, at most once per turn (flag), so it can never loop."""
@@ -1691,7 +1823,8 @@ class Agent:
         own command and output, the rest log the first line of their result."""
         s = lambda key: str(inp[key])            # a required argument (KeyError if missing)
         tools = {
-            "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset"))),
+            "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")),
+                                          bool(inp.get("background")), inp.get("announced")),
             "read_file": lambda: self.read_file(s("path"), inp.get("offset"), inp.get("limit")),
             "write_file": lambda: self.write_file(s("path"), s("content")),
             "edit_file": lambda: self.edit_file(s("path"), s("old_text"), s("new_text"), bool(inp.get("replace_all"))),
@@ -1733,7 +1866,11 @@ class Agent:
                 if used:
                     self.state["last_input_tokens"] = used
                 if self.model.last_cost:
-                    self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + float(self.model.last_cost), 6)
+                    cost, today = float(self.model.last_cost), time.strftime("%Y-%m-%d")
+                    self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + cost, 6)
+                    if self.state.get("spend_day") != today:
+                        self.state.update({"spend_day": today, "spend_today": 0.0})
+                    self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
                     self.model.last_cost = None
                 return blocks, stop_reason
             except ApiError as e:
@@ -1856,8 +1993,26 @@ class Agent:
         self.log("hobkin", f"compacted; note:\n{note}")
 
     # --- the loop: one step at a time; the heartbeat; run()
+    def over_budget(self) -> bool:
+        budget = self.cfg.get("daily_budget_usd")
+        return bool(budget) and self.state.get("spend_day") == time.strftime("%Y-%m-%d") \
+            and self.state.get("spend_today", 0) >= float(budget)
+
     def step(self) -> None:
         """One model call, then run any commands it asked for."""
+        if self.over_budget():
+            today = time.strftime("%Y-%m-%d")
+            if self.state.get("budget_notice") != today:
+                # One last turn: let people know where they'll see it
+                self.state["budget_notice"] = today
+                self.add_user(f"[from hobkin: today's budget (${self.cfg['daily_budget_usd']}) is used up "
+                              f"(${self.state['spend_today']:.2f} spent). Post where people will see it that you're "
+                              "pausing until tomorrow (or until someone raises daily_budget_usd), then stop.]")
+            else:
+                self.paused = self.budget_paused = True
+                self.save_state("paused (budget)")
+                self.log("hobkin", f"daily budget used up (${self.state['spend_today']:.2f}): pausing until tomorrow")
+                return
         if self.compact_requested:
             self.compact_requested = False
             self.compact("requested")
@@ -1906,10 +2061,10 @@ class Agent:
                 content = self.tool_nudges(b.get("name"), b.get("input") or {}, content, err)
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
         # Reminders that came due and operator messages that came in meanwhile ride along
-        for text in self.take_due_reminders():
+        for text in self.due_events():
             results.append({"type": "text", "text": text})
         for text in self.pending:
-            results.append({"type": "text", "text": self.from_operator(text)})
+            results.append({"type": "text", "text": self.from_operator(text, busy=True)})
         self.pending = []
         self.messages.append({"role": "user", "content": results})
         self.save_context()
@@ -1923,6 +2078,8 @@ class Agent:
             return self.waiting_note
         if self.working:
             return "working"
+        if self.state.get("jobs"):
+            return f"on duty, background job #{', #'.join(sorted(self.state['jobs']))} running"
         coming = []
         try:                                       # read-only: never logs from this thread
             items = json.loads(read(self.p("reminders.json"), "{}") or "{}").get("items", [])
@@ -1962,16 +2119,20 @@ class Agent:
         try:
             while not self.stop:
                 if self.paused:
-                    self.save_state("error" if self.error else "paused")
+                    if self.budget_paused and not self.over_budget():      # a new day
+                        self.paused = self.budget_paused = False
+                        self.log("hobkin", "a new day: budget reset, carrying on")
+                        continue
+                    self.save_state("paused (budget)" if self.budget_paused else "error" if self.error else "paused")
                     waiting = len(self.pending)
-                    self.poll_input(3600)
+                    self.poll_input(60 if self.budget_paused else 3600)
                     if self.error and len(self.pending) > waiting:
                         self.paused = self.error = False      # a message after an error: try again
                     continue
                 if self.compact_requested and not self.working:
                     self.compact_requested = False
                     self.compact("requested")
-                due = self.take_due_reminders()
+                due = self.due_events()
                 if due or self.pending:
                     self.add_user("\n\n".join(due + [self.from_operator(t) for t in self.pending]))
                     self.pending = []
@@ -1983,9 +2144,14 @@ class Agent:
                     continue
                 self.save_state("idle")
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
-                wait = max(0.0, idle_since + every - time.time()) if prompt else 3600
+                quiet = bool(prompt) and self.scheduled()  # it's set its own next wake-up: no need to nag
+                if quiet:
+                    prompt = None
+                wait = max(0.0, idle_since + every - time.time()) if prompt else every if quiet else 3600
                 self.next_idle_prompt = idle_since + every if prompt else None
                 nxt = self.next_reminder_in()
+                if self.state.get("jobs"):
+                    nxt = min(nxt, 1.0) if nxt is not None else 1.0   # look for finished jobs every second
                 self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
                     self.log("hobkin", "idle prompt")

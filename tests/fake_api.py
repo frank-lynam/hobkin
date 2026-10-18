@@ -104,6 +104,6 @@ class H(BaseHTTPRequestHandler):
             texts = "\n".join(flat(m["content"]) for m in tail if m["role"] == "user")
             kind, val = decide(texts, [m["content"] for m in tail if m["role"] == "tool"], body.get("tool_choice") == "none")
             msg = {"role": "assistant", "content": val} if kind == "text" else {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{len(msgs)}", "type": "function", "function": {"name": val[0], "arguments": json.dumps(val[1])}}]}
-            return self.send(200, {"choices": [{"message": msg, "finish_reason": "tool_calls" if kind == "tool" else "stop"}], "usage": {"prompt_tokens": size}})
+            return self.send(200, {"choices": [{"message": msg, "finish_reason": "tool_calls" if kind == "tool" else "stop"}], "usage": {"prompt_tokens": size, **({"cost": 0.4} if body.get("model") == "fake-costly" else {})}})
         self.send(404, {})
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

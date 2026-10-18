@@ -457,6 +457,79 @@ try:
     check("[429] both carry on afterwards, still one blocked call", served() - before == 1, served() - before)
     for p_ in (p1, p2): p_.send_signal(signal.SIGTERM); p_.wait(10)
 
+    # background jobs: report back when they finish, even across a restart
+    h = home("jobs", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+    p, aid, d = start(h)
+    say(d, 'call: bash {"command": "sleep 2; echo job-done-marker", "background": true}')
+    wait_for(d, "Started background job #1", file="context.jsonl")
+    wait_for(d, "Background job #1 finished: exit 0", 15)
+    wait_for(d, "job-done-marker", 5, file="context.jsonl")
+    check("[jobs] a background job reports back when it finishes", True)
+    say(d, 'call: bash {"command": "sleep 3; echo after-restart", "background": true}')
+    wait_for(d, "Started background job #2", file="context.jsonl")
+    say(d, "/stop"); p.wait(10); time.sleep(4)
+    p, _, d = start(h, aid)
+    wait_for(d, "Background job #2 finished: exit 0", 15)
+    check("[jobs] a job that finished while hobkin was stopped is reported after restart", "after-restart" in open(d + "/context.jsonl").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # nudges stay quiet while the agent has its own wake-up set (a reminder or a job)
+    h = home("quiet", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": "nag me", "idle_seconds": 2})
+    os.makedirs(h + "/quiet1")
+    due = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 7200))
+    json.dump({"next_id": 2, "items": [{"id": 1, "message": "later", "due": due, "every": None, "set": due}]},
+              open(h + "/quiet1/reminders.json", "w"))
+    p, aid, d = start(h, "quiet1")
+    say(d, "run: echo quiet-check"); wait_for(d, "Done. Output was: quiet-check"); time.sleep(4)
+    texts = [b.get("text", "") for m in ctx(d) if m["role"] == "user" for b in m["content"]]
+    check("[quiet] with a reminder set: no hot take, no wrap-up, no idle nag",
+          not any("[hobkin: a task or an idea" in t or "wrap-up check" in t for t in texts)
+          and "idle prompt" not in open(d + "/out").read(), [t[:60] for t in texts])
+    os.remove(d + "/reminders.json")
+    wait_for(d, "hobkin> idle prompt", 10)
+    check("[quiet] once nothing's scheduled, the idle nag is back", True)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # announce first: outward-facing commands wait for an announcement and a delay; /veto stops them
+    h = home("announce", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"announce_first": {"test rockets": "launch-rockets"}, "announce_delay": 2, "idle_prompt": None})
+    p, aid, d = start(h)
+    def tool(name, args, marker):                          # waits for a *new* occurrence of the marker
+        seen = open(d + "/context.jsonl").read().count(marker)
+        say(d, f"call: {name} " + json.dumps(args))
+        for _ in range(150):
+            if open(d + "/context.jsonl").read().count(marker) > seen: return
+            time.sleep(0.1)
+        raise AssertionError(f"no new {marker!r}: " + open(d + "/out").read()[-600:])
+    say(d, "run: echo launch-rockets now"); wait_for(d, "this looks outward-facing (test rockets)", file="context.jsonl")
+    check("[announce] not run until announced", "launch-rockets now\n" not in "".join(
+        r for r in [json.dumps(m) for m in ctx(d)] if "tool_result" in r))
+    tool("bash", {"command": "echo launch-rockets now", "announced": "chat with frank"}, "Announced. It can run from")
+    tool("bash", {"command": "echo launch-rockets now", "announced": "chat with frank"}, "Not yet: it can run from")
+    time.sleep(2.5)
+    tool("bash", {"command": "echo launch-rockets now", "announced": "chat with frank"}, "launch-rockets now\\n\\n[exit code 0")
+    check("[announce] runs after the delay with no objection", "nobody objected: running it" in open(d + "/out").read())
+    tool("bash", {"command": "echo launch-rockets twice", "announced": "chat"}, "Announced. It can run from")
+    say(d, "/veto"); wait_for(d, "vetoed 1 announced command"); time.sleep(2.5)
+    tool("bash", {"command": "echo launch-rockets twice", "announced": "chat"}, "vetoed this (test rockets)")
+    check("[announce] /veto stops it", True)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # daily budget: one last turn to say so, then paused
+    h = home("budget", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake-costly", "key_env": "TESTKEY"},
+             {"daily_budget_usd": 1.0, "idle_prompt": None})
+    p, aid, d = start(h)
+    for word in ("one", "two", "three"):
+        say(d, word); wait_for(d, f"echo: {word}")
+    say(d, "four"); wait_for(d, "today's budget ($1.0) is used up", 10, file="context.jsonl")
+    say(d, "five"); wait_for(d, "daily budget used up", 10)
+    for _ in range(20):
+        if json.load(open(d + "/state.json")).get("status") == "paused (budget)": break
+        time.sleep(0.1)
+    check("[budget] a notice turn, then paused for the day", json.load(open(d + "/state.json")).get("status") == "paused (budget)")
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"heartbeat_seconds": 1, "idle_prompt": None})
