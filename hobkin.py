@@ -31,7 +31,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 import email.utils
 import base64
@@ -83,7 +83,7 @@ HOME = os.path.expanduser(os.environ.get("HOBKIN_HOME", "~/.hobkins"))
 SHARED = os.path.join(HOME, "_shared")
 
 
-USER_AGENT = "hobkin/0.1"
+USER_AGENT = f"hobkin/{__version__}"
 
 
 DEFAULT_CONFIG = {
@@ -787,7 +787,7 @@ def is_running(agent_dir):
 
 # ---- web: pages as text, client certificates, SSO, search (for fetch_url, web_search)
 
-WEB_AGENT = "Mozilla/5.0 (X11; Linux x86_64) hobkin/0.1"
+WEB_AGENT = f"Mozilla/5.0 (X11; Linux x86_64) hobkin/{__version__}"
 WEB_MAX = 10 * 1024 * 1024
 
 
