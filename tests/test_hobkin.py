@@ -539,9 +539,13 @@ try:
     certs = os.path.join(BASE, "certs"); os.makedirs(certs)
     def ossl(*a):
         subprocess.run(["openssl", *a], cwd=certs, check=True, capture_output=True)
-    ossl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=Test CA")
-    open(os.path.join(certs, "san.cnf"), "w").write("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
-    for who, extra in (("server", ["-extfile", "san.cnf"]), ("client", [])):
+    # The extensions a real CA sets: Python 3.13+ checks them (VERIFY_X509_STRICT)
+    ossl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "2", "-subj", "/CN=Test CA",
+         "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    leaf = "authorityKeyIdentifier=keyid,issuer\nsubjectKeyIdentifier=hash\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+    open(os.path.join(certs, "server.cnf"), "w").write(leaf + "extendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1,DNS:localhost\n")
+    open(os.path.join(certs, "client.cnf"), "w").write(leaf + "extendedKeyUsage=clientAuth\n")
+    for who, extra in (("server", ["-extfile", "server.cnf"]), ("client", ["-extfile", "client.cnf"])):
         ossl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{who}.key", "-out", f"{who}.csr", "-subj", f"/CN=hobkin-{who}")
         ossl("x509", "-req", "-in", f"{who}.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
              "-out", f"{who}.pem", "-days", "2", *extra)
