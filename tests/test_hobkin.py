@@ -664,8 +664,8 @@ try:
     env = {**os.environ, "HOBKIN_HOME": hs}
     run = lambda *a, **k: subprocess.run([sys.executable, HOB, *a], env=env, capture_output=True, text=True, timeout=60, **k)
     r = run("models", "http://127.0.0.1:48702/v1", "sk-x")
-    check("[setup] hobkin models lists an endpoint's models", "1 model at http://127.0.0.1:48702/v1" in r.stdout
-          and "fake  100k context" in r.stdout, r.stdout + r.stderr)
+    check("[setup] hobkin models lists an endpoint's models", "2 models at http://127.0.0.1:48702/v1" in r.stdout
+          and re.search(r"^  fake +100k context$", r.stdout, re.M), r.stdout + r.stderr)
     r = run("http://127.0.0.1:48702/v1", "fakr", "sk-x", "--no-service", "--id", "s1")
     check("[setup] a model the endpoint doesn't offer is refused, with the close ones", r.returncode != 0
           and "doesn't offer 'fakr'. Close: fake" in r.stderr and not os.path.exists(hs + "/s1"), r.stderr)
@@ -679,7 +679,17 @@ try:
     check("[setup] starts the agent and --chat talks to it", r.returncode == 0 and "agent> echo: hello setup" in r.stdout,
           r.stdout + r.stderr)
     r = run("chat", "s1", input="/models\n")
-    check("[setup] /models lists them in a chat, the one in use starred", "* fake  100k context" in r.stdout, r.stdout)
+    check("[setup] /models lists them in a chat, the one in use starred", re.search(r"\* fake +100k context", r.stdout), r.stdout)
+    r = run("chat", "s1", input="/model fakr\n")
+    check("[model] /model with a name nobody offers says so", "no model 'fakr'" in r.stdout and "Close: fake" in r.stdout, r.stdout)
+    r = run("chat", "s1", input="/model fake-costly\n")
+    acfg = json.load(open(hs + "/s1/config.json"))
+    check("[model] /model switches to a model the API offers, saved in the agent's config",
+          "switched from fake (fake via" in r.stdout and "to fake-costly (fake-costly via" in r.stdout
+          and acfg["model"] == "fake-costly" and acfg["models"]["fake-costly"]["key_file"] == key_file
+          and json.load(open(hs + "/s1/state.json"))["model"].startswith("fake-costly"), r.stdout + json.dumps(acfg))
+    r = run("chat", "s1", input="/model\n")
+    check("[model] /model alone lists the configured ones", re.search(r"configured \(\* = in use\):.* fake, \*fake-costly$", r.stdout, re.M), r.stdout)
     run("send", "s1", "/stop")
     for _ in range(50):
         if json.load(open(hs + "/s1/state.json")).get("status") == "stopped": break

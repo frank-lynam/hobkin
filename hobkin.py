@@ -43,7 +43,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 import email.utils
 import base64
@@ -520,7 +520,7 @@ shopt -s expand_aliases
 
 
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits",
-            "/models")
+            "/models", "/model")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
@@ -1308,6 +1308,7 @@ class Agent:
         self.restart_requested = False
         self.limits_requested = False
         self.models_requested = False
+        self.model_wanted = None           # /model NAME: switched between steps
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1408,6 +1409,47 @@ class Agent:
                 self.state["context_tokens"], self.state["context_source"] = int(ctx), src
             if out:
                 self.state["api_max_output"] = int(out)
+
+    def use_model(self, name: str) -> None:
+        """Run on configured model `name` from now on (its limits asked for again)."""
+        self.model = Model(name, self.cfg["models"][name])
+        self.state["model"] = self.model.describe()
+        self.discover_limits()
+        self.save_state()
+
+    def switch_model(self, wanted: str) -> str:
+        """/model NAME: a configured model, else a model the current API offers (it gets a config entry
+        like the current one's). Saved in this agent's config.json, so it lasts; returns what happened."""
+        name, entry = wanted, None
+        if wanted not in self.cfg["models"]:
+            try:
+                offered = [i for i, _ in self.model.list_models()]
+            except (urllib.error.URLError, OSError, ValueError):
+                offered = None
+            if offered is not None and wanted not in offered:
+                near = difflib.get_close_matches(wanted, list(self.cfg["models"]) + offered, n=5, cutoff=0.4)
+                return (f"no model {wanted!r}: it's not in your config, and {self.model.base} doesn't offer it"
+                        + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
+            name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
+            entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
+                     "model": wanted}
+            self.cfg["models"][name] = entry
+        if name == self.model.name:
+            return f"already on {self.model.describe()}"
+        path = self.p("config.json")
+        try:
+            data = json.loads(read(path) or "{}")
+        except json.JSONDecodeError as e:
+            return f"can't switch: {path} isn't valid JSON ({e})"
+        if entry:
+            data.setdefault("models", {})[name] = entry
+        data["model"] = name
+        write_atomic(path, json.dumps(data, indent=2) + "\n")
+        old = self.model.describe()
+        self.use_model(name)
+        self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in self.cfg["models"] and f != name]
+        return (f"switched from {old} to {self.model.describe()}, context {self.state.get('context_tokens') or 'unknown'} "
+                f"(saved in {path})")
 
     def refresh_limits(self, why: str) -> None:
         """Ask the API for the limits again: windows can change (a local server restarted with another
@@ -1528,7 +1570,7 @@ class Agent:
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
         before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested)
+                  self.models_requested, self.model_wanted)
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -1553,7 +1595,7 @@ class Agent:
                 self.fifo_buf = b""
             self._drain_queue()
             if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested) != before:
+                  self.models_requested, self.model_wanted) != before:
                 return
 
     def _drain_queue(self):
@@ -1575,6 +1617,9 @@ class Agent:
             cmd = line.strip().split(" ", 1)[0].lower()
             if cmd in COMMANDS and line.strip().lower() == cmd:
                 self.command(cmd)
+            elif cmd == "/model":                      # the one command with an argument: /model NAME
+                self.model_wanted = line.strip().split(" ", 1)[1].strip()   # switched between steps
+                self.log("hobkin", f"command /model {self.model_wanted}")
             else:
                 body.append(line)
         body = "\n".join(body).strip()
@@ -1594,6 +1639,10 @@ class Agent:
             self.save_state("working" if self.working else "idle")
         elif cmd == "/compact":
             self.compact_requested = True   # done between steps, never mid-command
+        elif cmd == "/model":
+            names = ", ".join(("*" if n == self.model.name else "") + n for n in self.cfg["models"])
+            self.log("hobkin", f"model: {self.model.describe()}\nconfigured (* = in use): {names}\n"
+                     "/model NAME switches to one of those, or to any model this API offers (/models lists them)")
         elif cmd == "/models":
             self.models_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/limits":
@@ -2450,11 +2499,8 @@ class Agent:
             hint = (f"\nThe API refused the key for model {self.model.describe()}: "
                     "check it, and check \"model\" in config.json picks the API you meant.") if e.status in (401, 403) else ""
             if self.fallbacks:
-                old, name = self.model.describe(), self.fallbacks.pop(0)
-                self.model = Model(name, self.cfg["models"][name])
-                self.state["model"] = self.model.describe()
-                self.discover_limits()
-                self.save_state()
+                old = self.model.describe()
+                self.use_model(self.fallbacks.pop(0))
                 self.log("hobkin", f"model {old} refused ({e.status}), switching to {self.model.describe()}:\n{e}{hint}")
                 self.alert(f"hobkin {self.id}: model {old} refused ({e}); switched to {self.model.describe()}")
                 return
@@ -2579,6 +2625,9 @@ class Agent:
                 if self.models_requested:
                     self.models_requested = False
                     self.log("hobkin", models_text(self.model))
+                if self.model_wanted:
+                    wanted, self.model_wanted = self.model_wanted, None
+                    self.log("hobkin", self.switch_model(wanted))
                 if self.compact_requested and not self.working:
                     self.compact_requested = False
                     self.compact("requested")

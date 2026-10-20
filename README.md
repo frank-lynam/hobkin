@@ -165,6 +165,7 @@ operator]". A line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
+| `/model [NAME]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Saved in the agent's `config.json`, so it lasts; happens between steps. |
 | `/models` | List the models the agent's API offers (the one in use starred), with their context windows. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
 | `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |

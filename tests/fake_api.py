@@ -38,7 +38,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/models/"):
             return self.send(200, {"id": self.path.split("/")[-1], "max_input_tokens": CTX, "max_tokens": 4096})
         if self.path == "/v1/models":
-            return self.send(200, {"data": [{"id": "fake", **({"context_length": CTX} if LIST_CTX else {})}]})
+            return self.send(200, {"data": [{"id": m, **({"context_length": CTX} if LIST_CTX else {})} for m in ("fake", "fake-costly")]})
         self.send(404, {"error": "nope"})
     def do_POST(self):
         try:
