@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """hobkin: one unattended agent per process, driven through plain files.
 
+    hobkin URL MODEL [KEY] [--chat]   set up that API and start an agent on it (see below)
     hobkin                 start a new agent (prints its id)
     hobkin ID              resume agent ID
     hobkin chat ID         talk to a running agent in this terminal
@@ -8,7 +9,18 @@
     hobkin service remove ID   stop it and take it off boot
     hobkin send ID TEXT    message an agent (queued if it isn't running)
     hobkin list            list agents
+    hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
     hobkin --version
+
+Set up and go in one line (no config editing):
+
+    hobkin https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --chat
+
+adds that endpoint to _shared/config.json as the default model (the key goes in
+_shared/keys/, readable only by you; leave it out to be asked for it), checks the model
+exists, starts a new agent as a systemd user service (or in the background where there's
+no systemd), and with --chat connects you to it. Also: --id ID (the agent's id),
+--api anthropic|openai (else guessed from the URL), --no-service, --force (skip the check).
 
 (Or run the file directly: python3 hobkin.py ...)
 
@@ -507,7 +519,8 @@ shopt -s expand_aliases
 """
 
 
-COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits")
+COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits",
+            "/models")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
@@ -1014,6 +1027,14 @@ def retry_hint(headers: dict, text: str) -> tuple[float | None, str | None]:
     return found[key], key
 
 
+def listed_context(m: dict) -> int | None:
+    """The context window in one entry of an OpenAI-style /models list (OpenRouter, vLLM and others name it differently)."""
+    top = m.get("top_provider") or {}
+    ctx = (m.get("context_length") or m.get("max_model_len") or m.get("context_window")
+           or m.get("max_context_length") or top.get("context_length"))
+    return int(ctx) if ctx else None
+
+
 class Model:
     """One configured model. Messages are kept in Anthropic's shape (content blocks:
     text, tool_use, tool_result) and converted for OpenAI-style APIs."""
@@ -1099,12 +1120,10 @@ class Model:
             listing = http_json("GET", f"{self.base}/models", h, timeout=30)
             for m in listing.get("data", []):
                 if m.get("id") == self.model:
-                    top = m.get("top_provider") or {}
-                    ctx = (m.get("context_length") or m.get("max_model_len") or m.get("context_window")
-                           or m.get("max_context_length") or top.get("context_length"))
-                    out = top.get("max_completion_tokens") or m.get("max_completion_tokens")
+                    ctx = listed_context(m)
+                    out = (m.get("top_provider") or {}).get("max_completion_tokens") or m.get("max_completion_tokens")
                     if ctx:
-                        return int(ctx), out, "models list"
+                        return ctx, out, "models list"
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             pass
         root = re.sub(r"/v1$", "", self.base)
@@ -1123,6 +1142,21 @@ class Model:
         except (urllib.error.URLError, OSError, ValueError):
             pass
         return None, None, None
+
+    def list_models(self) -> list[tuple[str, int | None]]:
+        """(id, context window or None) for every model the API offers. HTTP errors are raised."""
+        h = self.headers()
+        if self.api == "anthropic":
+            out, after = [], None
+            while True:
+                page = http_json("GET", f"{self.base}/v1/models?limit=1000"
+                                 + (f"&after_id={urllib.parse.quote(after)}" if after else ""), h, timeout=30)
+                out += [(m["id"], m.get("max_input_tokens")) for m in page.get("data", []) if m.get("id")]
+                if not page.get("has_more") or not page.get("last_id"):
+                    return out
+                after = page["last_id"]
+        listing = http_json("GET", f"{self.base}/models", h, timeout=30)
+        return [(m["id"], listed_context(m)) for m in listing.get("data", []) if m.get("id")]
 
     # --- one request
     def call(self, system: str, messages: list[dict], max_tokens: int, tools=TOOLS,
@@ -1273,6 +1307,7 @@ class Agent:
         self.budget_paused = False
         self.restart_requested = False
         self.limits_requested = False
+        self.models_requested = False
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1492,7 +1527,8 @@ class Agent:
     def poll_input(self, timeout):
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
-        before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested)
+        before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
+                  self.models_requested)
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -1516,7 +1552,8 @@ class Agent:
                 self._take(self.fifo_buf.decode(errors="replace"))
                 self.fifo_buf = b""
             self._drain_queue()
-            if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested) != before:
+            if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
+                  self.models_requested) != before:
                 return
 
     def _drain_queue(self):
@@ -1557,6 +1594,8 @@ class Agent:
             self.save_state("working" if self.working else "idle")
         elif cmd == "/compact":
             self.compact_requested = True   # done between steps, never mid-command
+        elif cmd == "/models":
+            self.models_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/limits":
             self.limits_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/restart":
@@ -2537,6 +2576,9 @@ class Agent:
                 if self.limits_requested:
                     self.limits_requested = False
                     self.refresh_limits("/limits")
+                if self.models_requested:
+                    self.models_requested = False
+                    self.log("hobkin", models_text(self.model))
                 if self.compact_requested and not self.working:
                     self.compact_requested = False
                     self.compact("requested")
@@ -2861,6 +2903,148 @@ def cmd_list():
         print(f"{name:10} {status:8} {services.get(name, ''):18} {st.get('model', '')[:40]:40} {last[0][:60] if last else ''}")
 
 
+def models_text(model: Model) -> str:
+    """What `hobkin models` and /models print: every model the API offers, the current one starred."""
+    try:
+        found = sorted(model.list_models())
+    except urllib.error.HTTPError as e:
+        return f"{model.base} won't list its models (HTTP {e.code})"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return f"can't list the models at {model.base}: {e}"
+    if not found:
+        return f"{model.base} lists no models"
+    k = lambda n: f"{round(n / 1000)}k" if n >= 10000 else str(n)
+    width = min(60, max(len(i) for i, _ in found))
+    lines = [f"{'*' if i == model.model else ' '} {i:<{width}}  {k(ctx) + ' context' if ctx else ''}".rstrip()
+             for i, ctx in found]
+    return f"{len(found)} model{'' if len(found) == 1 else 's'} at {model.base} (* = in use):\n" + "\n".join(lines)
+
+
+def endpoint_model(url: str, model: str, key: str | None, api: str | None) -> Model:
+    """A Model for a bare endpoint (not from config): the API style from --api, else guessed from the URL."""
+    api = api or ("anthropic" if "anthropic.com" in urllib.parse.urlparse(url).netloc else "openai")
+    base = url.rstrip("/")
+    if api == "anthropic":
+        base = re.sub(r"/v1$", "", base)      # Anthropic's paths start with /v1 themselves
+    m = Model(re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-") or "model",
+              {"api": api, "base_url": base, "model": model})
+    m.key = key or ""
+    return m
+
+
+def split_args(argv: list[str], flags: set[str], options: set[str]) -> tuple[list[str], dict]:
+    """Positional arguments, and {flag: True, option: value}."""
+    pos, opts, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in flags:
+            opts[a] = True
+        elif a in options:
+            if i + 1 >= len(argv):
+                sys.exit(f"hobkin: {a} needs a value")
+            opts[a] = argv[i + 1]
+            i += 1
+        elif a.startswith("--"):
+            sys.exit(f"hobkin: unknown option {a}")
+        else:
+            pos.append(a)
+        i += 1
+    return pos, opts
+
+
+def cmd_models(argv):
+    pos, opts = split_args(argv, set(), {"--api"})
+    if pos and pos[0].startswith(("http://", "https://")):
+        return print(models_text(endpoint_model(pos[0], "", pos[1] if len(pos) > 1 else None, opts.get("--api"))))
+    cfg = load_config(os.path.join(HOME, ".none"))
+    name = pos[0] if pos else cfg.get("model") or (next(iter(cfg["models"])) if len(cfg["models"]) == 1 else None)
+    if name not in cfg["models"]:
+        sys.exit(f"hobkin: no model {name!r} in your config (models: {', '.join(cfg['models']) or 'none'})")
+    print(models_text(Model(name, cfg["models"][name])))
+
+
+def cmd_setup(argv):
+    """hobkin URL MODEL [KEY] [--chat] ...: configure the endpoint, start an agent on it, maybe chat."""
+    pos, opts = split_args(argv, {"--chat", "--no-service", "--force"}, {"--id", "--api"})
+    if len(pos) not in (2, 3):
+        sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--id ID] [--api anthropic|openai] [--no-service] [--force]")
+    url, model_id = pos[0], pos[1]
+    key = pos[2] if len(pos) == 3 else None
+    if key is None and sys.stdin.isatty():
+        import getpass
+        key = getpass.getpass("API key (Enter for none): ").strip() or None
+    if opts.get("--api") not in (None, "anthropic", "openai"):
+        sys.exit("hobkin: --api is anthropic or openai")
+    m = endpoint_model(url, model_id, key, opts.get("--api"))
+
+    # Check the key and the model before anything is written
+    try:
+        found = [i for i, _ in m.list_models()]
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            sys.exit(f"hobkin: {m.base} refused the key (HTTP {e.code})")
+        found = None
+        print(f"note: {m.base} won't list its models (HTTP {e.code}), so the model name isn't checked")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        sys.exit(f"hobkin: can't reach {m.base}: {e}")
+    if found is not None and model_id not in found and not opts.get("--force"):
+        near = difflib.get_close_matches(model_id, found, n=5, cutoff=0.4)
+        sys.exit(f"hobkin: {m.base} doesn't offer {model_id!r}"
+                 + (f". Close: {', '.join(near)}" if near else "")
+                 + f". See them all: hobkin models {url}{' KEY' if key else ''}   (--force skips this check)")
+
+    # The endpoint becomes the default model; the key goes in a file only you can read
+    ensure_shared()
+    entry = {"api": m.api, "base_url": m.base, "model": model_id}
+    if key:
+        keys = os.path.join(SHARED, "keys")
+        os.makedirs(keys, mode=0o700, exist_ok=True)
+        os.chmod(keys, 0o700)
+        key_path = os.path.join(keys, f"{m.name}.key")
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key + "\n")
+        os.chmod(key_path, 0o600)
+        entry["key_file"] = key_path
+    path = os.path.join(SHARED, "config.json")
+    try:
+        data = json.loads(read(path) or "{}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"hobkin: {path}: {e} (fix it, or move it away to start fresh)")
+    data.setdefault("models", {})[m.name] = entry
+    before, data["model"] = data.get("model"), m.name
+    write_atomic(path, json.dumps(data, indent=2) + "\n")
+    print(f"model {m.name!r}: {model_id} via {m.base}"
+          + (f", now the default (was {before!r})" if before and before != m.name else ", the default")
+          + f"\n  in {path}" + (f"; key in {entry['key_file']}" if key else ""))
+
+    # A new agent, as a service where there's systemd, else in the background
+    agent_id = valid_id(opts["--id"]) if opts.get("--id") else secrets.token_hex(4)
+    d = os.path.join(HOME, agent_id)
+    if os.path.isdir(d) and is_running(d):
+        sys.exit(f"hobkin: {agent_id} is already running")
+    os.makedirs(d, exist_ok=True)
+    systemd = not opts.get("--no-service") and shutil.which("systemctl") \
+        and systemctl("show-environment").returncode == 0
+    if systemd:
+        cmd_service(["add", agent_id])
+    else:
+        with open(os.path.join(d, "hobkin.log"), "ab") as log:
+            subprocess.Popen([sys.executable, SCRIPT, agent_id], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+        print(f"{agent_id}: started in the background (startup errors go to {os.path.join(d, 'hobkin.log')})")
+    for _ in range(100):
+        if is_running(d) and "up:" in read(os.path.join(d, "out")):
+            break
+        time.sleep(0.2)
+    else:
+        sys.exit(f"hobkin: {agent_id} didn't start:\n" + (read(os.path.join(d, "out"))[-800:]
+                 or read(os.path.join(d, "hobkin.log"))[-800:]))
+    if opts.get("--chat"):
+        return cmd_chat(agent_id)
+    print(f"talk: hobkin chat {agent_id}")
+
+
 def main(argv):
     if argv[:1] in (["-h"], ["--help"], ["help"]):
         print(__doc__)
@@ -2870,6 +3054,10 @@ def main(argv):
         return
     if argv[:1] == ["list"]:
         return cmd_list()
+    if argv[:1] == ["models"]:
+        return cmd_models(argv[1:])
+    if argv and argv[0].startswith(("http://", "https://")):
+        return cmd_setup(argv)
     if argv[:1] == ["service"]:
         return cmd_service(argv[1:])
     if argv[:1] == ["chat"]:

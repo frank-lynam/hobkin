@@ -23,6 +23,33 @@ directly: `python3 hobkin.py`.
 
 ## Quick start
 
+One line, no config editing: the API's URL, the model, your key.
+
+```sh
+pipx install hobkin
+hobkin https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --chat
+```
+
+That:
+- **checks** the key works and the API offers that model (a typo gets the close
+  names back; `--force` skips the check for APIs that don't list their models);
+- **sets it up** as your default model in `~/.hobkins/_shared/config.json`, with the
+  key in `_shared/keys/`, readable only by you. Leave the key out and it asks for it,
+  so it stays out of your shell history; leave it out for a local server with none;
+- **starts a new agent** as a systemd user service (see "Keeping agents running"),
+  or in the background where there's no systemd (or with `--no-service`);
+- with `--chat`, **connects you** to it. Without, it prints how.
+
+The API style comes from the URL (`anthropic.com` is Anthropic's; anything else is
+OpenAI-style: OpenRouter, vLLM, llama.cpp, Ollama's `/v1`, LiteLLM...); `--api`
+overrides it. `--id NAME` names the agent instead of a random id. Run it again with
+another URL or model to add that one and make it the default.
+
+To see what an API offers before choosing: `hobkin models URL [KEY]`; `hobkin models`
+lists your configured model's API, and `/models` does the same in a chat.
+
+The long way:
+
 ```sh
 hobkin                 # a new agent: prints its id, e.g. 7f3a91c2
 hobkin 7f3a91c2        # resume that agent later (its context is kept)
@@ -138,6 +165,7 @@ operator]". A line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
+| `/models` | List the models the agent's API offers (the one in use starred), with their context windows. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
 | `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |
 

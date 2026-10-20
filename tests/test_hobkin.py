@@ -659,6 +659,32 @@ try:
     check("[limits] /limits picks up a changed window", json.load(open(d + "/state.json"))["context_tokens"] == 60000)
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # one-line setup: hobkin URL MODEL KEY --chat (in the background here; CI has no systemd)
+    hs = os.path.join(BASE, "setup")
+    env = {**os.environ, "HOBKIN_HOME": hs}
+    run = lambda *a, **k: subprocess.run([sys.executable, HOB, *a], env=env, capture_output=True, text=True, timeout=60, **k)
+    r = run("models", "http://127.0.0.1:48702/v1", "sk-x")
+    check("[setup] hobkin models lists an endpoint's models", "1 model at http://127.0.0.1:48702/v1" in r.stdout
+          and "fake  100k context" in r.stdout, r.stdout + r.stderr)
+    r = run("http://127.0.0.1:48702/v1", "fakr", "sk-x", "--no-service", "--id", "s1")
+    check("[setup] a model the endpoint doesn't offer is refused, with the close ones", r.returncode != 0
+          and "doesn't offer 'fakr'. Close: fake" in r.stderr and not os.path.exists(hs + "/s1"), r.stderr)
+    r = run("http://127.0.0.1:48702/v1", "fake", "sk-secret", "--no-service", "--id", "s1", "--chat", input="hello setup\n")
+    cfg = json.load(open(hs + "/_shared/config.json"))
+    key_file = cfg["models"]["fake"]["key_file"]
+    check("[setup] configures the endpoint as the default, the key in a file only you can read",
+          cfg["model"] == "fake" and cfg["models"]["fake"]["base_url"] == "http://127.0.0.1:48702/v1"
+          and open(key_file).read().strip() == "sk-secret" and oct(os.stat(key_file).st_mode & 0o777) == "0o600"
+          and "sk-secret" not in open(hs + "/_shared/config.json").read(), cfg)
+    check("[setup] starts the agent and --chat talks to it", r.returncode == 0 and "agent> echo: hello setup" in r.stdout,
+          r.stdout + r.stderr)
+    r = run("chat", "s1", input="/models\n")
+    check("[setup] /models lists them in a chat, the one in use starred", "* fake  100k context" in r.stdout, r.stdout)
+    run("send", "s1", "/stop")
+    for _ in range(50):
+        if json.load(open(hs + "/s1/state.json")).get("status") == "stopped": break
+        time.sleep(0.2)
+
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"heartbeat_seconds": 1, "idle_prompt": None})
