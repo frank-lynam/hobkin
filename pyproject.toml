@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "hobkin"
-description = "Unattended AI agents you run, talk to and inspect through plain files: one process each, no ports, one stdlib-only file."
+description = "An AI agent for austere environments: one stdlib-only Python file, no installs, no open ports. Use it from the command line, or as a worker on hearthboard."
 dynamic = ["version"]   # from hobkin.__version__
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Frank Lynam" }]
 requires-python = ">=3.9"
 dependencies = []
-keywords = ["agent", "llm", "ai", "unattended", "autonomous", "cli", "claude", "openai"]
+keywords = ["agent", "llm", "ai", "unattended", "autonomous", "cli", "claude", "openai", "hearthboard"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

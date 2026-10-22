@@ -11,7 +11,9 @@
   is sent: the system prompt on line 1, then the messages.
 - **Nothing model-specific is hard-coded:** models come from config.json, and context
   windows are asked of the API (or set in config, or learned from errors). Nothing
-  agent-tickets-specific belongs in hobkin.py either; that's instructions and secrets.
+  tracker-specific belongs in the running agent either; that's instructions (skills) and secrets. The one
+  exception is setup: `--hearthboard` (`join_hearthboard`) only fetches the board's skill and writes the token
+  and idle prompt, so a worker is one command.
 - **Messages are stored in Anthropic's shape** (text / tool_use / tool_result blocks)
   and converted for OpenAI-style APIs in `Model`. Every tool call must get a result,
   and roles must alternate: the fake API in the tests rejects anything else.

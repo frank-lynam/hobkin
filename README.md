@@ -1,34 +1,43 @@
 # hobkin
 
-A small unattended agent: one process per agent, run through plain files. A
-hobkin is a little hob, the house spirit that does the chores while the house
-sleeps.
+An AI agent for austere environments: one stdlib-only Python file, no installs,
+no open ports. Use it from the command line, or as a worker on
+[hearthboard](https://github.com/frank-lynam/hearthboard). (A hobkin is a
+little hob, the house spirit that does the chores while the house sleeps.)
 
-- **One file, standard library only.** `hobkin.py`, Python 3.12+. Nothing to install.
-- **No ports.** It listens on nothing; it only makes outgoing calls to the model API.
-- **Files are the interface.** Talk to it with `echo`, watch it with `tail -F`,
-  and see exactly what the model sees with `cat`.
-- **Many per account.** Each agent has its own id and folder, and a lock stops two
-  processes running the same one.
+## Get one running
 
-## Install
+Anywhere with Python 3.9+ (Linux or another POSIX system). Nothing to install:
 
 ```sh
-pipx install hobkin        # or: uv tool install hobkin
+curl -O https://raw.githubusercontent.com/frank-lynam/hobkin/main/hobkin.py
+python3 hobkin.py https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --chat
 ```
 
-That gives you the `hobkin` command. Python 3.9 or newer on Linux (or another
-POSIX system); no dependencies. You can also skip installing and run the file
-directly: `python3 hobkin.py`.
-
-## Quick start
-
-One line, no config editing: the API's URL, the model, your key.
+**As a background service:** leave out `--chat`, and name it if you like. It
+runs as a systemd user service where there is one (in the background where
+there isn't), and keeps running after you log out. Talk to it whenever:
 
 ```sh
-pipx install hobkin
-hobkin https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --chat
+python3 hobkin.py https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --id helper
+python3 hobkin.py chat helper
 ```
+
+**As a hearthboard worker:** add the board's URL and the agent's token. The
+board's Users page shows this line, ready to copy, when you add an agent:
+
+```sh
+python3 hobkin.py https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... \
+  --hearthboard http://board.lan:43917 at_THE_AGENTS_TOKEN
+```
+
+More workers on the same machine reuse the model: `python3 hobkin.py
+--hearthboard http://board.lan:43917 at_ANOTHER_TOKEN`.
+
+Installed rather than copied: `pipx install hobkin` (or `uv tool install
+hobkin`), then the same commands as `hobkin ...`.
+
+## What that does
 
 That:
 - **checks** the key works and the API offers that model (a typo gets the close
@@ -48,7 +57,28 @@ another URL or model to add that one and make it the default.
 To see what an API offers before choosing: `hobkin models URL [KEY]`; `hobkin models`
 lists your configured model's API, and `/models` does the same in a chat.
 
-The long way:
+With `--hearthboard URL TOKEN`, it also checks the token with the board, then:
+- saves the **board's own skill** (`/api/skill`) in `_shared/skills/hearthboard/`,
+  shared by every agent here, so the agent works by the board's current rules;
+- puts **the token** in that agent's `secrets.env` (readable only by you; the
+  model only ever sees it as an environment variable, never in its context);
+- sets its **idle prompt** to the board's wait loop, so it picks up work itself;
+- names the agent after its board user, unless you give `--id`.
+
+Without `URL MODEL KEY` it uses the model you've already set up.
+
+## Why it's built this way
+
+- **One file, standard library only.** `hobkin.py` and Python 3.9+. Nothing to
+  install, so it runs on locked-down servers, containers and old boxes alike.
+- **No ports.** It listens on nothing; it only makes outgoing calls to the
+  model API (and your board, if it has one).
+- **Files are the interface.** Talk to it with `echo`, watch it with `tail -F`,
+  and see exactly what the model sees with `cat`.
+- **Many per account.** Each agent has its own id and folder, and a lock stops
+  two processes running the same one.
+
+## The long way
 
 ```sh
 hobkin                 # a new agent: prints its id, e.g. 7f3a91c2
@@ -126,7 +156,7 @@ or reference files. Install one by copying its folder into
 **`~/.hobkins/_shared/skills/`**, and every agent can use it.
 
 ```
-~/.hobkins/_shared/skills/agent-tickets/SKILL.md
+~/.hobkins/_shared/skills/hearthboard/SKILL.md
 ~/.hobkins/_shared/skills/release/SKILL.md
 ~/.hobkins/_shared/skills/release/build.sh
 ```
@@ -144,17 +174,25 @@ work out where scripts live. Dozens of skills cost a line each.
 
 ## Talking to it
 
-Anything you write to `in` is a message. The agent sees it labelled with who
-sent it and when: set `"operator": "frank"` in `config.json` (use the name people know
-you by, e.g. your tracker username) and it reads `[message from frank, Sat
-2026-10-17 09:12]`, with its system prompt saying who that is; without it,
-`[message from operator, …]`. After a quiet spell it adds how long it's been
-(`; 3d 2h since you last worked`), so Friday's request isn't mistaken for
-today's. Automatic messages are marked and timed too (`[from hobkin: idle
-prompt, …]`, `[Reminder #3 …]`, finished jobs), so the agent never mistakes
-them for you. If it's busy running a command, the
-message is added to the result of that command, marked "[message from
-operator]". A line that is just one of these is a command instead:
+Anything you write to `in` is a message, and the agent is told plainly what to
+do with it, the way a work tracker's API would:
+
+- **When it's free:** `[message from frank, Sat 2026-10-17 09:12: they're
+  talking with you now. Answer them in your reply]`. Set `"operator": "frank"` in
+  `config.json` (the name people know you by, e.g. your tracker username) and
+  its system prompt says who that is; without it, `[message from operator, …]`.
+- **When it's busy:** the message rides along with the result of the command
+  it was running: `[message from frank, …, while you were working: answer it
+  in your next reply, then carry on]`. If it goes on working without a word, it
+  gets one reminder that you're waiting for an answer.
+- **While you're talking with it,** the idle prompt holds off for 5 minutes
+  after each message, so it doesn't wander off between your messages.
+- **After a quiet spell** the label says how long it's been (`; 3d 2h since you
+  last worked`), so Friday's request isn't mistaken for today's.
+
+Automatic messages are marked and timed too (`[from hobkin: idle prompt, …]`,
+`[Reminder #3 …]`, finished jobs), so the agent never mistakes them for you. A
+line that is just one of these is a command instead:
 
 | Command | Effect |
 |---|---|
@@ -497,10 +535,12 @@ nothing extra.
 
 All of it is plain text in hobkin.py and AGENTS.md, so rein it in as you like.
 
-## As an agent-tickets worker
+## As a hearthboard worker
 
-Nothing in hobkin knows about agent-tickets; you give it the instructions and
-the token:
+[Hearthboard](https://github.com/frank-lynam/hearthboard) (formerly
+agent-tickets) is a ticket tracker for agents. `--hearthboard URL TOKEN` (see
+the top) sets an agent up for it in one go; the running agent knows nothing
+about hearthboard beyond the board's skill. By hand, that's:
 
 ```sh
 hobkin                            # note the id, then /stop it (Ctrl-C)
@@ -508,13 +548,13 @@ ID=7f3a91c2 URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
 printf 'AGENT_TICKETS_URL=%s\nAGENT_TICKETS_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
 chmod 600 ~/.hobkins/$ID/secrets.env
 curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \
-  -o ~/.hobkins/_shared/skills/agent-tickets/SKILL.md
-echo '{"idle_prompt": "Run the agent-tickets wait loop (GET /api/wait) and do what it says.", "idle_seconds": 60}' \
+  -o ~/.hobkins/_shared/skills/hearthboard/SKILL.md
+echo '{"idle_prompt": "Run the hearthboard wait loop (GET /api/wait) and do what it says.", "idle_seconds": 60}' \
   > ~/.hobkins/$ID/config.json
 hobkin $ID
 ```
 
-The agent-tickets skill is shared: it reads the token from
+The hearthboard skill is shared: it reads the token from
 `AGENT_TICKETS_TOKEN`, so one copy serves every worker, each with its own
 `secrets.env`. The idle prompt keeps it
 checking for work, and it can also hold `/api/wait` open itself inside a

@@ -61,6 +61,12 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, f"""<html><body onload="document.forms[0].submit()"><noscript>JavaScript is off: press Continue.</noscript>
 <form method="post" action="/sso/acs"><input type="hidden" name="SAMLResponse" value="signed-assertion">
 <input type="hidden" name="RelayState" value="{back}"><input type="submit" value="Continue"></form></body></html>""")
+        if path in ("/board/api/me", "/board/api/skill"):     # a hearthboard, for hobkin --hearthboard
+            if self.headers.get("authorization") != "Bearer hb-good":
+                return self.send(401, json.dumps({"error": "bad token"}), "application/json")
+            if path.endswith("/me"):
+                return self.send(200, json.dumps({"username": "worker.7", "kind": "agent", "guidance": ""}), "application/json")
+            return self.send(200, "---\nname: hearthboard\ndescription: Work with the board\n---\n# Board skill\n", "text/markdown")
         if path == "/ddg":
             return self.send(200, DDG)
         if path == "/ddg-blocked":

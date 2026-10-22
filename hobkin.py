@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""hobkin: one unattended agent per process, driven through plain files.
+"""hobkin: an AI agent for austere environments. One stdlib-only file, no installs, no open
+ports; one unattended agent per process, driven through plain files. Use it from the command
+line, or as a worker on hearthboard.
 
     hobkin URL MODEL [KEY] [--chat]   set up that API and start an agent on it (see below)
+    hobkin [URL MODEL [KEY]] --hearthboard BOARD_URL TOKEN   ...and make it a worker on that board
     hobkin                 start a new agent (prints its id)
     hobkin ID              resume agent ID
     hobkin chat ID         talk to a running agent in this terminal
@@ -21,6 +24,9 @@ _shared/keys/, readable only by you; leave it out to be asked for it), checks th
 exists, starts a new agent as a systemd user service (or in the background where there's
 no systemd), and with --chat connects you to it. Also: --id ID (the agent's id),
 --api anthropic|openai (else guessed from the URL), --no-service, --force (skip the check).
+With --hearthboard BOARD_URL TOKEN it also joins that board: the board's skill, the token in
+the agent's secrets.env, and the board's wait loop as its idle prompt (named after its board
+user unless --id). Leave out URL MODEL KEY to use the model already set up.
 
 (Or run the file directly: python3 hobkin.py ...)
 
@@ -43,7 +49,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 import email.utils
 import base64
@@ -155,8 +161,8 @@ DEFAULT_CONFIG = {
         "client_cert": None,
         "search_url": "https://html.duckduckgo.com/html/",
     },
-    "idle_prompt": ("You're idle. Unacceptable! Grab work from your work sources (your skills say where), "
-                    "or hunt for something useful to do."),
+    "idle_prompt": ("Nothing on? Check your work sources (your skills say where) and grab the next piece of "
+                    "work. Nothing there either: end your turn quietly; you'll be woken when something comes in."),
     "idle_seconds": 60,
     "bash_timeout": 600,       # default seconds per command (an agent can ask for longer)
     "output_limit": 30000,     # characters of command output kept (head + tail)
@@ -233,12 +239,17 @@ in the world, and the second best is grabbing the next one.
   whenever you're woken with nothing specific to do, go there and grab the
   next piece of work. Never reply "what should I do?" while there's somewhere
   to look.
-- A message that isn't a task ("hi", "you there?", "get to work") means: carry
-  on working. Answer in one cheerful line, then go.
-- Nothing in the queue? Hunt. A flaky test, a stale doc, a messy folder, a
+- **When someone talks to you, talk back, then keep going.** Answer what they
+  actually said (ask if it's unclear) in your reply, then carry on with your
+  work: back to your task, or to your work sources if you're between tasks. If
+  they write again, answer that too, straight away: talking with people is part
+  of the job, not a break from it, and it doesn't stop the work either.
+- Nothing in the queue? Hunt where the work lives: your work system, the
+  projects you've been given, your own workspace. A flaky test, a stale doc, a
   missing feature: fix it, or propose it as new work through your work system.
-  Being idle is unacceptable. Only if you truly can't find anything useful,
-  say so in one line where people will see it, and stop until you're woken.
+  Don't go rummaging through folders nobody pointed you at (your home
+  directory, the rest of the machine). Truly nothing useful? Say so in one line
+  where people will see it, and stop until you're woken.
 
 ## Your tools
 
@@ -525,6 +536,8 @@ COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
 LINE_LIMITS = {"MEMORY.md": ("memory", 80), "BLOOPERS.md": ("blooper reel", 30)}
+# After a direct message, idle prompts wait this long: someone's talking with it (the tests shorten it)
+CHAT_QUIET = float(os.environ.get("HOBKIN_CHAT_QUIET", 5 * 60))
 KEEP_DAYS = 30            # old archives (contexts, out logs) and finished jobs' folders are deleted after this
 
 
@@ -533,7 +546,7 @@ KEEP_DAYS = 30            # old archives (contexts, out logs) and finished jobs'
 # Small models skim long instructions but follow a nudge at the moment it applies
 HOT_TAKE = ("[hobkin: a task or an idea? Start your reply with a hot take: one to five stars and your own "
             "reason; if it's a bad idea, laugh and do the better thing. Just a hello or a question? Answer it "
-            "in your reply, no rating, then get back to work.]")
+            "in your reply, no rating, like a person would, then carry on with your work.]")
 
 
 SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
@@ -558,6 +571,9 @@ COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehens
 
 PRUNE = ("[hobkin: your {what} is {n} lines, over its {limit}-line limit. Prune it: keep what still earns its "
          "place, merge repeats, cut what's stale or fixed. Then carry on.]")
+
+
+REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
 
 STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
@@ -690,6 +706,8 @@ def load_config(agent_dir: str) -> dict:
             files.append(path)
     if not files:
         cfg["models"], cfg["model"] = DEFAULT_CONFIG["models"], DEFAULT_CONFIG["model"]
+    if cfg.get("idle_prompt") in OLD_IDLE_PROMPTS:          # an old default nobody edited
+        cfg["idle_prompt"] = DEFAULT_CONFIG["idle_prompt"]
     cfg["_files"] = files
     return cfg
 
@@ -774,12 +792,31 @@ def find_skills(agent_dir: str, extra_dirs=()) -> dict[str, tuple[str, str]]:
     return skills
 
 
+# Earlier defaults (sha256[:16] of each DEFAULT_AGENTS_MD; idle_prompt texts): a shared copy that's
+# exactly one of these was never edited, so it gets the current default. Add the old one when changing either.
+OLD_AGENTS_MD = {"06d8120f260a1520",
+                 "1b7e4666536d399e",
+                 "1d0a1f9294c293f0",
+                 "8576a912f8618e6b",
+                 "8c2c4fe710c94445",
+                 "9aa53e0beef77f77",
+                 "a1359be7fb14033f",
+                 "a175e07eb2ea2a4f",
+                 "b08fd89216256f8c",
+                 "bea84f43ecbc3e0d",
+                 "ca7b3192ccffc008",
+                 "cca240a9cfc4e5a4",
+                 "f72b78431ee15218"}
+OLD_IDLE_PROMPTS = {"You're idle. Unacceptable! Grab work from your work sources (your skills say where), or hunt for something useful to do."}
+
+
 def ensure_shared():
     os.makedirs(os.path.join(SHARED, "skills"), exist_ok=True)
     if not os.path.exists(os.path.join(SHARED, "config.json")):
         write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
-    if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
-        write_atomic(os.path.join(SHARED, "AGENTS.md"), DEFAULT_AGENTS_MD)
+    agents_md = os.path.join(SHARED, "AGENTS.md")
+    if not os.path.exists(agents_md) or hashlib.sha256(read(agents_md).encode()).hexdigest()[:16] in OLD_AGENTS_MD:
+        write_atomic(agents_md, DEFAULT_AGENTS_MD)
 
 
 def is_running(agent_dir):
@@ -1309,6 +1346,9 @@ class Agent:
         self.limits_requested = False
         self.models_requested = False
         self.model_wanted = None           # /model NAME: switched between steps
+        self.owe_reply = False             # a direct message hasn't been answered yet
+        self.reply_nudged = False
+        self.last_direct = 0.0             # when someone last talked to it directly (idle prompts wait)
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.wrap_up_sent = False
         self.voice_sent = False
@@ -1626,6 +1666,7 @@ class Agent:
         if body:
             self.log(self.who, body)
             self.pending.append(body)
+            self.last_direct = time.time()
 
     def command(self, cmd):
         self.log("hobkin", f"command {cmd}")
@@ -2088,8 +2129,12 @@ class Agent:
     def from_operator(self, text: str, busy: bool = False) -> str:
         """A message from the operator as the model sees it: who sent it, and the hot-take hint, unless
         the agent is busy (mid-task) or managing itself (a reminder or job of its own coming)."""
-        hint = "" if busy or self.scheduled() else f"\n{HOT_TAKE}"
-        return f"[message from {self.who}, {self.stamp()}]\n{text}{hint}"
+        self.owe_reply, self.reply_nudged = True, False
+        if busy:
+            return (f"[message from {self.who}, {self.stamp()}, while you were working: answer it in your next "
+                    f"reply, then carry on]\n{text}")
+        hint = "" if self.scheduled() else f"\n{HOT_TAKE}"
+        return f"[message from {self.who}, {self.stamp()}: they're talking with you now. Answer them in your reply]\n{text}{hint}"
 
     def stamp(self) -> str:
         """The time now, for anything that wakes the agent, plus how long it's been when that's a while."""
@@ -2114,9 +2159,27 @@ class Agent:
                 content += "\n" + PRUNE.format(what=what, n=n, limit=limit)
         return content
 
+    def reply_check(self, blocks: list) -> str | None:
+        """After a direct message: once the agent says something, it's answered; if it acts without a word,
+        one reminder that someone's waiting (then it's left alone)."""
+        if not self.owe_reply:
+            return None
+        if any(b.get("type") == "text" and b.get("text", "").strip() for b in blocks):
+            self.owe_reply = False
+            return None
+        if self.reply_nudged:
+            return None
+        self.reply_nudged = True
+        return REPLY_OWED.format(who=self.who)
+
     def turn_end_nudge(self, blocks: list) -> bool:
-        """At the end of a turn: a committee-voiced reply, or the wrap-up check after a working turn.
-        True if a nudge was sent (the agent gets one more step to act on it)."""
+        """At the end of a turn: someone still waiting for an answer, a committee-voiced reply, or the
+        wrap-up check after a working turn. True if a nudge was sent (the agent gets one more step)."""
+        owed = self.reply_check(blocks)
+        if owed:                                    # reply_check sends it at most once per message
+            self.messages.append({"role": "user", "content": [{"type": "text", "text": owed}]})
+            self.save_context()
+            return True
         said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
             return True
@@ -2527,6 +2590,7 @@ class Agent:
             self.save_state()
             return
         self.turn_used_tools = True
+        owed = self.reply_check(blocks)
         results = []
         for b in calls:
             if self.stop:
@@ -2538,6 +2602,8 @@ class Agent:
         # Reminders that came due and operator messages that came in meanwhile ride along
         for text in self.due_events():
             results.append({"type": "text", "text": text})
+        if owed:
+            results.append({"type": "text", "text": owed})
         for text in self.pending:
             results.append({"type": "text", "text": self.from_operator(text, busy=True)})
         self.pending = []
@@ -2643,7 +2709,8 @@ class Agent:
                     continue
                 self.save_state("idle")
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
-                quiet = bool(prompt) and self.scheduled()  # it's set its own next wake-up: no need to nag
+                # No nagging while it's set its own next wake-up, or while someone's talking with it
+                quiet = bool(prompt) and (self.scheduled() or time.time() - self.last_direct < CHAT_QUIET)
                 if quiet:
                     prompt = None
                 wait = max(0.0, idle_since + every - time.time()) if prompt else every if quiet else 3600
@@ -2981,13 +3048,18 @@ def endpoint_model(url: str, model: str, key: str | None, api: str | None) -> Mo
     return m
 
 
-def split_args(argv: list[str], flags: set[str], options: set[str]) -> tuple[list[str], dict]:
-    """Positional arguments, and {flag: True, option: value}."""
+def split_args(argv: list[str], flags: set[str], options: set[str], pairs: set[str] = frozenset()) -> tuple[list[str], dict]:
+    """Positional arguments, and {flag: True, option: value, pair-option: (value, value)}."""
     pos, opts, i = [], {}, 0
     while i < len(argv):
         a = argv[i]
         if a in flags:
             opts[a] = True
+        elif a in pairs:
+            if i + 2 >= len(argv):
+                sys.exit(f"hobkin: {a} needs two values")
+            opts[a] = (argv[i + 1], argv[i + 2])
+            i += 2
         elif a in options:
             if i + 1 >= len(argv):
                 sys.exit(f"hobkin: {a} needs a value")
@@ -3012,11 +3084,69 @@ def cmd_models(argv):
     print(models_text(Model(name, cfg["models"][name])))
 
 
+HEARTHBOARD_IDLE = "Run your hearthboard wait loop (GET /api/wait, as your hearthboard skill says) and do what it says."
+
+
+def hearthboard_user(url: str, token: str) -> dict:
+    """Who a hearthboard token belongs to ({username, kind, ...}), or exit saying why not."""
+    try:
+        return http_json("GET", f"{url}/api/me", {"authorization": f"Bearer {token}"}, timeout=20)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"hobkin: {url} refused that token (HTTP {e.code})" if e.code in (401, 403) else
+                 f"hobkin: {url} answered HTTP {e.code}: is that a hearthboard?")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        sys.exit(f"hobkin: can't reach a hearthboard at {url}: {e}")
+
+
+def join_hearthboard(d: str, url: str, token: str) -> None:
+    """--hearthboard URL TOKEN: the board's own skill (shared by every agent here), this agent's token in its
+    secrets.env (only you can read it; the model never sees it), and an idle prompt that runs the board's
+    wait loop. Nothing else in hobkin knows about hearthboard: the skill carries the board's rules."""
+    req = urllib.request.Request(f"{url}/api/skill", headers={"authorization": f"Bearer {token}", "user-agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        skill = r.read().decode()
+    os.makedirs(os.path.join(SHARED, "skills", "hearthboard"), exist_ok=True)
+    write_atomic(os.path.join(SHARED, "skills", "hearthboard", "SKILL.md"), skill)
+    # Older boards' skills read AGENT_TICKETS_*; newer ones HEARTHBOARD_*
+    env = {"HEARTHBOARD_URL": url, "HEARTHBOARD_TOKEN": token, "AGENT_TICKETS_URL": url, "AGENT_TICKETS_TOKEN": token}
+    path = os.path.join(d, "secrets.env")
+    kept = [l for l in read(path).splitlines() if l.split("=", 1)[0].strip() not in env]
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(kept + [f"{k}={v}" for k, v in env.items()]) + "\n")
+    os.chmod(path, 0o600)
+    cfg_path = os.path.join(d, "config.json")
+    try:
+        cfg = json.loads(read(cfg_path) or "{}")
+    except json.JSONDecodeError:
+        cfg = {}
+    cfg.update({"idle_prompt": HEARTHBOARD_IDLE, "idle_seconds": 60})
+    write_atomic(cfg_path, json.dumps(cfg, indent=2) + "\n")
+
+
 def cmd_setup(argv):
-    """hobkin URL MODEL [KEY] [--chat] ...: configure the endpoint, start an agent on it, maybe chat."""
-    pos, opts = split_args(argv, {"--chat", "--no-service", "--force"}, {"--id", "--api"})
-    if len(pos) not in (2, 3):
-        sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--id ID] [--api anthropic|openai] [--no-service] [--force]")
+    """hobkin URL MODEL [KEY] [--chat] [--hearthboard URL TOKEN] ...: configure the model endpoint, start an
+    agent on it, maybe join it to a hearthboard, maybe chat. With --hearthboard alone, the configured model."""
+    pos, opts = split_args(argv, {"--chat", "--no-service", "--force"}, {"--id", "--api"}, {"--hearthboard"})
+    board = opts.get("--hearthboard")
+    if len(pos) not in (2, 3) and not (board and not pos):
+        sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--hearthboard BOARD_URL TOKEN] [--id ID] "
+                 "[--api anthropic|openai] [--no-service] [--force]\n"
+                 "       hobkin --hearthboard BOARD_URL TOKEN [--id ID] [--chat]   (another agent, on the configured model)")
+    board_user = None
+    if board:                                   # check the token before anything is written
+        board = (board[0].rstrip("/"), board[1])
+        board_user = hearthboard_user(*board)
+        print(f"hearthboard: the token is {board_user.get('kind', '?')} {board_user.get('username')!r} on {board[0]}"
+              + ("" if board_user.get("kind") == "agent" else
+                 ". Agents should each have their own agent user (add one on the board's Users page)"))
+    if pos:
+        configure_model(pos, opts)
+    start_agent(opts, board, board_user)
+
+
+def configure_model(pos, opts):
+    """The URL MODEL [KEY] part: check the endpoint and make it the default model."""
     url, model_id = pos[0], pos[1]
     key = pos[2] if len(pos) == 3 else None
     if key is None and sys.stdin.isatty():
@@ -3067,12 +3197,21 @@ def cmd_setup(argv):
           + (f", now the default (was {before!r})" if before and before != m.name else ", the default")
           + f"\n  in {path}" + (f"; key in {entry['key_file']}" if key else ""))
 
-    # A new agent, as a service where there's systemd, else in the background
-    agent_id = valid_id(opts["--id"]) if opts.get("--id") else secrets.token_hex(4)
+
+def start_agent(opts, board=None, board_user=None):
+    """A new agent (named by --id, else its hearthboard user, else at random), as a service where there's
+    systemd, else in the background; joined to the board if asked; then a chat if asked."""
+    name = opts.get("--id") or re.sub(r"[^A-Za-z0-9_-]+", "-", (board_user or {}).get("username") or "").strip("-")
+    agent_id = valid_id(name) if name else secrets.token_hex(4)
     d = os.path.join(HOME, agent_id)
     if os.path.isdir(d) and is_running(d):
         sys.exit(f"hobkin: {agent_id} is already running")
+    ensure_shared()
     os.makedirs(d, exist_ok=True)
+    if board:
+        join_hearthboard(d, *board)
+        print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (its skill is in "
+              f"{os.path.join(SHARED, 'skills', 'hearthboard')}, its token in {os.path.join(d, 'secrets.env')})")
     systemd = not opts.get("--no-service") and shutil.which("systemctl") \
         and systemctl("show-environment").returncode == 0
     if systemd:
@@ -3105,7 +3244,7 @@ def main(argv):
         return cmd_list()
     if argv[:1] == ["models"]:
         return cmd_models(argv[1:])
-    if argv and argv[0].startswith(("http://", "https://")):
+    if argv and (argv[0].startswith(("http://", "https://")) or "--hearthboard" in argv):
         return cmd_setup(argv)
     if argv[:1] == ["service"]:
         return cmd_service(argv[1:])

@@ -15,8 +15,8 @@ def home(name, model_cfg, extra=None):
     h = os.path.join(BASE, name); os.makedirs(h + "/_shared", exist_ok=True)
     cfg = {"model": "m", "models": {"m": model_cfg}, "idle_seconds": 300, **(extra or {})}
     json.dump(cfg, open(h + "/_shared/config.json", "w")); return h
-def start(h, aid=None):
-    env = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
+def start(h, aid=None, **extra_env):
+    env = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key", **extra_env}
     p = subprocess.Popen([sys.executable, HOB] + ([aid] if aid else []), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     procs.append(p)
     if not aid: aid = p.stdout.readline().strip()
@@ -97,7 +97,7 @@ try:
         wait_for(d, "$> sleep 2"); say(d, "also check the wiki")
         wait_for(d, "Done. Output was: slept")
         last_user = last_results(d)
-        check(f"[{api}] mid-command message added after results", any(re.search(r"\[message from operator, \w+ [\d-]+ [\d:]+\]\nalso check the wiki", b.get("text", "")) for b in last_user["content"]), last_user)
+        check(f"[{api}] mid-command message added after results", any(re.search(r"\[message from operator, \w+ [\d-]+ [\d:]+, while you were working: answer it in your next reply, then carry on\]\nalso check the wiki", b.get("text", "")) for b in last_user["content"]), last_user)
         # stop, queue while stopped, resume
         say(d, "/stop"); p.wait(10)
         check(f"[{api}] /stop exits", p.returncode == 0, p.stderr.read())
@@ -382,8 +382,15 @@ try:
     say(d, "hello there"); wait_for(d, "echo: hello there")
     users = [m for m in ctx(d) if m["role"] == "user"]
     texts = [b.get("text", "") for m in users for b in m["content"]]
-    check("[who] direct messages say who sent them", any(re.match(r"\[message from frank, \w+ [\d-]+ [\d:]+\]\nhello there\n\[hobkin: a task or an idea\?", t) for t in texts), texts)
+    check("[who] direct messages say who sent them", any(re.match(r"\[message from frank, \w+ [\d-]+ [\d:]+: they're talking with you now\. Answer them in your reply\]\nhello there\n\[hobkin: a task or an idea\?", t) for t in texts), texts)
     check("[who] idle prompt is marked automatic", any(re.match(r"\[from hobkin: idle prompt, \w+ [\d-]+ [\d:]+\]\nCheck for new work\.$", t) for t in texts), texts)
+    for _ in range(3):                                   # idle_seconds is 3: they'd fire by now if not paused
+        time.sleep(2)
+    after_hello = open(d + "/out").read().split("frank> hello there")[-1]
+    check("[chat] idle prompts wait while someone's talking with it", "idle prompt" not in after_hello, after_hello[-400:])
+    say(d, "silent-run: echo shh"); wait_for(d, "Done. Output was: shh")
+    check("[chat] acting on a direct message without a word gets one reminder that they're waiting",
+          "frank is waiting for an answer" in json.dumps(last_results(d)), last_results(d))
     check("[who] system prompt names the operator", "Messages that arrive here directly are from frank" in ctx(d)[0]["content"])
     check("[memory] the prompt says memory is a sketch to check", "A sketch of where you were, not the truth" in ctx(d)[0]["content"]
           and "Your memory is the enemy, and you love beating it" in ctx(d)[0]["content"])
@@ -485,7 +492,7 @@ try:
     due = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 7200))
     json.dump({"next_id": 2, "items": [{"id": 1, "message": "later", "due": due, "every": None, "set": due}]},
               open(h + "/quiet1/reminders.json", "w"))
-    p, aid, d = start(h, "quiet1")
+    p, aid, d = start(h, "quiet1", HOBKIN_CHAT_QUIET="1")     # this test isn't about the pause during a chat
     say(d, "run: echo quiet-check"); wait_for(d, "Done. Output was: quiet-check"); time.sleep(4)
     texts = [b.get("text", "") for m in ctx(d) if m["role"] == "user" for b in m["content"]]
     check("[quiet] with a reminder set: no hot take, no wrap-up, no idle nag",
@@ -617,7 +624,7 @@ try:
     say(d, "hello after the weekend"); wait_for(d, "echo: hello after the weekend")
     first = [b["text"] for b in ctx(d)[1]["content"] if b.get("type") == "text"][0]
     check("[time] a message says when, and how long since it last worked", re.match(
-        r"\[message from operator, \w+ [\d-]+ [\d:]+; 3d 2h since you last worked\]\nhello after the weekend", first), first)
+        r"\[message from operator, \w+ [\d-]+ [\d:]+; 3d 2h since you last worked: they're talking with you now\. Answer them in your reply\]\nhello after the weekend", first), first)
     out = open(d + "/out").read()
     check("[fallback] a withdrawn model switches to the next", "refused (404), switching to n2" in out
           and json.load(open(d + "/state.json"))["model"].startswith("n2"), out[-600:])
@@ -691,9 +698,47 @@ try:
     r = run("chat", "s1", input="/model\n")
     check("[model] /model alone lists the configured ones", re.search(r"configured \(\* = in use\):.* fake, \*fake-costly$", r.stdout, re.M), r.stdout)
     run("send", "s1", "/stop")
+    # --hearthboard: join a board (the fake web server plays one); a bad token is refused before anything's written
+    r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-bad", "--no-service")
+    check("[hearthboard] a token the board refuses stops it", r.returncode != 0 and "refused that token (HTTP 401)" in r.stderr,
+          r.stdout + r.stderr)
+    r = run("--hearthboard", "http://127.0.0.1:48790/board/", "hb-good", "--no-service", "--chat", input="hi board\n")
+    ad = hs + "/worker-7"
+    sec = open(ad + "/secrets.env").read() if os.path.exists(ad + "/secrets.env") else ""
+    check("[hearthboard] joins: named after its board user, the board's skill shared, its token private",
+          r.returncode == 0 and "joined http://127.0.0.1:48790/board as worker.7" in r.stdout
+          and open(hs + "/_shared/skills/hearthboard/SKILL.md").read().startswith("---\nname: hearthboard")
+          and "HEARTHBOARD_TOKEN=hb-good" in sec and "HEARTHBOARD_URL=http://127.0.0.1:48790/board" in sec
+          and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
+    check("[hearthboard] on the configured model, with the board's wait loop as its idle prompt",
+          "agent> echo: hi board" in r.stdout and "wait loop" in json.load(open(ad + "/config.json"))["idle_prompt"]
+          and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
+    run("send", "worker-7", "/stop")
+    for _ in range(50):
+        if json.load(open(ad + "/state.json")).get("status") == "stopped": break
+        time.sleep(0.2)
     for _ in range(50):
         if json.load(open(hs + "/s1/state.json")).get("status") == "stopped": break
         time.sleep(0.2)
+
+    # untouched copies of old defaults get the new ones; edited ones are left alone
+    up = os.path.join(BASE, "upgrade"); os.makedirs(up + "/_shared")
+    probe = """
+import hashlib, json, os, sys
+sys.path.insert(0, %r)
+import hobkin
+old = "# How you are\\n(an old default)\\n"
+hobkin.OLD_AGENTS_MD.add(hashlib.sha256(old.encode()).hexdigest()[:16])
+path = os.path.join(hobkin.SHARED, "AGENTS.md")
+open(path, "w").write(old); hobkin.ensure_shared(); upgraded = open(path).read() == hobkin.DEFAULT_AGENTS_MD
+open(path, "w").write(old + "my own rule\\n"); hobkin.ensure_shared(); kept = open(path).read().endswith("my own rule\\n")
+json.dump({"idle_prompt": sorted(hobkin.OLD_IDLE_PROMPTS)[0]}, open(os.path.join(hobkin.SHARED, "config.json"), "w"))
+idle = hobkin.load_config(os.path.join(hobkin.HOME, "x"))["idle_prompt"] == hobkin.DEFAULT_CONFIG["idle_prompt"]
+print(upgraded, kept, idle)
+""" % os.path.join(HERE, "..")
+    r = subprocess.run([sys.executable, "-c", probe], env={**os.environ, "HOBKIN_HOME": up}, capture_output=True, text=True)
+    check("[defaults] an untouched old AGENTS.md and idle prompt are upgraded; an edited AGENTS.md isn't",
+          r.stdout.split() == ["True", "True", "True"], r.stdout + r.stderr)
 
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
