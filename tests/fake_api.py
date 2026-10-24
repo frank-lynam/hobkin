@@ -15,6 +15,8 @@ def flat(content):
 def last_text(blocks):
     return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
 def decide(last_user_texts, tool_results, summary):
+    m = re.search(r"while that is still running:\]\n(.*?)\n\[hobkin: answer them", last_user_texts, re.S)
+    if summary and m: return ("text", "FRONT DESK: still on it, re: " + m.group(1).strip()[:60])
     if summary: return ("text", "SUMMARY: handoff note")
     if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " "))
     t = re.sub(r"(?m)^\[(message from [^\]]*|from hobkin[^\]]*)\]\n", "", last_user_texts)   # sender labels

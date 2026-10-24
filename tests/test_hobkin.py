@@ -194,6 +194,28 @@ try:
         last_user = "".join(b.get("text", "") for b in [m for m in ctx(d) if m["role"] == "user"][-1]["content"])
         check(f"[{api}] answers after compaction, with the message in its context", "agent> echo:" in tail and "still there?" in last_user, tail[-300:])
         p.send_signal(signal.SIGTERM); p.wait(10)
+    # the front desk: a message while a command runs is answered then, the command keeps going, the worker hears it
+    h = home("frontdesk", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    p, aid, d = start(h)
+    say(d, "run: sleep 4; echo slow-done")
+    wait_for(d, "$> sleep 4"); time.sleep(1)
+    say(d, "how's it going?")
+    wait_for(d, "FRONT DESK: still on it, re: how's it going?", 10)
+    wait_for(d, "Done. Output was: slow-done", 15)
+    out = open(d + "/out").read()
+    check("[front desk] answered while the command ran, before it finished", out.index("FRONT DESK") < out.index("\n    slow-done"), out[-600:])
+    worker_sees = json.dumps(last_results(d))
+    check("[front desk] the worker gets the exchange with its command's result", "you answered straight away" in worker_sees
+          and "FRONT DESK: still on it" in worker_sees, worker_sees[-400:])
+    reqs = [json.loads(l)["body"] for l in open(LOG) if '"path": "/v1/messages"' in l]
+    reqs = [r for r in reqs if "/frontdesk/" in json.dumps(r.get("system"))]          # this agent's requests
+    fd = [i for i, r in enumerate(reqs) if "while that is still running" in json.dumps(r["messages"][-1:])]
+    same = fd and len(reqs) > fd[-1] + 1 and reqs[fd[-1]]["messages"][:-1] == reqs[fd[-1] + 1]["messages"][:len(reqs[fd[-1]]["messages"]) - 1]
+    check("[front desk] its request is the worker's conversation plus the message (a local KV cache is reused)", same,
+          [len(r["messages"]) for r in reqs[-3:]])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # context: a budget below the model's window; compaction at good moments; the checklist carried over
     h = home("ctxbudget", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
                            "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000, "compact_early": 0.5})

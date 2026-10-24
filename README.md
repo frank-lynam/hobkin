@@ -196,10 +196,18 @@ do with it, the way a work tracker's API would:
   talking with you now. Answer them in your reply]`. Set `"operator": "frank"` in
   `config.json` (the name people know you by, e.g. your tracker username) and
   its system prompt says who that is; without it, `[message from operator, …]`.
-- **When it's busy:** the message rides along with the result of the command
-  it was running: `[message from frank, …, while you were working: answer it
-  in your next reply, then carry on]`. If it goes on working without a word, it
-  gets one reminder that you're waiting for an answer.
+- **When it's busy running a command** (a build, a test run, a tracker's wait),
+  it answers straight away, while the command keeps going: hobkin asks the model
+  for a short reply with the agent's own conversation so far and your message
+  (the "front desk"). The answer appears in the chat, and the agent gets the whole
+  exchange with its command's result, so a request you made isn't lost. Its
+  request starts exactly like the agent's own, so a local server (llama.cpp,
+  Ollama, vLLM) reuses its KV cache, and it's never sent alongside the agent's
+  own model calls, so one server slot is enough. A message that arrives while
+  the model is mid-reply is answered as soon as that reply is done.
+  `"front_desk": false` turns it off: then the message rides along with the
+  command's result, `[… while you were working: answer it in your next reply,
+  then carry on]`, with one reminder if it goes on working without a word.
 - **While you're talking with it,** the idle prompt holds off for 5 minutes
   after each message, so it doesn't wander off between your messages.
 - **After a quiet spell** the label says how long it's been (`; 3d 2h since you

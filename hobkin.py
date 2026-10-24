@@ -164,6 +164,10 @@ DEFAULT_CONFIG = {
     # Landlock goes; hobkin won't start if it can't sandbox at all). true, or {"network": true} to let
     # commands use the network.
     "safe_mode": False,
+    # Answer messages that arrive while a command runs, straight away, without stopping the work (the
+    # "front desk"): one model call with the worker's own conversation, so a local server's KV cache is
+    # reused, and never alongside the worker's own calls. false: they wait for the command to finish.
+    "front_desk": True,
     # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
     # for one (so an SSO login server in a redirect chain gets it too):
     # {"cert": "~/.certs/me.pem", "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem", "password_file": ...}
@@ -198,7 +202,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "context_budget": (int, type(None)), "skill_dirs": list, "max_output_tokens": int,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
-                "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict)}
+                "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -631,6 +635,15 @@ SAFE_REFUSED = ("Not written: safe mode lets you write only in your workspace ($
 CONTEXT_HALF = ("[hobkin: your context is {pct}% full. Read narrowly from here (grep for what you need, read_file "
                 "with offset and limit, `| tail`), keep your checklist and MEMORY.md current, and finish the step "
                 "you're on: your context will be compacted after it, and the checklist is what carries you over.]")
+
+# The front desk: what the agent is asked when someone writes while one of its commands is still running
+FRONT_DESK = ("[hobkin: {who} just wrote to you, {stamp}, while that is still running:]\n{text}\n[hobkin: answer them "
+              "now, briefly, in plain text: where you are with the work, or the answer if you know it. You can't run "
+              "anything for this reply, and the command keeps going. If it needs work or changes your plan, say "
+              "you'll take it up when this step's done.]")
+STILL_RUNNING = "(still running: not finished yet)"
+FRONT_DESK_DONE = ("[While that ran, {who} wrote and you answered straight away:]\n{who}: {text}\nyou: {reply}\n"
+                   "[If they asked for something, do it now or put it in your checklist.]")
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -1506,6 +1519,7 @@ class Agent:
         self.plan_checked = False
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
+        self.answered = []                 # (who, message, reply) the front desk handled during this step
         self.wrap_up_sent = False
         self.voice_sent = False
         self.pending = []          # operator messages not yet given to the model
@@ -2078,6 +2092,8 @@ class Agent:
             start, reason = time.time(), None
             while proc.poll() is None:
                 self.poll_input(0.5)                 # keep reading the FIFO (commands work mid-run)
+                if self.pending and self.cfg.get("front_desk", True):
+                    self.front_desk()                # answer now; the command keeps running
                 if self.stop:
                     reason = "interrupted: hobkin is stopping"
                 elif self.interrupt:
@@ -2375,6 +2391,45 @@ class Agent:
         """Any skills at all: somewhere work comes from besides the people talking to it here."""
         return bool(find_skills(self.dir, self.cfg.get("skill_dirs") or []))
 
+    def count_cost(self) -> None:
+        """Add the last call's cost (where the API reports it) to today's and all-time spend."""
+        if self.model.last_cost:
+            cost, today = float(self.model.last_cost), time.strftime("%Y-%m-%d")
+            self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + cost, 6)
+            if self.state.get("spend_day") != today:
+                self.state.update({"spend_day": today, "spend_today": 0.0})
+            self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
+            self.model.last_cost = None
+
+    def front_desk(self) -> None:
+        """Messages that came in while a command runs: answer each now, with one model call that has the
+        worker's own conversation up to this point (so a local server's KV cache is reused) and stand-in
+        results for the commands still running. Called from the command-wait loop, so it never overlaps
+        the worker's own model calls. If it can't (rate limit, model down), the message waits as before."""
+        last = self.messages[-1] if self.messages else None
+        calls = [b for b in (last or {}).get("content", []) if b.get("type") == "tool_use"] \
+            if last and last.get("role") == "assistant" else []
+        if not calls or self.model.blocked_until() > time.time() or self.over_budget():
+            return
+        while self.pending:
+            text = self.pending[0]
+            ask = [{"type": "tool_result", "tool_use_id": b["id"], "content": STILL_RUNNING} for b in calls]
+            ask.append({"type": "text", "text": FRONT_DESK.format(who=self.who, stamp=self.stamp(), text=text)})
+            try:
+                blocks, _, _ = self.model.call(self.system_prompt(), self.messages + [{"role": "user", "content": ask}],
+                                               min(self.max_output(), 1000), tool_choice="none")
+            except (ApiError, urllib.error.URLError, OSError, ValueError) as e:
+                self.log("hobkin", f"front desk couldn't answer ({e}); the message waits for this step to finish")
+                return
+            self.count_cost()
+            reply = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+            if not reply:
+                return
+            self.log("agent", reply)
+            self.answered.append((self.who, text, reply))
+            self.pending.pop(0)
+            self.owe_reply = False
+
     def stamp(self) -> str:
         """The time now, for anything that wakes the agent, plus how long it's been when that's a while."""
         gap = time.time() - (self.state.get("last_step") or time.time())
@@ -2622,13 +2677,7 @@ class Agent:
                 self.state["last_step"] = time.time()
                 if used:
                     self.state["last_input_tokens"] = used
-                if self.model.last_cost:
-                    cost, today = float(self.model.last_cost), time.strftime("%Y-%m-%d")
-                    self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + cost, 6)
-                    if self.state.get("spend_day") != today:
-                        self.state.update({"spend_day": today, "spend_today": 0.0})
-                    self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
-                    self.model.last_cost = None
+                self.count_cost()
                 return blocks, stop_reason
             except ApiError as e:
                 if e.status in FATAL_STATUS:
@@ -2914,6 +2963,9 @@ class Agent:
         self.state["last_input_tokens"] = (self.state.get("last_input_tokens") or 0) + len(json.dumps(results)) // 4
         if owed:
             results.append({"type": "text", "text": owed})
+        for who, text, reply in self.answered:     # what the front desk said while the commands ran
+            results.append({"type": "text", "text": FRONT_DESK_DONE.format(who=who, text=text, reply=reply)})
+        self.answered = []
         for text in self.pending:
             results.append({"type": "text", "text": self.from_operator(text, busy=True)})
         self.pending = []
