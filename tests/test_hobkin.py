@@ -100,7 +100,9 @@ try:
         wait_for(d, "$> sleep 2"); say(d, "also check the wiki")
         wait_for(d, "Done. Output was: slept")
         last_user = last_results(d)
-        check(f"[{api}] mid-command message added after results", any(re.search(r"\[message from operator, \w+ [\d-]+ [\d:]+, while you were working: answer it in your next reply, then carry on\]\nalso check the wiki", b.get("text", "")) for b in last_user["content"]), last_user)
+        check(f"[{api}] a message while a command runs: answered then (front desk), and the worker hears it with the result",
+              any("you answered straight away" in b.get("text", "") and "operator: also check the wiki" in b.get("text", "")
+                  and "FRONT DESK: still on it" in b.get("text", "") for b in last_user["content"]), last_user)
         # stop, queue while stopped, resume
         say(d, "/stop"); p.wait(10)
         check(f"[{api}] /stop exits", p.returncode == 0, p.stderr.read())
