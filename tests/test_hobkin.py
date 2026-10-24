@@ -194,6 +194,44 @@ try:
         last_user = "".join(b.get("text", "") for b in [m for m in ctx(d) if m["role"] == "user"][-1]["content"])
         check(f"[{api}] answers after compaction, with the message in its context", "agent> echo:" in tail and "still there?" in last_user, tail[-300:])
         p.send_signal(signal.SIGTERM); p.wait(10)
+    # context: a budget below the model's window; compaction at good moments; the checklist carried over
+    h = home("ctxbudget", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
+                           "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000, "compact_early": 0.5})
+    p, aid, d = start(h)
+    base = json.load(open(d + "/state.json"))
+    say(d, 'call: write_file {"path": "CHECKLIST.md", "content": "# goal\\n- [ ] count\\n- [ ] report\\n"}')
+    wait_for(d, "Created")
+    for _ in range(50):
+        if json.load(open(d + "/state.json")).get("status") == "idle": break
+        time.sleep(0.1)
+    say(d, 'multi-call: [["bash", {"command": "seq 1 9000"}], ["edit_file", {"path": "CHECKLIST.md", "old_text": "- [ ] count", "new_text": "- [x] count"}]]')
+    wait_for(d, "compacted; note", 20)
+    why = "".join(open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive") if n.startswith("out-"))
+    first = ctx(d)[1]["content"][0]["text"]
+    check("[context] the window is capped by context_budget (the model says 100000)", base.get("context_tokens") == 100000)
+    check("[context] a ticked checklist step past half the budget: compacted there, not mid-step",
+          "compacting context (a checklist step is done" in why, why[-400:])
+    check("[context] the checklist goes over word for word", "Your checklist, as it is now" in first and "- [x] count" in first
+          and "- [ ] report" in first, first[:600])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # Between tasks: past half, it compacts while idle, and doesn't wake itself up for it
+    h = home("ctxidle", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
+                         "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000, "compact_early": 0.5,
+                                                     "output_limit": 50000})
+    p, aid, d = start(h)
+    say(d, "run: seq 1 9000")
+    wait_for(d, "compacted; note", 20)
+    why = "".join(open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive") if n.startswith("out-"))
+    for _ in range(50):
+        if json.load(open(d + "/state.json")).get("status") == "idle": break
+        time.sleep(0.1)
+    time.sleep(1)
+    msgs = ctx(d)[1:]
+    check("[context] between tasks it compacts while idle, without waking itself", len(msgs) == 1
+          and "compacting context (a task is done" in why
+          and "nothing in progress" in msgs[0]["content"][0]["text"], [m["role"] for m in msgs])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # skills: shared, overridden per agent, extra dirs from config; listed (not inlined) in the prompt
     extra = os.path.join(BASE, "extra-skills")
     h = home("skills", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},

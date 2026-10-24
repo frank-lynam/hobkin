@@ -19,6 +19,8 @@ def decide(last_user_texts, tool_results, summary):
     if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " "))
     t = re.sub(r"(?m)^\[(message from [^\]]*|from hobkin[^\]]*)\]\n", "", last_user_texts)   # sender labels
     t = re.sub(r"(?m)\n?^\[hobkin: [^\n]*\]$", "", t)                                          # nudges
+    m = re.search(r"multi-call:\s*(\[.*\])\s*$", t, re.S)        # several tool calls in one reply: [[TOOL, {input}], ...]
+    if m: return ("multi", json.loads(m.group(1)))
     m = re.search(r"noplan-call:\s*(\w+)\s+(\{.*\})\s*$", t, re.S)   # a call without saying a plan first
     if m: return ("noplan", (m.group(1), json.loads(m.group(2))))
     m = re.search(r"call:\s*(\w+)\s+(\{.*\})\s*$", t, re.S)      # call: TOOL {json input}
@@ -93,6 +95,10 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"prompt is too long: {size} tokens > {CTX} maximum"}})
             last = msgs[-1]["content"]
             kind, val = decide(last_text(last), [flat(b["content"]) for b in last if b["type"] == "tool_result"], body.get("tool_choice", {}).get("type") == "none")
+            if kind == "multi":
+                content = [{"type": "text", "text": "**What would:** these."}] + [
+                    {"type": "tool_use", "id": f"toolu_{len(msgs)}_{i}", "name": n, "input": inp} for i, (n, inp) in enumerate(val)]
+                return self.send(200, {"content": content, "stop_reason": "tool_use", "usage": {"input_tokens": size}})
             content = [{"type": "text", "text": val}] if kind == "text" else ([] if kind == "silent" else [{"type": "text", "text": "Running it." if kind == "noplan" else "**What would:** running it."}]) + [{"type": "tool_use", "id": f"toolu_{len(msgs)}", "name": val[0], "input": val[1]}]
             return self.send(200, {"content": content, "stop_reason": "tool_use" if kind == "tool" else "end_turn", "usage": {"input_tokens": size}})
         if self.path == "/v1/chat/completions":

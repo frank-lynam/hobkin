@@ -306,7 +306,22 @@ asked again before each compaction, after a "too long" error that doesn't say th
 limit, and on `/limits`.
 `state.json` records where the number came from.
 
-When the conversation passes `compact_at` (80%) of the window, the agent writes
+**Compaction, at good moments.** The window it works within is the model's, capped
+at `context_budget` (100,000 tokens). Models that advertise 1M-token windows get slow,
+expensive and forgetful long before they fill one; `null` uses the model's full window.
+- **Past `compact_early` (half) of the room the conversation has** (the window less
+  the instructions), the agent is told once to read narrowly and keep its checklist
+  current. It's compacted at the next good moment: right after it ticks a step in
+  its `CHECKLIST.md`, or when it finishes a task (that one happens quietly, without
+  waking it).
+- **Past `compact_at` (80%)** it's compacted wherever it is, as a fallback.
+- **A big command output is counted as it arrives,** not after the next request,
+  so one huge output can't blow the window before anything notices.
+- **What carries it over** is its handoff note plus its current checklist, word
+  for word. The note is its own summary; the checklist is the plan, so it picks up
+  at the first unchecked step.
+
+When the conversation is compacted, the agent writes
 itself a handoff note. The conversation is replaced by that note, with the
 newest unanswered message carried over unchanged, and the old conversation goes to
 `archive/` (messages only: the system prompt is rebuilt every turn anyway), along

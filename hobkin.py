@@ -176,7 +176,12 @@ DEFAULT_CONFIG = {
     "idle_seconds": 60,
     "bash_timeout": 600,       # default seconds per command (an agent can ask for longer)
     "output_limit": 30000,     # characters of command output kept (head + tail)
-    "compact_at": 0.8,         # compact when the context passes this share of the window
+    "compact_at": 0.8,         # compact when the context passes this share of the window, wherever it is
+    # Past this share, compact at the next good moment instead: a checklist step ticked, or a task done
+    "compact_early": 0.5,
+    # Treat the window as no bigger than this many tokens: models that advertise huge windows (1M) get
+    # slow, expensive and forgetful long before they're full. null: the model's real window.
+    "context_budget": 100000,
     # Not in a terminal (e.g. a systemd service): print "hobkin ID active: ..." to stdout this often
     # while on duty (working, or idle with a reminder or idle prompt coming). 0 turns it off.
     "heartbeat_seconds": 60,
@@ -189,7 +194,8 @@ DEFAULT_CONFIG = {
 
 CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
-                "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
+                "output_limit": int, "compact_at": (int, float), "compact_early": (int, float),
+                "context_budget": (int, type(None)), "skill_dirs": list, "max_output_tokens": int,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict)}
@@ -621,6 +627,10 @@ GREET = ("[from hobkin: {who} just opened a chat with you, {stamp}. Say hello: i
 SAFE_REFUSED = ("Not written: safe mode lets you write only in your workspace ($HOBKIN_WORK) and your memory "
                 "files, not {path}. If that file needs changing, write a script in $HOBKIN_WORK/for-review/ that "
                 "does it, and ask a human to review and run it.")
+
+CONTEXT_HALF = ("[hobkin: your context is {pct}% full. Read narrowly from here (grep for what you need, read_file "
+                "with offset and limit, `| tail`), keep your checklist and MEMORY.md current, and finish the step "
+                "you're on: your context will be compacted after it, and the checklist is what carries you over.]")
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -1490,6 +1500,9 @@ class Agent:
         self.last_direct = 0.0             # when someone last talked to it directly (idle prompts wait)
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.turn_said = ""                # what the agent has said this turn (for "plan before changing files")
+        self.step_done = False             # a checklist step was just ticked: a good moment to compact
+        self.half_warned = False           # told once per context that it's half full
+        self.idle_compact_tried = False
         self.plan_checked = False
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
@@ -2371,6 +2384,14 @@ class Agent:
         """A tool's result, with any hint for what the agent just did added at the end."""
         if not isinstance(content, str):            # an image result: nothing to add
             return content
+        new_text = str(inp.get("content") if name == "write_file" else inp.get("new_text") or "")
+        if not err and name in ("write_file", "edit_file") and os.path.basename(str(inp.get("path", ""))).lower() \
+                == "checklist.md" and re.search(r"\[[xX]\]", new_text):
+            self.step_done = True                  # a step ticked: compaction, if due, can happen now
+        early = float(self.cfg.get("compact_early") or 1)
+        if not self.half_warned and self.context_share() > early:
+            self.half_warned = True
+            content += "\n" + CONTEXT_HALF.format(pct=round(100 * self.context_share()))
         if name == "bash" and talks_by_echo(str(inp.get("command", ""))):
             content += f"\n{SAY_IT}"                       # talking through echo
         if err and (name != "bash" or re.search(r"exit code 12[67]\b|command not found", content)):
@@ -2645,10 +2666,33 @@ class Agent:
             raise ApiError(0, "stopping")
         self.save_state("working")
 
-    def needs_compaction(self) -> bool:
+    def window(self) -> int | None:
+        """The context the agent works within: the model's window, capped at context_budget."""
         ctx = self.state.get("context_tokens")
+        budget = self.cfg.get("context_budget")
+        return min(ctx, int(budget)) if ctx and budget else (ctx or (int(budget) if budget else None))
+
+    def context_share(self) -> float:
+        """How full the conversation's room is (the window less the instructions), 0 when not known."""
+        ctx = self.window()
+        if not ctx:
+            return 0.0
+        fixed = len(self.system_prompt()) // 4 + 2000
+        return max(0.0, (self.state.get("last_input_tokens") or 0) - fixed) / max(1, ctx - self.max_output() - fixed)
+
+    def needs_compaction(self, share: float | None = None) -> bool:
+        """Past `compact_at` of the window (or, given `share`, past that share of the room the conversation
+        has besides the instructions: compaction can't shrink those, so they don't count toward "half full")."""
+        ctx = self.window()
         used = self.state.get("last_input_tokens") or 0
-        if not ctx or used <= float(self.cfg["compact_at"]) * (ctx - self.max_output()):
+        if not ctx:
+            return False
+        if share is not None:
+            fixed = len(self.system_prompt()) // 4 + 2000            # instructions, tools (about)
+            room = ctx - self.max_output() - fixed
+            if room <= 0 or used - fixed <= share * room:
+                return False
+        elif used <= float(self.cfg["compact_at"]) * (ctx - self.max_output()):
             return False
         if len(self.messages) <= 2:   # nothing left to compact: the instructions themselves are the bulk
             if not self.state.get("warned_small_context"):
@@ -2680,8 +2724,24 @@ class Agent:
             for b in history[start]["content"]]
         return [{"role": "user", "content": first}] + history[start + 1:]
 
-    def compact(self, why: str) -> None:
-        """Replace the conversation with the agent's own summary of it; archive the old one."""
+    def current_checklist(self) -> tuple[str, str] | None:
+        """(path, text) of the checklist the agent's working from: the CHECKLIST.md in its workspace
+        changed most recently, if it changed in this conversation."""
+        newest, since = None, self.state.get("context_started", 0)
+        for root, dirs, files in os.walk(self.work):
+            dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("node_modules", "__pycache__", ".venv")]
+            for f in files:
+                if f.lower() == "checklist.md":
+                    path = os.path.join(root, f)
+                    t = os.path.getmtime(path)
+                    if t >= since and (not newest or t > newest[0]):
+                        newest = (t, path)
+        return (newest[1], read(newest[1])) if newest else None
+
+    def compact(self, why: str, idle: bool = False) -> None:
+        """Replace the conversation with the agent's own summary of it; archive the old one. Its current
+        checklist goes in word for word: that, not the summary, is what it carries on from. `idle`: done
+        between tasks, so the agent isn't woken by it."""
         if not self.messages:
             return
         self.log("hobkin", f"compacting context ({why})")
@@ -2713,10 +2773,17 @@ class Agent:
                 elif b.get("type") == "tool_result":
                     carry.append(f"[Result of your last command]\n{clip(result_text(b['content']), 2000, 1500)}")
         text = (f"[Your context was compacted. Your handoff note (written by you, so check it against the real "
-                f"thing before you trust it):]\n\n{note}\n\n") + (
-            "\n\n".join(carry) if carry else "[Carry on.]")
+                f"thing before you trust it):]\n\n{note}\n\n")
+        checklist = self.current_checklist()
+        if checklist:
+            text += (f"[Your checklist, as it is now ({checklist[0]}): carry on from its first unchecked step.]\n"
+                     f"{clip(checklist[1], 6000, 2000)}\n\n")
+        text += "\n\n".join(carry) if carry else ("[You'd finished; nothing in progress.]" if idle else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
-        archived = self.p(f"archive/context-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+        stamp, n = time.strftime('%Y%m%d-%H%M%S'), 1
+        while os.path.exists(self.p(f"archive/context-{stamp}{'' if n == 1 else f'-{n}'}.jsonl")):
+            n += 1                                           # two compactions in one second keep both
+        archived = self.p(f"archive/context-{stamp}{'' if n == 1 else f'-{n}'}.jsonl")
         # The conversation only: the system prompt is rebuilt every turn, and would only clutter a grep
         write_atomic(archived, "".join(json.dumps(m, ensure_ascii=False) + "\n" for m in self.messages))
         old_log = archived.replace("/context-", "/out-").replace(".jsonl", ".log")
@@ -2727,7 +2794,9 @@ class Agent:
         self.messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
         self.state["compactions"] = self.state.get("compactions", 0) + 1
         self.state["last_input_tokens"] = 0
-        self.working = True
+        self.state["context_started"] = time.time()
+        self.half_warned = False
+        self.working = not idle
         self.save_context()
         self.save_state()
         self.log("hobkin", f"earlier log: {old_log}")
@@ -2776,6 +2845,9 @@ class Agent:
         if self.compact_requested:
             self.compact_requested = False
             self.compact("requested")
+        elif self.step_done and self.needs_compaction(float(self.cfg.get("compact_early") or 1)):
+            self.step_done = False
+            self.compact("a checklist step is done: a good moment")
         elif self.needs_compaction():
             self.refresh_limits("context nearly full")     # it may have grown
             if self.needs_compaction():
@@ -2837,6 +2909,9 @@ class Agent:
         # Reminders that came due and operator messages that came in meanwhile ride along
         for text in self.due_events():
             results.append({"type": "text", "text": text})
+        # Count what just came back (about 4 characters a token) before the next request, so a huge output
+        # is compacted around instead of sent: the API only reports the real number after the fact
+        self.state["last_input_tokens"] = (self.state.get("last_input_tokens") or 0) + len(json.dumps(results)) // 4
         if owed:
             results.append({"type": "text", "text": owed})
         for text in self.pending:
@@ -2942,6 +3017,11 @@ class Agent:
                     idle_since = time.time()
                     self.poll_input(0)
                     continue
+                if not self.idle_compact_tried and len(self.messages) > 2 \
+                        and self.needs_compaction(float(self.cfg.get("compact_early") or 1)):
+                    self.idle_compact_tried = True          # once per turn, even if it fails (no retry loop)
+                    self.compact("a task is done: a good moment", idle=True)   # between tasks, not mid-way
+                    continue
                 self.save_state("idle")
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
                 if prompt == DEFAULT_CONFIG["idle_prompt"] and not self.has_work_system():
@@ -2983,7 +3063,7 @@ class Agent:
 
     def add_user(self, text: str) -> None:
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
-        self.turn_said, self.plan_checked = "", False
+        self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         block = {"type": "text", "text": text}
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages[-1]["content"].append(block)
