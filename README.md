@@ -85,8 +85,8 @@ Without `URL MODEL KEY` it uses the model you've already set up.
 ## The long way
 
 ```sh
-hobkin                 # a new agent: prints its id, e.g. 7f3a91c2
-hobkin 7f3a91c2        # resume that agent later (its context is kept)
+hobkin                 # a new agent: prints its name, e.g. bodkin
+hobkin bodkin          # resume that agent later (its context is kept)
 ```
 
 The first run creates `~/.hobkins/_shared/config.json`. Set your model there (see
@@ -95,7 +95,7 @@ The first run creates `~/.hobkins/_shared/config.json`. Set your model there (se
 Then, from another terminal, chat with it:
 
 ```sh
-hobkin chat 7f3a91c2
+hobkin chat bodkin
 ```
 
 Its replies appear as they come, and each tool call as one line (a command, a file
@@ -105,16 +105,16 @@ output too, as the `out` file has it. Each line you type (or paste) is sent;
 what you're typing (the line is redrawn below it), and you get the usual line
 editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
 ←/→, Ctrl-R to search. Piped, it sends the
-input, prints the reply and exits: `echo "status?" | hobkin chat 7f3a91c2`.
+input, prints the reply and exits: `echo "status?" | hobkin chat bodkin`.
 
 Or with plain files:
 
 ```sh
-echo "Clone https://example.com/repo and get its tests passing" > ~/.hobkins/7f3a91c2/in
-tail -F ~/.hobkins/7f3a91c2/out
+echo "Clone https://example.com/repo and get its tests passing" > ~/.hobkins/bodkin/in
+tail -F ~/.hobkins/bodkin/out
 ```
 
-Run it in the background however you like: `nohup hobkin 7f3a91c2 &`,
+Run it in the background however you like: `nohup hobkin bodkin &`,
 tmux, or a systemd user service.
 
 ## An agent's folder
@@ -549,7 +549,7 @@ about hearthboard beyond the board's skill. By hand, that's:
 
 ```sh
 hobkin                            # note the id, then /stop it (Ctrl-C)
-ID=7f3a91c2 URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
+ID=bodkin URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
 printf 'AGENT_TICKETS_URL=%s\nAGENT_TICKETS_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
 chmod 600 ~/.hobkins/$ID/secrets.env
 curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \

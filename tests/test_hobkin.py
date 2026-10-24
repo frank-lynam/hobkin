@@ -48,6 +48,7 @@ try:
         h = home(api, {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY"})
         p, aid, d = start(h)
         st = json.load(open(d + "/state.json"))
+        check(f"[{api}] a new agent gets a pronounceable name", re.fullmatch(r"[bdfghjlmnprstvz][aeiou][bdglmnprstvz]kin", aid), aid)
         check(f"[{api}] context size from API", st.get("context_tokens") == 100000, st)
         say(d, "run: echo hello > a.txt && cat a.txt && echo FOO=$FOO KEY=${TESTKEY:-unset}")
         wait_for(d, "Done. Output was")

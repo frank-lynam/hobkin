@@ -3263,11 +3263,33 @@ def configure_model(pos, opts):
           + f"\n  in {path}" + (f"; key in {entry['key_file']}" if key else ""))
 
 
+# New agents get a name: consonant, vowel, consonant, "kin" (bodkin, tamkin, lirkin...). No c/k/q/x/y,
+# so every name reads one way; a few stems are left out because the name would read as a slur or a rude
+# word. When nearly all of the ~900 are taken, names get two syllables (bodlirkin).
+NAME_ONSETS, NAME_VOWELS, NAME_CODAS = "bdfghjlmnprstvz", "aeiou", "bdglmnprstvz"
+NAME_SKIP = {"fag", "nig", "nip", "jap", "jiz", "jis", "wog", "wop", "lez", "tit", "pis", "pus", "bum",
+             "fug", "git", "sod", "nob", "rim", "fat", "hos", "hoz", "nad"}
+
+
+def new_agent_id() -> str:
+    """A pronounceable, unused agent id, like "bodkin"."""
+    def stem():
+        while True:
+            s = secrets.choice(NAME_ONSETS) + secrets.choice(NAME_VOWELS) + secrets.choice(NAME_CODAS)
+            if s not in NAME_SKIP:
+                return s
+    for tries in range(400):
+        name = (stem() + (stem() if tries >= 200 else "")) + "kin"
+        if not os.path.exists(os.path.join(HOME, name)):
+            return name
+    return stem() + stem() + stem() + "kin"
+
+
 def start_agent(opts, board=None, board_user=None):
     """A new agent (named by --id, else its hearthboard user, else at random), as a service where there's
     systemd, else in the background; joined to the board if asked; then a chat if asked."""
     name = opts.get("--id") or re.sub(r"[^A-Za-z0-9_-]+", "-", (board_user or {}).get("username") or "").strip("-")
-    agent_id = valid_id(name) if name else secrets.token_hex(4)
+    agent_id = valid_id(name) if name else new_agent_id()
     d = os.path.join(HOME, agent_id)
     if os.path.isdir(d) and is_running(d):
         sys.exit(f"hobkin: {agent_id} is already running")
@@ -3328,9 +3350,7 @@ def main(argv):
         agent_id = valid_id(argv[0])
     else:
         os.makedirs(HOME, exist_ok=True)
-        agent_id = secrets.token_hex(4)
-        while os.path.exists(os.path.join(HOME, agent_id)):
-            agent_id = secrets.token_hex(4)
+        agent_id = new_agent_id()
         print(agent_id, flush=True)
     os.makedirs(os.path.join(HOME, agent_id), exist_ok=True)
     agent = Agent(agent_id)
