@@ -168,6 +168,11 @@ DEFAULT_CONFIG = {
     # "front desk"): one model call with the worker's own conversation, so a local server's KV cache is
     # reused, and never alongside the worker's own calls. false: they wait for the command to finish.
     "front_desk": True,
+    # Another inbox for the front desk, checked over HTTP every `every` seconds while a command runs (set
+    # up by --hearthboard): {"url": ..., "reply": ".../{thread}/messages", "headers": {...}, "every": 15}.
+    # The url returns {"messages": [{"id", "thread", "from", "text", "needs_reply"}]}; replies are POSTed
+    # to `reply` as plain text. ${NAME} in headers comes from secrets.env.
+    "inbox": None,
     # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
     # for one (so an SSO login server in a redirect chain gets it too):
     # {"cert": "~/.certs/me.pem", "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem", "password_file": ...}
@@ -202,7 +207,8 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "context_budget": (int, type(None)), "skill_dirs": list, "max_output_tokens": int,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
-                "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool}
+                "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
+                "inbox": (dict, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -637,13 +643,13 @@ CONTEXT_HALF = ("[hobkin: your context is {pct}% full. Read narrowly from here (
                 "you're on: your context will be compacted after it, and the checklist is what carries you over.]")
 
 # The front desk: what the agent is asked when someone writes while one of its commands is still running
-FRONT_DESK = ("[hobkin: {who} just wrote to you, {stamp}, while that is still running:]\n{text}\n[hobkin: answer them "
+FRONT_DESK = ("[hobkin: {who} just wrote to you{where}, {stamp}, while that is still running:]\n{text}\n[hobkin: answer them "
               "now, briefly, in plain text: where you are with the work, or the answer if you know it. You can't run "
               "anything for this reply, and the command keeps going. If it needs work or changes your plan, say "
               "you'll take it up when this step's done.]")
 STILL_RUNNING = "(still running: not finished yet)"
-FRONT_DESK_DONE = ("[While that ran, {who} wrote and you answered straight away:]\n{who}: {text}\nyou: {reply}\n"
-                   "[If they asked for something, do it now or put it in your checklist.]")
+FRONT_DESK_DONE = ("[While that ran, {who} wrote{where} and you answered straight away{posted}:]\n{who}: {text}\n"
+                   "you: {reply}\n[If they asked for something, do it now or put it in your checklist.]")
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -1519,7 +1525,8 @@ class Agent:
         self.plan_checked = False
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
-        self.answered = []                 # (who, message, reply) the front desk handled during this step
+        self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
+        self.inbox_checked = 0.0
         self.wrap_up_sent = False
         self.voice_sent = False
         self.pending = []          # operator messages not yet given to the model
@@ -2094,6 +2101,10 @@ class Agent:
                 self.poll_input(0.5)                 # keep reading the FIFO (commands work mid-run)
                 if self.pending and self.cfg.get("front_desk", True):
                     self.front_desk()                # answer now; the command keeps running
+                inbox = self.cfg.get("inbox")
+                if inbox and self.cfg.get("front_desk", True) and \
+                        time.time() - self.inbox_checked >= float(inbox.get("every") or 15):
+                    self.check_inbox()
                 if self.stop:
                     reason = "interrupted: hobkin is stopping"
                 elif self.interrupt:
@@ -2401,34 +2412,82 @@ class Agent:
             self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
             self.model.last_cost = None
 
-    def front_desk(self) -> None:
-        """Messages that came in while a command runs: answer each now, with one model call that has the
-        worker's own conversation up to this point (so a local server's KV cache is reused) and stand-in
-        results for the commands still running. Called from the command-wait loop, so it never overlaps
-        the worker's own model calls. If it can't (rate limit, model down), the message waits as before."""
+    def front_desk_reply(self, who: str, text: str, where: str = "") -> str | None:
+        """One front-desk answer: the worker's own conversation up to now (so a local server's KV cache is
+        reused), stand-in results for the commands still running, and the message. Called only from the
+        command-wait loop, so it never overlaps the worker's own model calls. None if it can't answer
+        now (no command running, rate-limited, over budget, model down)."""
         last = self.messages[-1] if self.messages else None
         calls = [b for b in (last or {}).get("content", []) if b.get("type") == "tool_use"] \
             if last and last.get("role") == "assistant" else []
         if not calls or self.model.blocked_until() > time.time() or self.over_budget():
-            return
+            return None
+        ask = [{"type": "tool_result", "tool_use_id": b["id"], "content": STILL_RUNNING} for b in calls]
+        ask.append({"type": "text", "text": FRONT_DESK.format(who=who, where=where, stamp=self.stamp(), text=text)})
+        try:
+            blocks, _, _ = self.model.call(self.system_prompt(), self.messages + [{"role": "user", "content": ask}],
+                                           min(self.max_output(), 1000), tool_choice="none")
+        except (ApiError, urllib.error.URLError, OSError, ValueError) as e:
+            self.log("hobkin", f"front desk couldn't answer ({e}); the message waits for this step to finish")
+            return None
+        self.count_cost()
+        return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip() or None
+
+    def front_desk(self) -> None:
+        """Messages sent here directly while a command runs: answered now (see front_desk_reply)."""
         while self.pending:
-            text = self.pending[0]
-            ask = [{"type": "tool_result", "tool_use_id": b["id"], "content": STILL_RUNNING} for b in calls]
-            ask.append({"type": "text", "text": FRONT_DESK.format(who=self.who, stamp=self.stamp(), text=text)})
-            try:
-                blocks, _, _ = self.model.call(self.system_prompt(), self.messages + [{"role": "user", "content": ask}],
-                                               min(self.max_output(), 1000), tool_choice="none")
-            except (ApiError, urllib.error.URLError, OSError, ValueError) as e:
-                self.log("hobkin", f"front desk couldn't answer ({e}); the message waits for this step to finish")
-                return
-            self.count_cost()
-            reply = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+            reply = self.front_desk_reply(self.who, self.pending[0])
             if not reply:
                 return
             self.log("agent", reply)
-            self.answered.append((self.who, text, reply))
-            self.pending.pop(0)
+            self.answered.append((self.who, self.pending.pop(0), reply, "", ""))
             self.owe_reply = False
+
+    def inbox_request(self, url: str, data: bytes | None = None):
+        """An HTTP request to the inbox, with its headers (${NAME} from secrets.env)."""
+        env = {**os.environ, **load_env_file(os.path.join(SHARED, "secrets.env")), **load_env_file(self.p("secrets.env"))}
+        headers = {k: re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), ""), str(v))
+                   for k, v in ((self.cfg.get("inbox") or {}).get("headers") or {}).items()}
+        headers["user-agent"] = USER_AGENT
+        if data is not None:
+            headers["content-type"] = "text/plain; charset=utf-8"
+        req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.read()
+
+    def check_inbox(self) -> None:
+        """The other inbox (a tracker's chat, say): new messages that need a reply are answered by the front
+        desk while the command runs, and the reply is posted back. Messages that only need reading are left
+        for the agent. Each message is answered once (ids kept in state.json)."""
+        self.inbox_checked = time.time()
+        inbox = self.cfg.get("inbox") or {}
+        try:
+            data = json.loads(self.inbox_request(inbox["url"]) or b"{}")
+        except (KeyError, urllib.error.URLError, OSError, ValueError) as e:
+            if not self.state.get("inbox_warned"):
+                self.state["inbox_warned"] = True
+                self.log("hobkin", f"couldn't check the inbox ({e}); will keep trying")
+            return
+        self.state.pop("inbox_warned", None)
+        seen = self.state.setdefault("inbox_seen", [])
+        for m in (data.get("messages") if isinstance(data, dict) else data) or []:
+            key = f'{m.get("thread")}:{m.get("id")}'
+            if key in seen or m.get("needs_reply") is False:
+                continue
+            where = f' in chat ({m.get("thread_name") or m.get("thread")})'
+            reply = self.front_desk_reply(str(m.get("from") or "someone"), str(m.get("text") or ""), where)
+            if not reply:
+                return                                   # try again at the next check
+            try:
+                self.inbox_request(str(inbox["reply"]).replace("{thread}", str(m.get("thread"))), reply.encode())
+                posted = ", posted there"
+            except (KeyError, urllib.error.URLError, OSError) as e:
+                posted = f" (but posting it failed: {e}; answer there yourself)"
+            self.log("agent", f"(to {m.get('from')}{where}) {reply}")
+            self.answered.append((str(m.get("from")), str(m.get("text")), reply, where, posted))
+            seen.append(key)
+            del seen[:-300]
+            self.save_state()
 
     def stamp(self) -> str:
         """The time now, for anything that wakes the agent, plus how long it's been when that's a while."""
@@ -2963,8 +3022,9 @@ class Agent:
         self.state["last_input_tokens"] = (self.state.get("last_input_tokens") or 0) + len(json.dumps(results)) // 4
         if owed:
             results.append({"type": "text", "text": owed})
-        for who, text, reply in self.answered:     # what the front desk said while the commands ran
-            results.append({"type": "text", "text": FRONT_DESK_DONE.format(who=who, text=text, reply=reply)})
+        for who, text, reply, where, posted in self.answered:     # what the front desk said meanwhile
+            results.append({"type": "text", "text": FRONT_DESK_DONE.format(who=who, text=text, reply=reply,
+                                                                          where=where, posted=posted)})
         self.answered = []
         for text in self.pending:
             results.append({"type": "text", "text": self.from_operator(text, busy=True)})
@@ -3582,7 +3642,10 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
         cfg = json.loads(read(cfg_path) or "{}")
     except json.JSONDecodeError:
         cfg = {}
-    cfg.update({"idle_prompt": HEARTHBOARD_IDLE, "idle_seconds": 60})
+    cfg.update({"idle_prompt": HEARTHBOARD_IDLE, "idle_seconds": 60,
+                # The board's chat, for the front desk: answered while the agent's busy running a command
+                "inbox": {"url": f"{url}/api/chat/inbox?flat=1", "reply": f"{url}/api/chat/{{thread}}/messages",
+                          "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"}, "every": 15}})
     write_atomic(cfg_path, json.dumps(cfg, indent=2) + "\n")
 
 

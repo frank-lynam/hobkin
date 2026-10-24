@@ -888,6 +888,23 @@ try:
               and "read the log in `for-review/logs/` yourself" in open(d + "/context.jsonl").read())
         p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # the front desk and a board's chat (the inbox): a message there is answered during a command, and posted back
+    h = home("inboxdesk", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    os.makedirs(h + "/desk")
+    json.dump({"inbox": {"url": "http://127.0.0.1:48790/board/api/chat/inbox", "reply": "http://127.0.0.1:48790/board/api/chat/{thread}/messages",
+                         "headers": {"Authorization": "Bearer ${BOARD_TOKEN}"}, "every": 1}}, open(h + "/desk/config.json", "w"))
+    open(h + "/desk/secrets.env", "w").write("BOARD_TOKEN=tok-9\n")
+    p, aid, d = start(h, "desk")
+    say(d, "run: sleep 5; echo built"); wait_for(d, "Done. Output was: built", 20)
+    posted = json.loads(urllib.request.urlopen("http://127.0.0.1:48790/board/posted").read())
+    check("[inbox] a board chat message is answered during the command and posted back, once, as text",
+          len(posted) == 1 and posted[0]["path"] == "/board/api/chat/7/messages" and posted[0]["type"].startswith("text/plain")
+          and "FRONT DESK: still on it, re: is the build done?" in posted[0]["body"] and posted[0]["auth"] == "Bearer tok-9", posted)
+    check("[inbox] the worker hears it", "frank wrote in chat (frank) and you answered straight away, posted there"
+          in open(d + "/context.jsonl").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"heartbeat_seconds": 1, "idle_prompt": None})

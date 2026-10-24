@@ -22,6 +22,9 @@ DDG = """<html><body>
 <a class="result__snippet" href="x">A gentle guide to <b>parsing</b>.</a></div></body></html>"""
 
 
+POSTED = []      # replies posted to the board's chat
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -61,6 +64,12 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, f"""<html><body onload="document.forms[0].submit()"><noscript>JavaScript is off: press Continue.</noscript>
 <form method="post" action="/sso/acs"><input type="hidden" name="SAMLResponse" value="signed-assertion">
 <input type="hidden" name="RelayState" value="{back}"><input type="submit" value="Continue"></form></body></html>""")
+        if path == "/board/api/chat/inbox":                  # its chat: one message from a person, until answered
+            msgs = [] if POSTED else [{"id": 5, "thread": 7, "thread_name": "frank", "from": "frank",
+                                       "text": "is the build done?", "needs_reply": True}]
+            return self.send(200, json.dumps({"messages": msgs}), "application/json")
+        if path == "/board/posted":
+            return self.send(200, json.dumps(POSTED), "application/json")
         if path in ("/board/api/me", "/board/api/skill"):     # a hearthboard, for hobkin --hearthboard
             if self.headers.get("authorization") != "Bearer hb-good":
                 return self.send(401, json.dumps({"error": "bad token"}), "application/json")
@@ -75,7 +84,12 @@ class H(BaseHTTPRequestHandler):
         self.send(404, "<html><body>Not found</body></html>")
 
     def do_POST(self):
-        data = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("content-length") or 0)).decode())
+        raw = self.rfile.read(int(self.headers.get("content-length") or 0)).decode()
+        if self.path.startswith("/board/api/chat/"):
+            POSTED.append({"path": self.path, "type": self.headers.get("content-type"), "body": raw,
+                           "auth": self.headers.get("authorization")})
+            return self.send(201, "{}", "application/json")
+        data = urllib.parse.parse_qs(raw)
         if self.path == "/sso/acs" and data.get("SAMLResponse") == ["signed-assertion"]:
             return self.send(302, "", headers={"Location": data.get("RelayState", ["/"])[0], "Set-Cookie": "session=ok; Path=/"})
         self.send(403, "<html><body>Bad login</body></html>")

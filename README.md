@@ -205,6 +205,14 @@ do with it, the way a work tracker's API would:
   Ollama, vLLM) reuses its KV cache, and it's never sent alongside the agent's
   own model calls, so one server slot is enough. A message that arrives while
   the model is mid-reply is answered as soon as that reply is done.
+  **A tracker's chat too:** with an `inbox` in config (`--hearthboard` sets one
+  up), hobkin checks it every 15 seconds while a command runs; a message from a
+  person there is answered the same way and the reply posted back to that
+  conversation. Messages that only need reading (other agents', notes) are left
+  for the agent. Any tracker can work this way: `inbox` is a URL that returns
+  `{"messages": [{"id", "thread", "from", "text", "needs_reply"}]}` and a `reply`
+  URL (`{thread}` filled in) that takes the text as `text/plain`, with headers
+  whose `${NAMES}` come from `secrets.env`.
   `"front_desk": false` turns it off: then the message rides along with the
   command's result, `[… while you were working: answer it in your next reply,
   then carry on]`, with one reminder if it goes on working without a word.
