@@ -554,6 +554,10 @@ HOT_TAKE_CHAT = ("[hobkin: a task or an idea? Start your reply with a hot take: 
                  "it in your reply, no rating, like a person would, and stop there: let them talk. You have no "
                  "work system, so don't go looking for work.]")
 
+FORMATTING = ("# Formatting\n\nPeople read you in a terminal that colours your replies: put file names, paths, "
+              "commands, ids and other names of things in `backticks`, and the key point in **bold**. Use those "
+              "two, not colour codes.")
+
 NO_WORK_SYSTEM = ("# Where your work comes from\n\nYou have no skills, so no work system (no tracker, no queue). "
                   "Your work is what people ask you for here. Do it, report, and then end your turn and wait for "
                   "the next message: never go looking around the machine (your home directory, other folders, "
@@ -1526,6 +1530,7 @@ class Agent:
             text = read(own) if os.path.exists(own) else read(os.path.join(SHARED, n))
             if text.strip():
                 parts.append(text.strip())
+        parts.append(FORMATTING)
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
         if not skills:
             parts.append(NO_WORK_SYSTEM)
@@ -2897,14 +2902,57 @@ def cmd_send(agent_id, text):
 TOOL_WHO = {"$", "=", "job", "reminder"} | {t["name"] for t in TOOLS}
 
 
-def chat_view(lines: list[str], own: str, full: bool, st: dict) -> list[str]:
+# Colour in chat (only on a terminal, and not with NO_COLOR set): who's talking, `code` and file
+# paths in green, **bold**, links underlined, tool calls dimmed, failed commands in red.
+ANSI = {"dim": "\x1b[2m", "bold": "\x1b[1m", "magenta": "\x1b[35m", "green": "\x1b[32m", "blue": "\x1b[34m",
+        "yellow": "\x1b[33m", "red": "\x1b[31m", "under": "\x1b[4m", "off": "\x1b[0m"}
+PATH_RE = re.compile(r"(?<![\w/.:-])(~?/[\w.@+-]+(?:/[\w.@+-]*)*|\.{1,2}/[\w.@+/-]+|[\w-]+(?:/[\w.@+-]+)+"
+                     r"|[\w-]+\.(?:py|js|ts|tsx|jsx|md|json|jsonl|sh|txt|html|css|toml|ya?ml|cfg|ini|log|csv|sql|go|rs|"
+                     r"c|h|cpp|java|kt|rb|php|lock|env|service|timer|png|jpe?g|gif|svg|pdf|zip|gz|tar|apk))(?![\w/])")
+
+
+def paint(text: str) -> str:
+    """A message's text for the terminal: `code` green (backticks dropped), **bold** bold, links
+    underlined, file paths green, # headings bold."""
+    a = ANSI
+    if re.match(r"#{1,4} ", text):
+        return a["bold"] + text.lstrip("# ") + a["off"]
+    out = []
+    for i, part in enumerate(re.split(r"`([^`\n]+)`", text)):
+        if i % 2:
+            out.append(a["green"] + part + a["off"])
+            continue
+        part = re.sub(r"\*\*([^*\n]+)\*\*", lambda m: a["bold"] + m.group(1) + a["off"], part)
+        part = re.sub(r"https?://[^\s)>\]]*[^\s)>\].,;:!?'\"]", lambda m: a["under"] + m.group(0) + a["off"], part)
+        part = re.sub(r"(?<!\x1b\[)" + PATH_RE.pattern,
+                      lambda m: m.group(0) if m.group(0).startswith(("http", "//")) else a["green"] + m.group(0) + a["off"], part)
+        out.append(part)
+    return "".join(out)
+
+
+def paint_header(line: str, who: str, text: str, own: str) -> str:
+    """A log entry's first line ("HH:MM:SS who> text"), coloured by who it's from."""
+    a, clock = ANSI, line[:8]
+    if who == "=":
+        failed = not text.startswith("(exit code 0;")
+        return f'{a["dim"]}{clock}{a["off"]} {a["red"] if failed else a["dim"]}=> {text}{a["off"]}'
+    if who in TOOL_WHO:
+        return f'{a["dim"]}{clock} {who}> {text}{a["off"]}'
+    label = (a["magenta"] + a["bold"]) if who == "agent" else a["yellow"] if who == "hobkin" else (a["blue"] + a["bold"])
+    body = paint(text) if who != "hobkin" else a["dim"] + text + a["off"]
+    return f'{a["dim"]}{clock}{a["off"]} {label}{who}>{a["off"]} {body}'
+
+
+def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False) -> list[str]:
     """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's
     and hobkin's in full, and each tool call as one line, its output hidden (a failed command's
-    status stays). `full` shows everything. `st` carries the current entry between calls."""
+    status stays). `full` shows everything; `color` adds terminal colours. `st` carries the
+    current entry between calls."""
     shown = []
     for line in lines:
         if not line.startswith("    "):
             who, _, text = line[20:].partition("> ")
+            st["who"] = who
             st["mine"] = line[20:].startswith(own)
             if full or who not in TOOL_WHO:
                 st["keep"] = "all"
@@ -2917,8 +2965,14 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict) -> list[str]:
             line = line[11:]                                     # drop the date
             if st["keep"] == "head" and len(line) > 110:
                 line = line[:109] + "…"
+            if color:
+                who_, _, text_ = line[9:].partition("> ")
+                line = paint_header(line, who_, text_, own)
             shown.append(line)
         elif not st.get("mine") and st.get("keep") == "all":
+            if color:
+                who = st.get("who")
+                line = (ANSI["dim"] + line + ANSI["off"]) if who in TOOL_WHO or who == "hobkin" else "    " + paint(line[4:])
             shown.append(line)
     return shown
 
@@ -2938,7 +2992,8 @@ def cmd_chat(agent_id, full=False):
     with open(out_path, "rb") as f:
         raw = f.read().decode(errors="replace").splitlines()
         pos = f.tell()
-    recent = chat_view(raw[-400:], "\0", full, {})[-12:]     # the recent past, your own lines included
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    recent = chat_view(raw[-400:], "\0", full, {}, color)[-12:]     # the recent past, your own lines included
     st = {}
     short = lambda line: line                                  # chat_view has already shaped the lines
 
@@ -2951,7 +3006,7 @@ def cmd_chat(agent_id, full=False):
             chunk = f.read()
         cut = chunk.rfind(b"\n") + 1   # whole lines only
         pos += cut
-        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st)
+        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st, color)
 
     if sys.stdin.isatty():
         return chat_terminal(agent_id, d, fifo, recent, new_lines, short)

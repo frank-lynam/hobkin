@@ -101,7 +101,11 @@ Then, from another terminal, chat with it:
 hobkin chat bodkin
 ```
 
-Its replies appear as they come, and each tool call as one line (a command, a file
+In a terminal it's in colour, so things are easy to find when you scroll back:
+the agent's name in magenta, file names, paths and `code` in green, **bold** in
+bold, links underlined, tool calls dimmed and failed commands in red (agents are
+asked to put names of things in backticks for this). Piped, or with `NO_COLOR`
+set, it's plain text. Its replies appear as they come, and each tool call as one line (a command, a file
 read, a failed exit status), without its output; `hobkin chat ID --full` shows the
 output too, as the `out` file has it. Each line you type (or paste) is sent;
 `/stop` and the other commands work, and Ctrl-D leaves. Output never wipes out

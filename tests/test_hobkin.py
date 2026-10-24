@@ -691,9 +691,18 @@ try:
     r = run("chat", "s1", input="run: echo hidden-out-$((40+2))\n")
     check("[chat] tool calls show as one line, their output hidden", "$> echo hidden-out-$((40+2))" in r.stdout
           and "    hidden-out-42" not in r.stdout and "agent> Done. Output was: hidden-out-42" in r.stdout, r.stdout)
+    check("[chat] piped chat stays plain text (no colour codes)", "\x1b[" not in r.stdout, repr(r.stdout[:200]))
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    import hobkin as hb
+    painted = "\n".join(hb.chat_view(["2026-10-24 10:00:00 agent> **Done.** Fixed `parse()` in tests/a.py, see https://x.io/y.",
+                                       "2026-10-24 10:00:01 => (exit code 1; now in ~/w)"], "frank> ", False, {}, True))
+    check("[chat] colour on a terminal: code and file paths green, bold, links underlined, failures red",
+          "\x1b[32mparse()\x1b[0m" in painted and "\x1b[32mtests/a.py\x1b[0m" in painted and "\x1b[1mDone.\x1b[0m" in painted
+          and "\x1b[4mhttps://x.io/y\x1b[0m." in painted and "\x1b[31m=> (exit code 1" in painted, repr(painted))
     r = run("chat", "s1", "--full", input="run: echo shown-out-$((40+3))\n")
     check("[chat] --full shows tool output too", "    shown-out-43" in r.stdout, r.stdout)
     ctx_s1 = open(hs + "/s1/context.jsonl").read()
+    check("[chat] agents are asked to backtick file names and paths", "put file names, paths, commands, ids" in ctx_s1)
     check("[chat] an agent with no skills is told its work is what people ask, not the machine",
           "You have no skills, so no work system" in ctx_s1 and "don't go looking for work" in ctx_s1, ctx_s1[:300])
     r = run("chat", "s1", input="/model fakr\n")
