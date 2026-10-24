@@ -725,15 +725,16 @@ try:
           and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
     check("[hearthboard] other agents here don't get the board's skill (s1 isn't a worker)",
           "You have no skills, so no work system" in open(hs + "/s1/context.jsonl").read())
-    # A board skill left in _shared/ by 0.2.2 moves into the workers that use it
-    os.makedirs(hs + "/_shared/skills/hearthboard"); os.makedirs(hs + "/old-worker")
-    open(hs + "/_shared/skills/hearthboard/SKILL.md", "w").write("---\nname: hearthboard\ndescription: old\n---\n")
-    open(hs + "/old-worker/secrets.env", "w").write("AGENT_TICKETS_TOKEN=x\n")
-    r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-good", "--no-service", "--id", "worker-8")
-    check("[hearthboard] a shared board skill from 0.2.2 moves into each worker's own skills",
-          not os.path.exists(hs + "/_shared/skills/hearthboard") and os.path.exists(hs + "/old-worker/skills/hearthboard/SKILL.md")
-          and os.path.exists(hs + "/worker-8/skills/hearthboard/SKILL.md"), r.stdout + r.stderr)
-    run("send", "worker-8", "/stop")
+    # A setup on a machine that's already set up changes nothing shared: the new model is that agent's own
+    shared_before = open(hs + "/_shared/config.json").read()
+    r = run("http://127.0.0.1:48702/v1", "fake-costly", "sk-other", "--no-service", "--id", "s2")
+    acfg = json.load(open(hs + "/s2/config.json"))
+    check("[setup] on an existing install, only the new agent gets the model; shared config and keys untouched",
+          r.returncode == 0 and open(hs + "/_shared/config.json").read() == shared_before
+          and acfg["model"] == "fake-costly" and open(acfg["models"]["fake-costly"]["key_file"]).read().strip() == "sk-other"
+          and acfg["models"]["fake-costly"]["key_file"].startswith(hs + "/s2/")
+          and json.load(open(hs + "/s2/state.json"))["model"].startswith("fake-costly"), r.stdout + r.stderr)
+    run("send", "s2", "/stop")
     run("send", "worker-7", "/stop")
     for _ in range(50):
         if json.load(open(ad + "/state.json")).get("status") == "stopped": break
@@ -741,25 +742,6 @@ try:
     for _ in range(50):
         if json.load(open(hs + "/s1/state.json")).get("status") == "stopped": break
         time.sleep(0.2)
-
-    # untouched copies of old defaults get the new ones; edited ones are left alone
-    up = os.path.join(BASE, "upgrade"); os.makedirs(up + "/_shared")
-    probe = """
-import hashlib, json, os, sys
-sys.path.insert(0, %r)
-import hobkin
-old = "# How you are\\n(an old default)\\n"
-hobkin.OLD_AGENTS_MD.add(hashlib.sha256(old.encode()).hexdigest()[:16])
-path = os.path.join(hobkin.SHARED, "AGENTS.md")
-open(path, "w").write(old); hobkin.ensure_shared(); upgraded = open(path).read() == hobkin.DEFAULT_AGENTS_MD
-open(path, "w").write(old + "my own rule\\n"); hobkin.ensure_shared(); kept = open(path).read().endswith("my own rule\\n")
-json.dump({"idle_prompt": sorted(hobkin.OLD_IDLE_PROMPTS)[0]}, open(os.path.join(hobkin.SHARED, "config.json"), "w"))
-idle = hobkin.load_config(os.path.join(hobkin.HOME, "x"))["idle_prompt"] == hobkin.DEFAULT_CONFIG["idle_prompt"]
-print(upgraded, kept, idle)
-""" % os.path.join(HERE, "..")
-    r = subprocess.run([sys.executable, "-c", probe], env={**os.environ, "HOBKIN_HOME": up}, capture_output=True, text=True)
-    check("[defaults] an untouched old AGENTS.md and idle prompt are upgraded; an edited AGENTS.md isn't",
-          r.stdout.split() == ["True", "True", "True"], r.stdout + r.stderr)
 
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},

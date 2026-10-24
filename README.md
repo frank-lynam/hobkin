@@ -42,8 +42,11 @@ hobkin`), then the same commands as `hobkin ...`.
 That:
 - **checks** the key works and the API offers that model (a typo gets the close
   names back; `--force` skips the check for APIs that don't list their models);
-- **sets it up** as your default model in `~/.hobkins/_shared/config.json`, with the
-  key in `_shared/keys/`, readable only by you. Leave the key out and it asks for it,
+- **sets it up**: on a fresh install, as the default model in
+  `~/.hobkins/_shared/config.json`, with the key in `_shared/keys/`, readable only
+  by you. On a machine that's already set up it changes nothing shared: the model
+  and its key go in the new agent's own folder, and your other agents and
+  settings stay as they are. Leave the key out and it asks for it,
   so it stays out of your shell history; leave it out for a local server with none;
 - **starts a new agent** as a systemd user service (see "Keeping agents running"),
   or in the background where there's no systemd (or with `--no-service`);
@@ -51,8 +54,8 @@ That:
 
 The API style comes from the URL (`anthropic.com` is Anthropic's; anything else is
 OpenAI-style: OpenRouter, vLLM, llama.cpp, Ollama's `/v1`, LiteLLM...); `--api`
-overrides it. `--id NAME` names the agent instead of a random id. Run it again with
-another URL or model to add that one and make it the default.
+overrides it. `--id NAME` names the agent instead of a made-up name like `bodkin`. Run it again with
+another URL or model to start another agent on that one.
 
 To see what an API offers before choosing: `hobkin models URL [KEY]`; `hobkin models`
 lists your configured model's API, and `/models` does the same in a chat.

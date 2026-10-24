@@ -23,6 +23,12 @@
   (`PageText`) and follows SSO steps that need no typing; one client certificate
   (`tls_context`) is offered to any site that asks. Anything needing JavaScript or
   a site-specific login belongs in a skill, not hobkin.py.
+- **No auto-updates or migrations.** Never write code that detects an older
+  install and changes its files, configs, services or skills, and no legacy-name
+  fallbacks. Assume a fresh install in an austere environment. Setup commands on
+  a machine that's already set up add to it (the new agent's own folder) and
+  never rewrite what's shared; `service add` won't replace another hobkin's
+  service template without `--force`.
 - **Tests:** `python3 tests/test_hobkin.py` (real processes against
   `tests/fake_api.py`; no key, no cost). Add a check for every behaviour you change.
 - GitHub: `frank-lynam/hobkin` (remote `origin` uses the `github-hobkin` SSH alias). Commit and push finished work.

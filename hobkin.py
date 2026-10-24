@@ -717,8 +717,6 @@ def load_config(agent_dir: str) -> dict:
             files.append(path)
     if not files:
         cfg["models"], cfg["model"] = DEFAULT_CONFIG["models"], DEFAULT_CONFIG["model"]
-    if cfg.get("idle_prompt") in OLD_IDLE_PROMPTS:          # an old default nobody edited
-        cfg["idle_prompt"] = DEFAULT_CONFIG["idle_prompt"]
     cfg["_files"] = files
     return cfg
 
@@ -803,31 +801,12 @@ def find_skills(agent_dir: str, extra_dirs=()) -> dict[str, tuple[str, str]]:
     return skills
 
 
-# Earlier defaults (sha256[:16] of each DEFAULT_AGENTS_MD; idle_prompt texts): a shared copy that's
-# exactly one of these was never edited, so it gets the current default. Add the old one when changing either.
-OLD_AGENTS_MD = {"06d8120f260a1520",
-                 "1b7e4666536d399e",
-                 "1d0a1f9294c293f0",
-                 "8576a912f8618e6b",
-                 "8c2c4fe710c94445",
-                 "9aa53e0beef77f77",
-                 "a1359be7fb14033f",
-                 "a175e07eb2ea2a4f",
-                 "b08fd89216256f8c",
-                 "bea84f43ecbc3e0d",
-                 "ca7b3192ccffc008",
-                 "cca240a9cfc4e5a4",
-                 "f72b78431ee15218"}
-OLD_IDLE_PROMPTS = {"You're idle. Unacceptable! Grab work from your work sources (your skills say where), or hunt for something useful to do."}
-
-
 def ensure_shared():
     os.makedirs(os.path.join(SHARED, "skills"), exist_ok=True)
     if not os.path.exists(os.path.join(SHARED, "config.json")):
         write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
-    agents_md = os.path.join(SHARED, "AGENTS.md")
-    if not os.path.exists(agents_md) or hashlib.sha256(read(agents_md).encode()).hexdigest()[:16] in OLD_AGENTS_MD:
-        write_atomic(agents_md, DEFAULT_AGENTS_MD)
+    if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
+        write_atomic(os.path.join(SHARED, "AGENTS.md"), DEFAULT_AGENTS_MD)
 
 
 def is_running(agent_dir):
@@ -2801,8 +2780,9 @@ def systemctl(*args, check=False):
 
 
 def cmd_service(argv):
+    argv, force = [a for a in argv if a != "--force"], "--force" in argv
     if len(argv) != 2 or argv[0] not in ("add", "remove"):
-        sys.exit("usage: hobkin service add ID | hobkin service remove ID")
+        sys.exit("usage: hobkin service add ID [--force] | hobkin service remove ID")
     action, agent_id = argv[0], valid_id(argv[1])
     if not shutil.which("systemctl") or systemctl("show-environment").returncode != 0:
         sys.exit("hobkin: systemd user services aren't available here (no systemctl, or no user session: "
@@ -2828,6 +2808,12 @@ def cmd_service(argv):
     unit_dir = os.path.expanduser("~/.config/systemd/user")
     template = os.path.join(unit_dir, f"{unit_prefix()}@.service")
     os.makedirs(unit_dir, exist_ok=True)
+    if os.path.exists(template) and read(template) != text and not force:
+        # Every agent's service runs from it: rewriting it would move them all to this hobkin
+        old = re.search(r"^ExecStart=(.*)$", read(template), re.M)
+        sys.exit(f"hobkin: {template} already exists and runs a different hobkin "
+                 f"({old.group(1) if old else '?'}), for every agent's service. Leaving it alone. "
+                 "Run this with that hobkin, or add --force to switch every agent's service to this one.")
     if read(template) != text:
         write_atomic(template, text)
         print(f"wrote {template}")
@@ -3151,11 +3137,9 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
     req = urllib.request.Request(f"{url}/api/skill", headers={"authorization": f"Bearer {token}", "user-agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=20) as r:
         skill = r.read().decode()
-    move_shared_board_skill()
     os.makedirs(os.path.join(d, "skills", "hearthboard"), exist_ok=True)
     write_atomic(os.path.join(d, "skills", "hearthboard", "SKILL.md"), skill)
-    # Older boards' skills read AGENT_TICKETS_*; newer ones HEARTHBOARD_*
-    env = {"HEARTHBOARD_URL": url, "HEARTHBOARD_TOKEN": token, "AGENT_TICKETS_URL": url, "AGENT_TICKETS_TOKEN": token}
+    env = {"HEARTHBOARD_URL": url, "HEARTHBOARD_TOKEN": token}
     path = os.path.join(d, "secrets.env")
     kept = [l for l in read(path).splitlines() if l.split("=", 1)[0].strip() not in env]
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -3169,24 +3153,6 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
         cfg = {}
     cfg.update({"idle_prompt": HEARTHBOARD_IDLE, "idle_seconds": 60})
     write_atomic(cfg_path, json.dumps(cfg, indent=2) + "\n")
-
-
-def move_shared_board_skill() -> None:
-    """0.2.2 kept the board's skill in _shared/skills/, where every agent here saw it, workers or not. Give
-    each worker (an agent with a board token) its own copy, and take the shared one away."""
-    shared = os.path.join(SHARED, "skills", "hearthboard", "SKILL.md")
-    if not os.path.isfile(shared) or skill_header(shared)[0] != "hearthboard":
-        return
-    text = read(shared)
-    for agent in sorted(os.listdir(HOME)):
-        env = load_env_file(os.path.join(HOME, agent, "secrets.env"))
-        own = os.path.join(HOME, agent, "skills", "hearthboard", "SKILL.md")
-        if (env.get("HEARTHBOARD_TOKEN") or env.get("AGENT_TICKETS_TOKEN")) and not os.path.exists(own):
-            os.makedirs(os.path.dirname(own), exist_ok=True)
-            write_atomic(own, text)
-    shutil.rmtree(os.path.dirname(shared), ignore_errors=True)
-    print("moved the hearthboard skill from _shared/skills/ into each worker's own skills/ "
-          "(agents that aren't workers no longer see it)")
 
 
 def cmd_setup(argv):
@@ -3205,13 +3171,20 @@ def cmd_setup(argv):
         print(f"hearthboard: the token is {board_user.get('kind', '?')} {board_user.get('username')!r} on {board[0]}"
               + ("" if board_user.get("kind") == "agent" else
                  ". Agents should each have their own agent user (add one on the board's Users page)"))
+    name = opts.get("--id") or re.sub(r"[^A-Za-z0-9_-]+", "-", (board_user or {}).get("username") or "").strip("-")
+    agent_id = valid_id(name) if name else new_agent_id()
+    d = os.path.join(HOME, agent_id)
+    if os.path.isdir(d) and is_running(d):
+        sys.exit(f"hobkin: {agent_id} is already running")
     if pos:
-        configure_model(pos, opts)
-    start_agent(opts, board, board_user)
+        configure_model(pos, opts, agent_id)
+    start_agent(agent_id, opts, board, board_user)
 
 
-def configure_model(pos, opts):
-    """The URL MODEL [KEY] part: check the endpoint and make it the default model."""
+def configure_model(pos, opts, agent_id):
+    """The URL MODEL [KEY] part: check the endpoint, then make it this agent's model. On a fresh install
+    (no shared config yet) it's also the default for every agent; an existing install's shared config,
+    keys and other agents are never touched: the model and its key go in this agent's own folder."""
     url, model_id = pos[0], pos[1]
     key = pos[2] if len(pos) == 3 else None
     if key is None and sys.stdin.isatty():
@@ -3237,11 +3210,15 @@ def configure_model(pos, opts):
                  + (f". Close: {', '.join(near)}" if near else "")
                  + f". See them all: hobkin models {url}{' KEY' if key else ''}   (--force skips this check)")
 
-    # The endpoint becomes the default model; the key goes in a file only you can read
+    # The key goes in a file only you can read: shared on a fresh install, else the agent's own
+    path = os.path.join(SHARED, "config.json")
+    fresh = not os.path.exists(path)
     ensure_shared()
+    d = os.path.join(HOME, agent_id)
+    os.makedirs(d, exist_ok=True)
     entry = {"api": m.api, "base_url": m.base, "model": model_id}
     if key:
-        keys = os.path.join(SHARED, "keys")
+        keys = os.path.join(SHARED, "keys") if fresh else d
         os.makedirs(keys, mode=0o700, exist_ok=True)
         os.chmod(keys, 0o700)
         key_path = os.path.join(keys, f"{m.name}.key")
@@ -3250,17 +3227,17 @@ def configure_model(pos, opts):
             f.write(key + "\n")
         os.chmod(key_path, 0o600)
         entry["key_file"] = key_path
-    path = os.path.join(SHARED, "config.json")
+    target = path if fresh else os.path.join(d, "config.json")
     try:
-        data = json.loads(read(path) or "{}")
+        data = json.loads(read(target) or "{}")
     except json.JSONDecodeError as e:
-        sys.exit(f"hobkin: {path}: {e} (fix it, or move it away to start fresh)")
+        sys.exit(f"hobkin: {target}: {e}")
     data.setdefault("models", {})[m.name] = entry
-    before, data["model"] = data.get("model"), m.name
-    write_atomic(path, json.dumps(data, indent=2) + "\n")
-    print(f"model {m.name!r}: {model_id} via {m.base}"
-          + (f", now the default (was {before!r})" if before and before != m.name else ", the default")
-          + f"\n  in {path}" + (f"; key in {entry['key_file']}" if key else ""))
+    data["model"] = m.name
+    write_atomic(target, json.dumps(data, indent=2) + "\n")
+    print(f"model {m.name!r}: {model_id} via {m.base}, "
+          + ("the default for every agent here" if fresh else f"for {agent_id} only (your other agents and settings are unchanged)")
+          + f"\n  in {target}" + (f"; key in {entry['key_file']}" if key else ""))
 
 
 # New agents get a name: consonant, vowel, consonant, "kin" (bodkin, tamkin, lirkin...). No c/k/q/x/y,
@@ -3285,14 +3262,10 @@ def new_agent_id() -> str:
     return stem() + stem() + stem() + "kin"
 
 
-def start_agent(opts, board=None, board_user=None):
-    """A new agent (named by --id, else its hearthboard user, else at random), as a service where there's
-    systemd, else in the background; joined to the board if asked; then a chat if asked."""
-    name = opts.get("--id") or re.sub(r"[^A-Za-z0-9_-]+", "-", (board_user or {}).get("username") or "").strip("-")
-    agent_id = valid_id(name) if name else new_agent_id()
+def start_agent(agent_id, opts, board=None, board_user=None):
+    """Start agent `agent_id` (named by --id, else its hearthboard user, else made up), as a service where
+    there's systemd, else in the background; joined to the board if asked; then a chat if asked."""
     d = os.path.join(HOME, agent_id)
-    if os.path.isdir(d) and is_running(d):
-        sys.exit(f"hobkin: {agent_id} is already running")
     ensure_shared()
     os.makedirs(d, exist_ok=True)
     if board:
