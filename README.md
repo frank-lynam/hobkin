@@ -432,6 +432,45 @@ Spend counts only where the API reports each call's cost (OpenRouter does);
 in one account stay apart by convention (their own folders), not by enforcement.
 Use a separate account or container when that matters.
 
+## Safe mode
+
+For a system people depend on: `"safe_mode": true` in an agent's `config.json`
+(or `--safe` on the one-line setup). The agent can read what its account can
+read, but its commands can only write in its workspace, its memory files and its
+job logs, with a private temp folder instead of `/tmp`.
+
+- **It's enforced by the kernel, not by hobkin checking commands.** Each command
+  runs through a small helper that locks itself down with
+  [Landlock](https://docs.kernel.org/userspace-api/landlock.html) and then runs
+  bash. Everything that command starts is locked down too, and it can't be undone
+  from inside. `sudo` won't work either, because nothing locked down can gain
+  privileges. hobkin's own file tools follow the same rule, and the agent can't
+  change its own `config.json` to turn safe mode off.
+- **What's covered depends on the kernel,** checked at start-up and written to the
+  log, to `state.json` and into the agent's instructions:
+
+  | Linux | Landlock | Blocked |
+  |---|---|---|
+  | 5.13+ | v1 | writes outside the workspace |
+  | 6.7+ | v4 | ...and TCP connections (`{"safe_mode": {"network": true}}` allows them) |
+  | 6.12+ | v6 | ...and signals to other processes |
+
+  With no Landlock at all (an older kernel, it's turned off, or a container's
+  security profile blocks it), a safe-mode agent won't start. It never runs
+  unprotected.
+- **Not covered:** reading. Whatever it reads goes to the model provider, so run
+  it as an account that can read only what it should. On kernels below 6.12, also
+  run it as a separate user, so it can't signal your services' processes. Local
+  services reached through socket files (Postgres, Docker) aren't blocked by
+  Landlock either; a separate user without access to them covers that.
+- **How it works with people:** it investigates by reading. When something needs
+  changing, or a command it can't run, it writes a script in
+  `work/for-review/` (what it does, why, and for changes, how to undo them) and
+  asks you to review and run it. The script saves all its output to
+  `work/for-review/logs/`, and gathers plenty while it's there (versions, config,
+  the state before and after), so the agent reads the results itself: you run it
+  and say "done".
+
 ## Reminders
 
 An agent can schedule its own wake-ups: `remind` with `in` ("20m", "2h",

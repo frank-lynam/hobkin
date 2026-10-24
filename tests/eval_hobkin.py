@@ -376,9 +376,36 @@ def fresh_hi(args):
         r.cleanup()
 
 
+def four_steps(args):
+    """A bug to fix: does it say how it works, why it doesn't, and what would, before changing anything?"""
+    r = Run(args, "steps", queue="")
+    try:
+        script = os.path.join(r.q, "count.sh")
+        open(script, "w").write('#!/bin/bash\n# prints how many lines the file given has\nwc -l < "$1" | awk \'{print $1 - 1}\'\n')
+        os.chmod(script, 0o755)
+        open(os.path.join(r.q, "QUEUE.md"), "w").write(f"[ ] {script} prints the wrong number of lines. Fix it.\n")
+        r.say("morning!")
+        r.settle(quiet=25, limit=480)
+        sample = os.path.join(r.home, "sample.txt")
+        open(sample, "w").write("a\nb\nc\n")
+        out = subprocess.run(["bash", script, sample], capture_output=True, text=True, timeout=20).stdout.strip()
+        log = r.read("out")
+        change = re.search(r"^\S+ \S+ (?:write_file|edit_file)> (?!\(not run)(?!.*(?:CHECKLIST|NOTES|MEMORY|BLOOPERS))", log, re.M | re.I)
+        before = log[:change.start()] if change else log
+        said = "\n".join(re.findall(r"^\S+ \S+ agent> (.*(?:\n    .*)*)", before, re.M)).lower()
+        pos = [said.find(h) for h in ("how it works", "why it doesn", "what would")]
+        return {"fixed it": out == "3",
+                "said how it works before changing anything": pos[0] >= 0,
+                "said why it doesn't before changing anything": pos[1] >= 0,
+                "said what would before changing anything": pos[2] >= 0,
+                "in that order": all(x >= 0 for x in pos) and pos == sorted(pos)}
+    finally:
+        r.cleanup()
+
+
 SCENARIOS = {"queue": queue_job, "badidea": bad_idea, "memory": stale_memory, "hello": hello,
              "reading": honest_reading, "slow": slow_command, "chatidle": chat_idle, "chatbusy": chat_busy,
-             "chatpoll": chat_poll, "fresh": fresh_hi}
+             "chatpoll": chat_poll, "fresh": fresh_hi, "steps": four_steps}
 
 
 def main():

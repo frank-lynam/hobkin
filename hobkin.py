@@ -22,7 +22,8 @@ Set up and go in one line (no config editing):
 adds that endpoint to _shared/config.json as the default model (the key goes in
 _shared/keys/, readable only by you; leave it out to be asked for it), checks the model
 exists, starts a new agent as a systemd user service (or in the background where there's
-no systemd), and with --chat connects you to it. Also: --id ID (the agent's id),
+no systemd), and with --chat connects you to it. Also: --id ID (the agent's id), --safe (safe mode:
+it can read, but its commands write only in its workspace; see "safe_mode" in config),
 --api anthropic|openai (else guessed from the URL), --no-service, --force (skip the check).
 With --hearthboard BOARD_URL TOKEN it also joins that board: the board's skill, the token in
 the agent's secrets.env, and the board's wait loop as its idle prompt (named after its board
@@ -49,10 +50,11 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 
 import email.utils
 import base64
+import ctypes
 import errno
 import difflib
 import fcntl
@@ -67,6 +69,7 @@ import re
 import secrets
 import select
 import shlex
+import struct
 import shutil
 import ssl
 import signal
@@ -86,6 +89,7 @@ import urllib.request
 #   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
 #   helpers       time and text helpers, files
 #   config        config.json, warnings, secrets, skills, the shared folder, the lock
+#   safe mode     Landlock: commands write only in the workspace, no TCP, no signals (what the kernel allows)
 #   web           pages as text, client certificates, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
 #   agent         the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
@@ -154,6 +158,11 @@ DEFAULT_CONFIG = {
     "alert_command": None,
     # Pause for the day once this much is spent (where the API reports cost, e.g. OpenRouter)
     "daily_budget_usd": None,
+    # Safe mode, for systems people depend on: the agent's commands can read but only write in its
+    # workspace, and can't open network connections or signal other processes (as far as this kernel's
+    # Landlock goes; hobkin won't start if it can't sandbox at all). true, or {"network": true} to let
+    # commands use the network.
+    "safe_mode": False,
     # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
     # for one (so an SSO login server in a redirect chain gets it too):
     # {"cert": "~/.certs/me.pem", "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem", "password_file": ...}
@@ -182,7 +191,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "output_limit": int, "compact_at": (int, float), "skill_dirs": list, "max_output_tokens": int,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
-                "fallback_models": list, "alert_command": (str, type(None))}
+                "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict)}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -309,22 +318,30 @@ in the world, and the second best is grabbing the next one.
    one to five stars (★★★☆☆ is three), and your own reason in your own words.
    A greeting or a question isn't a task, so no rating. Then do the task (or the
    better version of it, and say so).
-2. **Understand it.** Write the goal in one sentence. If details are missing,
-   look for them: in the task, the files, the tracker, the wiki. Still
-   missing? Pick the most reasonable assumption, write it in `NOTES.md`, and
-   charge on. Mention it in your report.
-3. **Make a folder** for the task in your workspace, with a short clear name,
+2. **Make a folder** for the task in your workspace, with a short clear name,
    and go into it: `mkdir -p $HOBKIN_WORK/fix-login && cd $HOBKIN_WORK/fix-login`.
    Everything for the task goes in it. Work from inside it.
-4. **Write a checklist** in that folder, `CHECKLIST.md`, before doing the work:
-   the goal at the top, then small steps as `- [ ]` lines. Each step should be
-   something you can check. End with "verify the result" and "tidy up".
-5. **Work through the list in order, one step at a time.** After each step,
-   check that it really worked, then mark it `- [x]` in the file. If you find
-   more work, add steps. Never mark a step done that you haven't checked.
-6. **Verify the whole result** at the end: run the tests, run the program, look
-   at the output. "It should work" is not done. "I ran it and it printed 377"
-   is done.
+
+Then four steps, each one said out loud in your reply before you start the
+next, so whoever's watching can follow your thinking (and stop you if you're
+off track; don't wait for them, though):
+
+3. **How it works.** Look at the real thing: read the code, run it, see what
+   it actually does. Then say **How it works:** what you looked at and what you
+   saw. Details missing? Look for them (the task, the files, the tracker, the
+   wiki); still missing, pick the most reasonable assumption and say so.
+4. **Why it doesn't** do the thing it should: say **Why it doesn't:** in one or
+   two sentences, with the evidence (the file and line, the output, the error).
+   For new work, what's missing. Not sure yet? Look more; never guess a cause
+   and then fix the guess.
+5. **What would.** Say **What would:** what would make it do the thing, which
+   files and commands you'll change, and how you'll check it worked. Write it
+   in `CHECKLIST.md` in the task folder as small `- [ ]` steps, each one you
+   can check, ending with "verify the result" and "tidy up".
+6. **Make it do the thing**, one checklist step at a time. After each step,
+   check it really worked, then mark it `- [x]`. Found more work? Add steps.
+   Then verify the whole result: run the tests, run the program, look at the
+   output. "It should work" is not done; "I ran it and it printed 377" is done.
 7. **Tidy up and report** (see "Finishing a task"), then grab the next task.
 
 Keep MEMORY.md pointing at your current task, for example:
@@ -531,7 +548,7 @@ shopt -s expand_aliases
 
 
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits",
-            "/models", "/model")
+            "/models", "/model", "/hello")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
@@ -587,6 +604,22 @@ COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehens
 PRUNE = ("[hobkin: your {what} is {n} lines, over its {limit}-line limit. Prune it: keep what still earns its "
          "place, merge repeats, cut what's stale or fixed. Then carry on.]")
 
+
+PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: **How it works:** what you "
+              "looked at and saw; **Why it doesn't:** do the thing, with the evidence; **What would:** make it do "
+              "the thing, and how you'll check. Then make this change.")
+
+# Files that are part of planning (or memory), not the work: always writable
+PLANNING_FILES = {"checklist.md", "notes.md", "memory.md", "bloopers.md"}
+
+# What the agent gets when someone opens `hobkin chat` in a terminal
+GREET = ("[from hobkin: {who} just opened a chat with you, {stamp}. Say hello: introduce yourself by name "
+         "(you're {name}) and say in a line what you're up to. Then wait for them; if you were in the middle "
+         "of something, carry on with it.]")
+
+SAFE_REFUSED = ("Not written: safe mode lets you write only in your workspace ($HOBKIN_WORK) and your memory "
+                "files, not {path}. If that file needs changing, write a script in $HOBKIN_WORK/for-review/ that "
+                "does it, and ask a human to review and run it.")
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -827,6 +860,117 @@ def is_running(agent_dir):
         return True
     finally:
         os.close(fd)
+
+
+# ---- safe mode: Landlock, so commands write only in the workspace, with no TCP and no signals out
+#
+# Landlock is a Linux security module any process can use, unprivileged, to restrict itself and every
+# process it starts, for good. Each command runs through a small helper (`hobkin.py __sandbox ...`):
+# it restricts itself, then becomes bash. What's covered depends on the kernel's Landlock version:
+# 1+ file writes (5.13), 2 renames across folders, 3 truncation (6.2), 4 TCP connect/bind (6.7),
+# 6 signals and abstract unix sockets (6.12). hobkin asks at start-up and won't run without at least 1.
+
+LL_SYSCALLS = (444, 445, 446)          # landlock_create_ruleset, _add_rule, _restrict_self (all arches but alpha)
+LL_WRITES = ((1 << 1) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9)   # write, rm dir/file, mknod..
+             | (1 << 10) | (1 << 11) | (1 << 12))                                          # ..fifo, block, symlink
+LL_REFER, LL_TRUNCATE, LL_WRITE_FILE = 1 << 13, 1 << 14, 1 << 1
+LL_NET_TCP = 1 | 2                      # bind, connect
+LL_SCOPE = 1 | 2                        # abstract unix sockets, signals
+
+
+def _libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    return libc
+
+
+def landlock_abi() -> int:
+    """The kernel's Landlock version, or 0 if there's none (not Linux, too old, or turned off)."""
+    if not sys.platform.startswith("linux"):
+        return 0
+    try:
+        abi = _libc().syscall(ctypes.c_long(LL_SYSCALLS[0]), None, ctypes.c_size_t(0), ctypes.c_uint32(1))
+    except (OSError, AttributeError):
+        return 0
+    return max(0, int(abi))
+
+
+def safe_coverage(abi: int, network: bool) -> str:
+    """What safe mode covers on this kernel, in a sentence (for the log, state.json and the agent)."""
+    got = ["file writes outside the workspace"]
+    if abi >= 4 and not network:
+        got.append("network (TCP) connections")
+    if abi >= 6:
+        got.append("signals to other processes")
+    missing = ([] if abi >= 4 or network else ["network connections (needs Linux 6.7)"]) + \
+              ([] if abi >= 6 else ["signals to other processes (needs Linux 6.12)"])
+    return (f"Landlock v{abi} blocks: " + ", ".join(got) + "."
+            + (f" Not blocked on this kernel: {', '.join(missing)}." if missing else "")
+            + (" Network allowed by config." if network else ""))
+
+
+def sandbox_self(spec: dict) -> None:
+    """Restrict this process (and all it starts) to writing in spec["dirs"] and spec["files"]; no TCP unless
+    spec["network"]; no signals out (as far as the kernel's Landlock goes). Irreversible."""
+    abi = landlock_abi()
+    if not abi:
+        raise OSError("Landlock isn't available")
+    libc = _libc()
+    fs = LL_WRITES | (LL_REFER if abi >= 2 else 0) | (LL_TRUNCATE if abi >= 3 else 0)
+    net = LL_NET_TCP if abi >= 4 and not spec.get("network") else 0
+    scoped = LL_SCOPE if abi >= 6 else 0
+    attr = struct.pack("=QQQ", fs, net, scoped)[: 8 if abi < 4 else 16 if abi < 6 else 24]
+    buf = ctypes.create_string_buffer(attr, len(attr))
+    ruleset = libc.syscall(ctypes.c_long(LL_SYSCALLS[0]), buf, ctypes.c_size_t(len(attr)), ctypes.c_uint32(0))
+    if ruleset < 0:
+        raise OSError(ctypes.get_errno(), "landlock_create_ruleset failed")
+    file_rights = LL_WRITE_FILE | (LL_TRUNCATE if abi >= 3 else 0)
+    for path, rights in [(d, fs) for d in spec.get("dirs", [])] + [(f, file_rights) for f in spec.get("files", [])]:
+        try:
+            fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        except OSError:
+            continue                                     # not there (yet): nothing to allow
+        rule = ctypes.create_string_buffer(struct.pack("=Qi", rights, fd), 12)
+        ok = libc.syscall(ctypes.c_long(LL_SYSCALLS[1]), ctypes.c_int(ruleset), ctypes.c_int(1), rule, ctypes.c_uint32(0))
+        os.close(fd)
+        if ok < 0:
+            raise OSError(ctypes.get_errno(), f"landlock_add_rule failed for {path}")
+    if libc.prctl(38, 1, 0, 0, 0) != 0:                  # PR_SET_NO_NEW_PRIVS: no setuid way out (sudo)
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
+    if libc.syscall(ctypes.c_long(LL_SYSCALLS[2]), ctypes.c_int(ruleset), ctypes.c_uint32(0)) < 0:
+        raise OSError(ctypes.get_errno(), "landlock_restrict_self failed")
+    os.close(ruleset)
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (4 << 30, 4 << 30))   # no single file over 4 GB
+
+
+def run_sandboxed(argv: list[str]) -> None:
+    """`hobkin.py __sandbox CMD...`: restrict this process as $HOBKIN_SANDBOX says, then become CMD."""
+    try:
+        sandbox_self(json.loads(os.environ.pop("HOBKIN_SANDBOX")))
+    except (OSError, KeyError, ValueError) as e:
+        sys.exit(f"hobkin: safe mode couldn't sandbox this command ({e}); not running it")
+    os.execvp(argv[0], argv)
+
+
+SAFE_MODE = ("# Safe mode\n\nYou're on a system people depend on, so you're in safe mode. You can read what your "
+             "account can read, but your commands can only write in your workspace ($HOBKIN_WORK) and your memory "
+             "files. {coverage} Don't try to change anything else, and never look for a way around this.\n\n"
+             "Work it out by reading: logs, configs, code, read-only commands. When something has to change, or a "
+             "command needs more than you're allowed (restarting a service, editing a config, a query that writes, "
+             "anything over the network), write it as a script for a human: in `$HOBKIN_WORK/for-review/`, named "
+             "for what it does (`01-check-disk.sh`, `02-restart-api.sh`), with a comment at the top saying what it "
+             "does and why. A script that changes something also says what it changes and how to undo it. Read-only "
+             "checks come first.\n\n"
+             "Every such script saves everything it prints to a log you can read afterwards: start it with "
+             "`exec > >(tee \"$(dirname \"$0\")/logs/$(basename \"$0\" .sh)-$(date +%Y%m%d-%H%M%S).log\") 2>&1` "
+             "(after `mkdir -p \"$(dirname \"$0\")/logs\"`). Make the trip worth it: have it gather plenty "
+             "(versions, the relevant config, timestamps, the state before and after a change, the last lines of "
+             "the logs that matter), with an echo line saying what each part is. Then say in your reply which "
+             "script, what it's for, and ask the person to review and run it and tell you when it's done; read the "
+             "log in `for-review/logs/` yourself rather than asking them to paste it. That's how you fix things "
+             "here: you work out what's wrong and what would fix it; they run it; the logs bring the results back.")
 
 
 # ---- web: pages as text, client certificates, SSO, search (for fetch_url, web_search)
@@ -1344,6 +1488,10 @@ class Agent:
         self.reply_nudged = False
         self.last_direct = 0.0             # when someone last talked to it directly (idle prompts wait)
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
+        self.turn_said = ""                # what the agent has said this turn (for "plan before changing files")
+        self.plan_checked = False
+        self.greet_wanted = False          # someone opened `hobkin chat`: say hello
+        self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.wrap_up_sent = False
         self.voice_sent = False
         self.pending = []          # operator messages not yet given to the model
@@ -1399,6 +1547,7 @@ class Agent:
             sys.exit(f"hobkin: {msg}")
         self.state = self.load_state()
         self.state.update({"id": self.id, "pid": os.getpid(), "model": self.model.describe()})
+        self.setup_safe_mode()
         self.state.setdefault("created", now())
         self.messages = self.load_context()
         self.discover_limits()
@@ -1410,6 +1559,64 @@ class Agent:
         self.log("hobkin", f"{self.id} up: {self.model.describe()}, context "
                  f"{self.state.get('context_tokens') or 'unknown'} ({self.state.get('context_source') or 'will learn from errors'})")
         self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
+
+    def setup_safe_mode(self) -> None:
+        """Safe mode: check the kernel can sandbox (and that it really does, here), or refuse to start."""
+        conf = self.cfg.get("safe_mode")
+        self.safe = None
+        if not conf:
+            self.state.pop("safe_mode", None)
+            return
+        network = isinstance(conf, dict) and bool(conf.get("network"))
+        abi = landlock_abi()
+        if not abi:
+            msg = ("safe mode needs Landlock (Linux 5.13 or later, with landlock among the kernel's security "
+                   "modules), and it isn't available here, so this agent won't start. Run it on a system that has "
+                   "it, as a separate low-privilege user, or turn safe_mode off.")
+            self.log("hobkin", msg)
+            sys.exit(f"hobkin: {msg}")
+        shell_dir = self.p("shell")
+        os.makedirs(os.path.join(self.work, ".tmp"), exist_ok=True)
+        os.makedirs(shell_dir, exist_ok=True)
+        os.makedirs(self.p("jobs"), exist_ok=True)
+        self.safe = {"dirs": [self.work, shell_dir, self.p("jobs")],
+                     "files": [self.p("MEMORY.md"), self.p("BLOOPERS.md"), self.p("in"),
+                               "/dev/null", "/dev/zero", "/dev/full"],
+                     "network": network}
+        # Prove it here: inside the workspace works, the agent's own config doesn't
+        probe = self.p(".safe-probe")
+        r = subprocess.run(self.sandboxed(["bash", "-c", f'echo ok > {shlex.quote(os.path.join(self.work, ".tmp", "probe"))} '
+                                           f'&& ! (echo x > {shlex.quote(probe)}) 2>/dev/null && echo sandboxed']),
+                           env={**os.environ, "HOBKIN_SANDBOX": json.dumps(self.safe)}, capture_output=True, text=True)
+        if os.path.exists(probe):
+            os.remove(probe)
+        if r.stdout.strip() != "sandboxed":
+            msg = (f"safe mode: the sandbox didn't hold on this system ({(r.stderr or r.stdout).strip()[:300]}), so "
+                   "this agent won't start. (In a container, its security profile may block Landlock.)")
+            self.log("hobkin", msg)
+            sys.exit(f"hobkin: {msg}")
+        self.state["safe_mode"] = safe_coverage(abi, network)
+        self.log("hobkin", f"safe mode: {self.state['safe_mode']}")
+
+    def sandboxed(self, argv: list[str]) -> list[str]:
+        """A command line that runs `argv` inside the safe-mode sandbox (or as it is, without safe mode)."""
+        return [sys.executable, os.path.abspath(__file__), "__sandbox"] + argv if self.safe else argv
+
+    def safe_env(self, env: dict) -> dict:
+        """The sandbox's spec for the helper, and a private temp folder (/tmp is shared with the system)."""
+        if self.safe:
+            env["HOBKIN_SANDBOX"] = json.dumps(self.safe)
+            env["TMPDIR"] = os.path.join(self.work, ".tmp")
+        return env
+
+    def writable(self, full: str) -> bool:
+        """Can hobkin's own file tools write here? Anywhere, except in safe mode: the workspace and memory."""
+        if not self.safe:
+            return True
+        real = os.path.realpath(full)
+        work = os.path.realpath(self.work)
+        return real == work or real.startswith(work + os.sep) or \
+            real in (os.path.realpath(self.p("MEMORY.md")), os.path.realpath(self.p("BLOOPERS.md")))
 
     def _on_signal(self, signum, frame):
         if self.stop:  # second signal: leave now
@@ -1531,6 +1738,8 @@ class Agent:
             if text.strip():
                 parts.append(text.strip())
         parts.append(FORMATTING)
+        if getattr(self, "safe", None):
+            parts.append(SAFE_MODE.format(coverage=self.state.get("safe_mode", "")))
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
         if not skills:
             parts.append(NO_WORK_SYSTEM)
@@ -1607,7 +1816,7 @@ class Agent:
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
         before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested, self.model_wanted)
+                  self.models_requested, self.model_wanted, self.greet_wanted)
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -1632,7 +1841,7 @@ class Agent:
                 self.fifo_buf = b""
             self._drain_queue()
             if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested, self.model_wanted) != before:
+                  self.models_requested, self.model_wanted, self.greet_wanted) != before:
                 return
 
     def _drain_queue(self):
@@ -1666,6 +1875,10 @@ class Agent:
             self.last_direct = time.time()
 
     def command(self, cmd):
+        if cmd == "/hello":                     # sent by `hobkin chat` as it opens: no need to log it
+            self.greet_wanted = True
+            self.last_direct = time.time()      # someone's here: idle prompts hold off
+            return
         self.log("hobkin", f"command {cmd}")
         if cmd == "/stop":
             self.stop = True
@@ -1723,12 +1936,12 @@ class Agent:
         n = self.state["next_job"] = self.state.get("next_job", 0) + 1
         jdir = self.p(f"jobs/{n}")
         os.makedirs(jdir, exist_ok=True)
-        state_file = self.p("shell.sh")
+        state_file = os.path.join(self.p("shell") if self.safe else self.dir, "shell.sh")
         script = (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if os.path.exists(state_file) else "") + command
-        env = self.tool_env()
+        env = self.safe_env(self.tool_env())
         env.update({"HOBKIN_JOB": script, "HOBKIN_JOB_OUT": os.path.join(jdir, "out.log"),
                     "HOBKIN_JOB_EXIT": os.path.join(jdir, "exit")})
-        proc = subprocess.Popen(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"'],
+        proc = subprocess.Popen(self.sandboxed(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"']),
                                 cwd=self.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True)
         self.job_procs[n] = proc            # kept so it's reaped; the exit file is what counts
@@ -1760,8 +1973,13 @@ class Agent:
         return out
 
     def due_events(self) -> list[str]:
-        """What's come due on its own: reminders and finished background jobs."""
-        return self.take_due_reminders() + self.finished_jobs()
+        """What's come due on its own: reminders, finished background jobs, and a hello when someone's
+        just opened a chat."""
+        greet = []
+        if self.greet_wanted:
+            self.greet_wanted = False
+            greet = [GREET.format(who=self.who, stamp=self.stamp(), name=self.id)]
+        return greet + self.take_due_reminders() + self.finished_jobs()
 
     def scheduled(self) -> bool:
         """True when the agent has set up its own next wake-up: a reminder, or a job still running.
@@ -1820,7 +2038,8 @@ class Agent:
         if background:
             return self.start_job(command)
         timeout = max(1, int(timeout or self.cfg["bash_timeout"]))   # the agent can ask for any length
-        state_file, cwd_file = self.p("shell.sh"), self.p(".cwd")
+        state_dir = self.p("shell") if self.safe else self.dir      # safe mode: a folder its commands may write
+        state_file, cwd_file = os.path.join(state_dir, "shell.sh"), os.path.join(state_dir, ".cwd")
         if reset:
             for f in (state_file, cwd_file):
                 if os.path.exists(f):
@@ -1829,14 +2048,15 @@ class Agent:
         cwd = self.cwd()
         self.log("$", ("(fresh shell) " if reset else "") + command)
         self.interrupt = False
-        env = self.tool_env()
+        env = self.safe_env(self.tool_env())
         env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
-                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_NOSAVE"])
+                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_NOSAVE",
+                                                              "HOBKIN_SANDBOX", "TMPDIR"])
         restore = os.path.exists(state_file)
         script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
                   + (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if restore else "")
                   + SHELL_SAVE + command)
-        argv = ["bash", "-c", script] if restore else ["bash", "--login", "-c", script]
+        argv = self.sandboxed(["bash", "-c", script] if restore else ["bash", "--login", "-c", script])
         with tempfile.TemporaryFile() as outf:
             proc = subprocess.Popen(argv, cwd=cwd, env=env,
                                     stdin=subprocess.DEVNULL, stdout=outf, stderr=subprocess.STDOUT,
@@ -1914,6 +2134,8 @@ class Agent:
 
     def write_file(self, path: str, content: str) -> ToolResult:
         full = self.resolve(path)
+        if not self.writable(full):
+            return SAFE_REFUSED.format(path=full), True
         existed = os.path.exists(full)
         if os.path.isdir(full):
             return f"{full} is a folder.", True
@@ -1929,6 +2151,8 @@ class Agent:
 
     def edit_file(self, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
         full = self.resolve(path)
+        if not self.writable(full):
+            return SAFE_REFUSED.format(path=full), True
         if not os.path.isfile(full):
             return f"No such file: {full}. Use write_file to create it.", True
         text = open(full, encoding="utf-8", errors="replace").read()
@@ -2255,6 +2479,8 @@ class Agent:
                 return f"Couldn't fetch {url}: {e}", True
             if save_as:
                 full = self.resolve(save_as)
+                if not self.writable(full):
+                    return SAFE_REFUSED.format(path=full), True
                 os.makedirs(os.path.dirname(full), exist_ok=True)
                 open(full, "wb").write(body)
                 return f"Saved {final} ({ctype or 'unknown type'}, {len(body) // 1024} KB) to {full}", False
@@ -2322,6 +2548,12 @@ class Agent:
         """(result text, is_error) for one tool call. Each tool is one line here; bash logs its
         own command and output, the rest log the first line of their result."""
         s = lambda key: str(inp[key])            # a required argument (KeyError if missing)
+        if name in ("write_file", "edit_file") and not self.plan_said() and not self.plan_checked \
+                and os.path.basename(str(inp.get("path", ""))).lower() not in PLANNING_FILES \
+                and not str(inp.get("path", "")).startswith(("$HOBKIN_MEMORY", "$HOBKIN_BLOOPERS")):
+            self.plan_checked = True               # once per turn: a second try goes through
+            self.log(name, f"(not run: no plan said yet) {inp.get('path', '')}")
+            return PLAN_FIRST, True
         tools = {
             "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")),
                                           bool(inp.get("background")), inp.get("announced")),
@@ -2581,6 +2813,7 @@ class Agent:
         for b in blocks:
             if b.get("type") == "text":
                 self.log("agent", b["text"])
+                self.turn_said += "\n" + b["text"]
         calls = [b for b in blocks if b.get("type") == "tool_use"]
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
@@ -2739,8 +2972,13 @@ class Agent:
                 self.save_state("stopped")
                 self.log("hobkin", "stopped")
 
+    def plan_said(self) -> bool:
+        """Has the agent said **What would:** (its plan) out loud in this turn?"""
+        return re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
+
     def add_user(self, text: str) -> None:
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
+        self.turn_said, self.plan_checked = "", False
         block = {"type": "text", "text": text}
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages[-1]["content"].append(block)
@@ -3055,6 +3293,7 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
     print("\n".join(short(line) for line in recent))
     print(f"-- chatting with {agent_id}: type and press Enter to send (up arrow for history); "
           "/stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
+    os.write(fifo, b"/hello\n")                 # the agent says hi first
 
     def printer():
         while not done.is_set():
@@ -3213,10 +3452,10 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
 def cmd_setup(argv):
     """hobkin URL MODEL [KEY] [--chat] [--hearthboard URL TOKEN] ...: configure the model endpoint, start an
     agent on it, maybe join it to a hearthboard, maybe chat. With --hearthboard alone, the configured model."""
-    pos, opts = split_args(argv, {"--chat", "--no-service", "--force"}, {"--id", "--api"}, {"--hearthboard"})
+    pos, opts = split_args(argv, {"--chat", "--no-service", "--force", "--safe"}, {"--id", "--api"}, {"--hearthboard"})
     board = opts.get("--hearthboard")
     if len(pos) not in (2, 3) and not (board and not pos):
-        sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--hearthboard BOARD_URL TOKEN] [--id ID] "
+        sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--hearthboard BOARD_URL TOKEN] [--id ID] [--safe] "
                  "[--api anthropic|openai] [--no-service] [--force]\n"
                  "       hobkin --hearthboard BOARD_URL TOKEN [--id ID] [--chat]   (another agent, on the configured model)")
     board_user = None
@@ -3323,6 +3562,11 @@ def start_agent(agent_id, opts, board=None, board_user=None):
     d = os.path.join(HOME, agent_id)
     ensure_shared()
     os.makedirs(d, exist_ok=True)
+    if opts.get("--safe"):                  # in the agent's own config, which safe mode won't let it change
+        path = os.path.join(d, "config.json")
+        cfg = json.loads(read(path) or "{}")
+        cfg["safe_mode"] = True
+        write_atomic(path, json.dumps(cfg, indent=2) + "\n")
     if board:
         join_hearthboard(d, *board)
         print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (its skill is in "
@@ -3349,6 +3593,8 @@ def start_agent(agent_id, opts, board=None, board_user=None):
 
 
 def main(argv):
+    if argv[:1] == ["__sandbox"]:          # safe mode's helper: restrict itself, then run the command
+        return run_sandboxed(argv[1:])
     if argv[:1] in (["-h"], ["--help"], ["help"]):
         print(__doc__)
         return

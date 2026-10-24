@@ -33,6 +33,8 @@ def wait_for(d, needle, t=15, file="out"):
         if needle in open(os.path.join(d, file)).read(): return True
         time.sleep(0.1)
     raise AssertionError(f"timeout waiting for {needle!r} in {file}:\n" + open(os.path.join(d, "out")).read()[-1500:])
+def read_or_empty(path):
+    return open(path).read() if os.path.exists(path) else ""
 def ctx(d): return [json.loads(l) for l in open(d + "/context.jsonl")]
 def last_results(d):
     """The last user message that carries tool results (the wrap-up check may follow it)."""
@@ -703,6 +705,22 @@ try:
     check("[chat] --full shows tool output too", "    shown-out-43" in r.stdout, r.stdout)
     ctx_s1 = open(hs + "/s1/context.jsonl").read()
     check("[chat] agents are asked to backtick file names and paths", "put file names, paths, commands, ids" in ctx_s1)
+    # Opening a chat asks the agent to say hello first
+    run("send", "s1", "/hello")
+    for _ in range(50):
+        if "just opened a chat with you" in open(hs + "/s1/context.jsonl").read(): break
+        time.sleep(0.2)
+    c1 = open(hs + "/s1/context.jsonl").read()
+    check("[chat] opening a chat asks the agent to introduce itself by name", "just opened a chat with you" in c1
+          and "(you're s1)" in c1 and "command /hello" not in open(hs + "/s1/out").read(), c1[-400:])
+    # Four steps out loud: a file change before a plan's been said isn't run (once); planning files always are
+    r = run("chat", "s1", input='noplan-call: write_file {"path": "fix.txt", "content": "x"}\n')
+    check("[steps] a file change before **What would:** is said isn't run, and says why", "not run: no plan said yet" in r.stdout
+          and not os.path.exists(hs + "/s1/work/fix.txt"), r.stdout)
+    r = run("chat", "s1", input='noplan-call: write_file {"path": "CHECKLIST.md", "content": "- [ ] x"}\n')
+    check("[steps] the checklist (part of planning) can always be written", os.path.exists(hs + "/s1/work/CHECKLIST.md"), r.stdout)
+    r = run("chat", "s1", input='call: write_file {"path": "fix.txt", "content": "x"}\n')
+    check("[steps] with the plan said, the change goes through", os.path.exists(hs + "/s1/work/fix.txt"), r.stdout)
     check("[chat] an agent with no skills is told its work is what people ask, not the machine",
           "You have no skills, so no work system" in ctx_s1 and "don't go looking for work" in ctx_s1, ctx_s1[:300])
     r = run("chat", "s1", input="/model fakr\n")
@@ -751,6 +769,46 @@ try:
     for _ in range(50):
         if json.load(open(hs + "/s1/state.json")).get("status") == "stopped": break
         time.sleep(0.2)
+
+    # safe mode: Landlock keeps commands' writes in the workspace, with no TCP (where the kernel has it)
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    import hobkin as hbk
+    abi = hbk.landlock_abi()
+    h = home("safe", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "safe_mode": True})
+    if not abi:
+        env = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
+        r = subprocess.run([sys.executable, HOB, "guard"], env=env, capture_output=True, text=True, timeout=30)
+        check("[safe] no Landlock here: safe mode refuses to start", r.returncode != 0 and "needs Landlock" in r.stderr, r.stderr)
+    else:
+        p, aid, d = start(h, "guard")
+        out = open(d + "/out").read()
+        check(f"[safe] says what this kernel's Landlock (v{abi}) covers", "safe mode: Landlock v" in out, out[-500:])
+        def bash(cmd, marker):                            # waits for the marker in the command's output
+            seen = open(d + "/out").read().count("\n    " + marker)
+            say(d, "run: " + cmd)
+            for _ in range(100):
+                if open(d + "/out").read().count("\n    " + marker) > seen: break
+                time.sleep(0.1)
+            return open(d + "/out").read().rsplit("$> " + cmd, 1)[-1]
+        outside = os.path.join(BASE, "safe-outside.txt")
+        bash("echo in > inside.txt; echo out > " + outside + "; echo cfg >> $HOBKIN_DIR/config.json; echo mem >> $HOBKIN_MEMORY; echo done-1", "done-1")
+        check("[safe] commands write in the workspace and memory, not outside or to their own config",
+              open(d + "/work/inside.txt").read() == "in\n" and not os.path.exists(outside)
+              and "cfg" not in read_or_empty(d + "/config.json") and "cfg" not in read_or_empty(h + "/_shared/config.json")
+              and "mem" in open(d + "/MEMORY.md").read())
+        bash("cd sub 2>/dev/null || mkdir sub; cd sub; export KEPT=yes; echo done-2", "done-2")
+        tail = bash("echo KEPT=$KEPT in $PWD; echo done-3", "done-3")
+        check("[safe] the shell still keeps its folder and variables", "KEPT=yes in " in tail and "/work/sub" in tail, tail[:300])
+        if abi >= 4:
+            tail = bash("(exec 3<>/dev/tcp/127.0.0.1/48701 && echo CONNECTED) 2>&1; echo done-4", "done-4")
+            check("[safe] no TCP connections from commands", "CONNECTED" not in tail, tail[:300])
+        say(d, 'call: write_file {"path": "' + outside + '", "content": "x"}'); wait_for(d, "Not written: safe mode")
+        check("[safe] write_file can't write outside the workspace either", not os.path.exists(outside))
+        check("[safe] the agent is told how to work: read, then scripts for a human that log what they find",
+              "write it as a script for a human" in open(d + "/context.jsonl").read()
+              and "read the log in `for-review/logs/` yourself" in open(d + "/context.jsonl").read())
+        p.send_signal(signal.SIGTERM); p.wait(10)
 
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
