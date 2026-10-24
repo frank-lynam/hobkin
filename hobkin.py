@@ -27,7 +27,8 @@ it can read, but its commands write only in its workspace; see "safe_mode" in co
 --api anthropic|openai (else guessed from the URL), --no-service, --force (skip the check).
 With --hearthboard BOARD_URL TOKEN it also joins that board: the board's skill, the token in
 the agent's secrets.env, and the board's wait loop as its idle prompt (named after its board
-user unless --id). Leave out URL MODEL KEY to use the model already set up.
+user unless --id). Leave out URL MODEL KEY to use the model already set up. With the --id of an
+agent you already have, it joins (or changes the model of) that one, restarting it if it's running.
 
 (Or run the file directly: python3 hobkin.py ...)
 
@@ -2962,6 +2963,10 @@ class Agent:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.restart_requested and not self.stop and self.pending:
+                # Messages that arrived but weren't started on yet: into the conversation, so a restart keeps them
+                self.add_user("\n\n".join(self.from_operator(t) for t in self.pending))
+                self.pending = []
             self.save_context()
             if self.restart_requested and not self.stop:
                 self.state["restarting"] = True
@@ -3468,11 +3473,18 @@ def cmd_setup(argv):
     name = opts.get("--id") or re.sub(r"[^A-Za-z0-9_-]+", "-", (board_user or {}).get("username") or "").strip("-")
     agent_id = valid_id(name) if name else new_agent_id()
     d = os.path.join(HOME, agent_id)
-    if os.path.isdir(d) and is_running(d):
-        sys.exit(f"hobkin: {agent_id} is already running")
+    running = os.path.isdir(d) and is_running(d)
+    if os.path.isdir(d):
+        print(f"{agent_id}: an agent you already have" + (" (running)" if running else ""))
     if pos:
         configure_model(pos, opts, agent_id)
-    start_agent(agent_id, opts, board, board_user)
+    prepare_agent(agent_id, opts, board, board_user)
+    if running:
+        restart_running(agent_id)
+        if opts.get("--chat"):
+            return cmd_chat(agent_id)
+        return print(f"talk: hobkin chat {agent_id}")
+    start_agent(agent_id, opts)
 
 
 def configure_model(pos, opts, agent_id):
@@ -3556,9 +3568,20 @@ def new_agent_id() -> str:
     return stem() + stem() + stem() + "kin"
 
 
-def start_agent(agent_id, opts, board=None, board_user=None):
-    """Start agent `agent_id` (named by --id, else its hearthboard user, else made up), as a service where
-    there's systemd, else in the background; joined to the board if asked; then a chat if asked."""
+JOINED = ("You're now a worker on the hearthboard at {url}, as {user}. Your hearthboard skill (just added) says "
+          "how to work there: open it, say hello on the board, then start its wait loop.")
+
+
+def queue_message(d: str, text: str) -> None:
+    """A message for an agent, through its queue file: read within a second if it's running, at start-up if
+    not, and safe across a restart (the in FIFO would drop it)."""
+    with open(os.path.join(d, "queue"), "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(text) + "\n")
+
+
+def prepare_agent(agent_id, opts, board=None, board_user=None):
+    """The agent's own settings from setup: safe mode, and joining a board (new agent or existing)."""
     d = os.path.join(HOME, agent_id)
     ensure_shared()
     os.makedirs(d, exist_ok=True)
@@ -3569,8 +3592,30 @@ def start_agent(agent_id, opts, board=None, board_user=None):
         write_atomic(path, json.dumps(cfg, indent=2) + "\n")
     if board:
         join_hearthboard(d, *board)
-        print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (its skill is in "
-              f"{os.path.join(SHARED, 'skills', 'hearthboard')}, its token in {os.path.join(d, 'secrets.env')})")
+        print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (the board's skill is in "
+              f"{os.path.join(d, 'skills', 'hearthboard')}, its token in {os.path.join(d, 'secrets.env')})")
+        queue_message(d, JOINED.format(url=board[0], user=board_user.get("username")))
+
+
+def restart_running(agent_id) -> None:
+    """A running agent picks up new settings by restarting in place (its conversation is kept)."""
+    d = os.path.join(HOME, agent_id)
+    ups = read(os.path.join(d, "out")).count(" up: ")
+    fd = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"/restart\n")
+    print(f"{agent_id}: restarting to pick up the changes (after its current step; its conversation is kept)")
+    for _ in range(600):
+        if read(os.path.join(d, "out")).count(" up: ") > ups:
+            return print(f"{agent_id}: restarted")
+        time.sleep(0.2)
+    print(f"{agent_id}: still busy with its current step; it'll restart when that's done")
+
+
+def start_agent(agent_id, opts):
+    """Start agent `agent_id` (named by --id, else its hearthboard user, else made up), as a service where
+    there's systemd, else in the background; then a chat if asked."""
+    d = os.path.join(HOME, agent_id)
     systemd = not opts.get("--no-service") and shutil.which("systemctl") \
         and systemctl("show-environment").returncode == 0
     if systemd:

@@ -748,7 +748,8 @@ try:
           and "HEARTHBOARD_TOKEN=hb-good" in sec and "HEARTHBOARD_URL=http://127.0.0.1:48790/board" in sec
           and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
     check("[hearthboard] on the configured model, with the board's wait loop as its idle prompt",
-          "agent> echo: hi board" in r.stdout and "wait loop" in json.load(open(ad + "/config.json"))["idle_prompt"]
+          "hi board" in open(ad + "/context.jsonl").read() and "You're now a worker" in open(ad + "/context.jsonl").read()
+          and "wait loop" in json.load(open(ad + "/config.json"))["idle_prompt"]
           and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
     check("[hearthboard] other agents here don't get the board's skill (s1 isn't a worker)",
           "You have no skills, so no work system" in open(hs + "/s1/context.jsonl").read())
@@ -762,6 +763,21 @@ try:
           and acfg["models"]["fake-costly"]["key_file"].startswith(hs + "/s2/")
           and json.load(open(hs + "/s2/state.json"))["model"].startswith("fake-costly"), r.stdout + r.stderr)
     run("send", "s2", "/stop")
+    # Two steps: an agent you already have (running) joins a board; it restarts in place and is told
+    r = run("http://127.0.0.1:48702/v1", "fake", "--no-service", "--id", "s3")
+    ups = open(hs + "/s3/out").read().count(" up: ")
+    r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-good", "--id", "s3")
+    for _ in range(100):
+        if "You're now a worker on the hearthboard" in open(hs + "/s3/context.jsonl").read(): break
+        time.sleep(0.2)
+    c3 = open(hs + "/s3/context.jsonl").read()
+    check("[hearthboard] an agent you already have joins: restarted in place, conversation kept, and told",
+          r.returncode == 0 and "an agent you already have (running)" in r.stdout and "restarted" in r.stdout
+          and open(hs + "/s3/out").read().count(" up: ") > ups and os.path.exists(hs + "/s3/skills/hearthboard/SKILL.md")
+          and "HEARTHBOARD_TOKEN=hb-good" in open(hs + "/s3/secrets.env").read()
+          and "wait loop" in json.load(open(hs + "/s3/config.json"))["idle_prompt"]
+          and "You're now a worker on the hearthboard at http://127.0.0.1:48790/board, as worker.7" in c3, r.stdout + r.stderr)
+    run("send", "s3", "/stop")
     run("send", "worker-7", "/stop")
     for _ in range(50):
         if json.load(open(ad + "/state.json")).get("status") == "stopped": break

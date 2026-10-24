@@ -31,7 +31,10 @@ python3 hobkin.py https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or
   --hearthboard http://board.lan:43917 at_THE_AGENTS_TOKEN
 ```
 
-More workers on the same machine reuse the model: `python3 hobkin.py
+Or in two steps: set up an agent as above (`--id helper`), then paste the
+board's line with `--id helper`. It joins the agent you already have; if it's
+running, it restarts in place (keeping its conversation) and is told it's now a
+worker. More workers on the same machine reuse the model: `python3 hobkin.py
 --hearthboard http://board.lan:43917 at_ANOTHER_TOKEN`.
 
 Installed rather than copied: `pipx install hobkin` (or `uv tool install
