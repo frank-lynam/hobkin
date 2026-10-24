@@ -58,8 +58,9 @@ To see what an API offers before choosing: `hobkin models URL [KEY]`; `hobkin mo
 lists your configured model's API, and `/models` does the same in a chat.
 
 With `--hearthboard URL TOKEN`, it also checks the token with the board, then:
-- saves the **board's own skill** (`/api/skill`) in `_shared/skills/hearthboard/`,
-  shared by every agent here, so the agent works by the board's current rules;
+- saves the **board's own skill** (`/api/skill`) in that agent's own `skills/`, so
+  it works by the board's current rules (and agents here that aren't workers
+  don't mistake the board for their work system);
 - puts **the token** in that agent's `secrets.env` (readable only by you; the
   model only ever sees it as an environment variable, never in its context);
 - sets its **idle prompt** to the board's wait loop, so it picks up work itself;
@@ -161,7 +162,6 @@ or reference files. Install one by copying its folder into
 **`~/.hobkins/_shared/skills/`**, and every agent can use it.
 
 ```
-~/.hobkins/_shared/skills/hearthboard/SKILL.md
 ~/.hobkins/_shared/skills/release/SKILL.md
 ~/.hobkins/_shared/skills/release/build.sh
 ```
@@ -553,15 +553,16 @@ ID=7f3a91c2 URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
 printf 'AGENT_TICKETS_URL=%s\nAGENT_TICKETS_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
 chmod 600 ~/.hobkins/$ID/secrets.env
 curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \
-  -o ~/.hobkins/_shared/skills/hearthboard/SKILL.md
+  -o ~/.hobkins/$ID/skills/hearthboard/SKILL.md
 echo '{"idle_prompt": "Run the hearthboard wait loop (GET /api/wait) and do what it says.", "idle_seconds": 60}' \
   > ~/.hobkins/$ID/config.json
 hobkin $ID
 ```
 
-The hearthboard skill is shared: it reads the token from
-`AGENT_TICKETS_TOKEN`, so one copy serves every worker, each with its own
-`secrets.env`. The idle prompt keeps it
+Each worker keeps the board's skill in its own `skills/` folder, not
+`_shared/`: an agent that isn't a worker shouldn't see the board as its work
+system. The skill reads the token from `HEARTHBOARD_TOKEN`, and each worker has
+its own in `secrets.env`. The idle prompt keeps it
 checking for work, and it can also hold `/api/wait` open itself inside a
 command. Give each worker its own token, so claims and comments show which
 agent did what.

@@ -713,14 +713,26 @@ try:
     r = run("--hearthboard", "http://127.0.0.1:48790/board/", "hb-good", "--no-service", "--chat", input="hi board\n")
     ad = hs + "/worker-7"
     sec = open(ad + "/secrets.env").read() if os.path.exists(ad + "/secrets.env") else ""
-    check("[hearthboard] joins: named after its board user, the board's skill shared, its token private",
+    check("[hearthboard] joins: named after its board user, the board's skill and token its own",
           r.returncode == 0 and "joined http://127.0.0.1:48790/board as worker.7" in r.stdout
-          and open(hs + "/_shared/skills/hearthboard/SKILL.md").read().startswith("---\nname: hearthboard")
+          and open(ad + "/skills/hearthboard/SKILL.md").read().startswith("---\nname: hearthboard")
+          and not os.path.exists(hs + "/_shared/skills/hearthboard")
           and "HEARTHBOARD_TOKEN=hb-good" in sec and "HEARTHBOARD_URL=http://127.0.0.1:48790/board" in sec
           and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
     check("[hearthboard] on the configured model, with the board's wait loop as its idle prompt",
           "agent> echo: hi board" in r.stdout and "wait loop" in json.load(open(ad + "/config.json"))["idle_prompt"]
           and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
+    check("[hearthboard] other agents here don't get the board's skill (s1 isn't a worker)",
+          "You have no skills, so no work system" in open(hs + "/s1/context.jsonl").read())
+    # A board skill left in _shared/ by 0.2.2 moves into the workers that use it
+    os.makedirs(hs + "/_shared/skills/hearthboard"); os.makedirs(hs + "/old-worker")
+    open(hs + "/_shared/skills/hearthboard/SKILL.md", "w").write("---\nname: hearthboard\ndescription: old\n---\n")
+    open(hs + "/old-worker/secrets.env", "w").write("AGENT_TICKETS_TOKEN=x\n")
+    r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-good", "--no-service", "--id", "worker-8")
+    check("[hearthboard] a shared board skill from 0.2.2 moves into each worker's own skills",
+          not os.path.exists(hs + "/_shared/skills/hearthboard") and os.path.exists(hs + "/old-worker/skills/hearthboard/SKILL.md")
+          and os.path.exists(hs + "/worker-8/skills/hearthboard/SKILL.md"), r.stdout + r.stderr)
+    run("send", "worker-8", "/stop")
     run("send", "worker-7", "/stop")
     for _ in range(50):
         if json.load(open(ad + "/state.json")).get("status") == "stopped": break

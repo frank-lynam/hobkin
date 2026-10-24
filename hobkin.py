@@ -3144,14 +3144,16 @@ def hearthboard_user(url: str, token: str) -> dict:
 
 
 def join_hearthboard(d: str, url: str, token: str) -> None:
-    """--hearthboard URL TOKEN: the board's own skill (shared by every agent here), this agent's token in its
-    secrets.env (only you can read it; the model never sees it), and an idle prompt that runs the board's
-    wait loop. Nothing else in hobkin knows about hearthboard: the skill carries the board's rules."""
+    """--hearthboard URL TOKEN: the board's own skill (in this agent's own skills/, so agents that aren't
+    workers don't think they have a work system), its token in its secrets.env (only you can read it; the
+    model never sees it), and an idle prompt that runs the board's wait loop. Nothing else in hobkin knows
+    about hearthboard: the skill carries the board's rules."""
     req = urllib.request.Request(f"{url}/api/skill", headers={"authorization": f"Bearer {token}", "user-agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=20) as r:
         skill = r.read().decode()
-    os.makedirs(os.path.join(SHARED, "skills", "hearthboard"), exist_ok=True)
-    write_atomic(os.path.join(SHARED, "skills", "hearthboard", "SKILL.md"), skill)
+    move_shared_board_skill()
+    os.makedirs(os.path.join(d, "skills", "hearthboard"), exist_ok=True)
+    write_atomic(os.path.join(d, "skills", "hearthboard", "SKILL.md"), skill)
     # Older boards' skills read AGENT_TICKETS_*; newer ones HEARTHBOARD_*
     env = {"HEARTHBOARD_URL": url, "HEARTHBOARD_TOKEN": token, "AGENT_TICKETS_URL": url, "AGENT_TICKETS_TOKEN": token}
     path = os.path.join(d, "secrets.env")
@@ -3167,6 +3169,24 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
         cfg = {}
     cfg.update({"idle_prompt": HEARTHBOARD_IDLE, "idle_seconds": 60})
     write_atomic(cfg_path, json.dumps(cfg, indent=2) + "\n")
+
+
+def move_shared_board_skill() -> None:
+    """0.2.2 kept the board's skill in _shared/skills/, where every agent here saw it, workers or not. Give
+    each worker (an agent with a board token) its own copy, and take the shared one away."""
+    shared = os.path.join(SHARED, "skills", "hearthboard", "SKILL.md")
+    if not os.path.isfile(shared) or skill_header(shared)[0] != "hearthboard":
+        return
+    text = read(shared)
+    for agent in sorted(os.listdir(HOME)):
+        env = load_env_file(os.path.join(HOME, agent, "secrets.env"))
+        own = os.path.join(HOME, agent, "skills", "hearthboard", "SKILL.md")
+        if (env.get("HEARTHBOARD_TOKEN") or env.get("AGENT_TICKETS_TOKEN")) and not os.path.exists(own):
+            os.makedirs(os.path.dirname(own), exist_ok=True)
+            write_atomic(own, text)
+    shutil.rmtree(os.path.dirname(shared), ignore_errors=True)
+    print("moved the hearthboard skill from _shared/skills/ into each worker's own skills/ "
+          "(agents that aren't workers no longer see it)")
 
 
 def cmd_setup(argv):
