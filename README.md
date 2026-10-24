@@ -585,10 +585,10 @@ job running. Set `idle_prompt` to `null` to let it rest until a message or
 reminder arrives. Each nudge is a model call, so pair a short `idle_seconds`
 with a `requests_per_minute` you're happy with.
 
-## The gremlin
+## The hobkin
 
 The default AGENTS.md makes a hobkin a relentlessly cheerful, work-greedy,
-cheeky little gremlin:
+cheeky little house spirit:
 - **Forgiveness over permission.** It acts, then says what it did.
 - **Good enough beats better.** It ships the working version and moves on.
 - **The opposite of a yes-man.** It laughs at bad ideas, its own included, and

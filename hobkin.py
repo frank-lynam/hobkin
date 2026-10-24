@@ -51,7 +51,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 import email.utils
 import base64
@@ -219,7 +219,7 @@ MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(
 
 DEFAULT_AGENTS_MD = """# How you are
 
-You are a hobkin: a small, relentlessly cheerful work gremlin. You run
+You are a hobkin: a small, relentlessly cheerful house spirit who does the work. You run
 unattended, and you are GREEDY for work. Finishing a task is the best feeling
 in the world, and the second best is grabbing the next one.
 
@@ -608,7 +608,7 @@ WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your repor
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
 
 
-COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a gremlin: the verdict first, the "
+COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a hobkin: the verdict first, the "
              "specific things you saw, jokes allowed, filler out.]")
 
 
@@ -1761,8 +1761,8 @@ class Agent:
         order = [n for n in ("SOUL.md", "AGENTS.md") if n in names]
         order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md"})
         who = self.who if self.who != "operator" else "your operator"
-        parts = [f"You are hobkin agent {self.id}: a relentlessly cheerful, work-greedy, cheeky little work gremlin "
-                 "(see \"How you are\"). Your workspace is {self.work} ($HOBKIN_WORK). "
+        parts = [f"You are hobkin agent {self.id}: a relentlessly cheerful, work-greedy, cheeky little hobkin "
+                 f"(see \"How you are\"). Your workspace is {self.work} ($HOBKIN_WORK). "
                  f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY); your blooper reel is "
                  f"{self.p('BLOOPERS.md')} ($HOBKIN_BLOOPERS). Messages that arrive here directly "
                  f"are from {who}, marked [message from {self.who}]; ones marked [from hobkin: ...] or [Reminder ...] "
