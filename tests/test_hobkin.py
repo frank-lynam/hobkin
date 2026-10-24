@@ -687,6 +687,14 @@ try:
           r.stdout + r.stderr)
     r = run("chat", "s1", input="/models\n")
     check("[setup] /models lists them in a chat, the one in use starred", re.search(r"\* fake +100k context", r.stdout), r.stdout)
+    r = run("chat", "s1", input="run: echo hidden-out-$((40+2))\n")
+    check("[chat] tool calls show as one line, their output hidden", "$> echo hidden-out-$((40+2))" in r.stdout
+          and "    hidden-out-42" not in r.stdout and "agent> Done. Output was: hidden-out-42" in r.stdout, r.stdout)
+    r = run("chat", "s1", "--full", input="run: echo shown-out-$((40+3))\n")
+    check("[chat] --full shows tool output too", "    shown-out-43" in r.stdout, r.stdout)
+    ctx_s1 = open(hs + "/s1/context.jsonl").read()
+    check("[chat] an agent with no skills is told its work is what people ask, not the machine",
+          "You have no skills, so no work system" in ctx_s1 and "don't go looking for work" in ctx_s1, ctx_s1[:300])
     r = run("chat", "s1", input="/model fakr\n")
     check("[model] /model with a name nobody offers says so", "no model 'fakr'" in r.stdout and "Close: fake" in r.stdout, r.stdout)
     r = run("chat", "s1", input="/model fake-costly\n")

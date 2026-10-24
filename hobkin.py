@@ -7,7 +7,7 @@ line, or as a worker on hearthboard.
     hobkin [URL MODEL [KEY]] --hearthboard BOARD_URL TOKEN   ...and make it a worker on that board
     hobkin                 start a new agent (prints its id)
     hobkin ID              resume agent ID
-    hobkin chat ID         talk to a running agent in this terminal
+    hobkin chat ID         talk to a running agent in this terminal (--full: tool output too)
     hobkin service add ID      run agent ID as a systemd user service (now and at boot)
     hobkin service remove ID   stop it and take it off boot
     hobkin send ID TEXT    message an agent (queued if it isn't running)
@@ -49,7 +49,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 import email.utils
 import base64
@@ -547,6 +547,17 @@ KEEP_DAYS = 30            # old archives (contexts, out logs) and finished jobs'
 HOT_TAKE = ("[hobkin: a task or an idea? Start your reply with a hot take: one to five stars and your own "
             "reason; if it's a bad idea, laugh and do the better thing. Just a hello or a question? Answer it "
             "in your reply, no rating, like a person would, then carry on with your work.]")
+
+# The same, for an agent with no work system (no skills): its work is what people ask it for
+HOT_TAKE_CHAT = ("[hobkin: a task or an idea? Start your reply with a hot take: one to five stars and your own "
+                 "reason; if it's a bad idea, laugh and do the better thing. Just a hello or a question? Answer "
+                 "it in your reply, no rating, like a person would, and stop there: let them talk. You have no "
+                 "work system, so don't go looking for work.]")
+
+NO_WORK_SYSTEM = ("# Where your work comes from\n\nYou have no skills, so no work system (no tracker, no queue). "
+                  "Your work is what people ask you for here. Do it, report, and then end your turn and wait for "
+                  "the next message: never go looking around the machine (your home directory, other folders, "
+                  "other projects) for something to do.")
 
 
 SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
@@ -1537,6 +1548,8 @@ class Agent:
             if text.strip():
                 parts.append(text.strip())
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
+        if not skills:
+            parts.append(NO_WORK_SYSTEM)
         if skills:
             parts.append("# Skills\n\nA skill is a set of instructions (and sometimes scripts) for one kind of task. "
                          "Before you start a task that a skill below covers, open it with the `skill` tool and follow "
@@ -2133,8 +2146,12 @@ class Agent:
         if busy:
             return (f"[message from {self.who}, {self.stamp()}, while you were working: answer it in your next "
                     f"reply, then carry on]\n{text}")
-        hint = "" if self.scheduled() else f"\n{HOT_TAKE}"
+        hint = "" if self.scheduled() else f"\n{HOT_TAKE if self.has_work_system() else HOT_TAKE_CHAT}"
         return f"[message from {self.who}, {self.stamp()}: they're talking with you now. Answer them in your reply]\n{text}{hint}"
+
+    def has_work_system(self) -> bool:
+        """Any skills at all: somewhere work comes from besides the people talking to it here."""
+        return bool(find_skills(self.dir, self.cfg.get("skill_dirs") or []))
 
     def stamp(self) -> str:
         """The time now, for anything that wakes the agent, plus how long it's been when that's a while."""
@@ -2709,6 +2726,8 @@ class Agent:
                     continue
                 self.save_state("idle")
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
+                if prompt == DEFAULT_CONFIG["idle_prompt"] and not self.has_work_system():
+                    prompt = None        # the default points at work sources, and there are none: nothing to nag about
                 # No nagging while it's set its own next wake-up, or while someone's talking with it
                 quiet = bool(prompt) and (self.scheduled() or time.time() - self.last_direct < CHAT_QUIET)
                 if quiet:
@@ -2887,26 +2906,58 @@ def cmd_send(agent_id, text):
     print(f"{agent_id} isn't running; queued for when it starts")
 
 
-def cmd_chat(agent_id):
+# Out-log entries that are tool calls (chat shows them as one line): bash's command and result, every
+# other tool by name, finished jobs, reminders. Everything else is talk: shown in full.
+TOOL_WHO = {"$", "=", "job", "reminder"} | {t["name"] for t in TOOLS}
+
+
+def chat_view(lines: list[str], own: str, full: bool, st: dict) -> list[str]:
+    """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's
+    and hobkin's in full, and each tool call as one line, its output hidden (a failed command's
+    status stays). `full` shows everything. `st` carries the current entry between calls."""
+    shown = []
+    for line in lines:
+        if not line.startswith("    "):
+            who, _, text = line[20:].partition("> ")
+            st["mine"] = line[20:].startswith(own)
+            if full or who not in TOOL_WHO:
+                st["keep"] = "all"
+            elif who == "=":
+                st["keep"] = "none" if text.startswith("(exit code 0;") else "head"
+            else:
+                st["keep"] = "head"
+            if st["mine"] or st["keep"] == "none":
+                continue
+            line = line[11:]                                     # drop the date
+            if st["keep"] == "head" and len(line) > 110:
+                line = line[:109] + "…"
+            shown.append(line)
+        elif not st.get("mine") and st.get("keep") == "all":
+            shown.append(line)
+    return shown
+
+
+def cmd_chat(agent_id, full=False):
     """Talk to a running agent in one terminal: its output appears as it comes, and each line
     you type (or paste) is sent. In a terminal, readline gives line editing and history (up
     arrow), and output never overwrites what you're typing. Piped input: send it all, print
-    the reply, exit."""
+    the reply, exit. Tool calls show as one line each unless `full`."""
     d = os.path.join(HOME, valid_id(agent_id))
     if not os.path.isdir(d) or not is_running(d):
         sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin {agent_id})")
     fifo = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
     os.set_blocking(fifo, True)
     out_path, state_path = os.path.join(d, "out"), os.path.join(d, "state.json")
-    with open(out_path, "rb") as f:
-        recent = f.read().decode(errors="replace").splitlines()[-12:]
-        pos = f.tell()
-    mine = False                     # inside one of our own entries (not echoed back)
     own = f"{operator_label(load_config(d))}> "
-    short = lambda line: line if line.startswith("    ") else line[11:]   # drop the date
+    with open(out_path, "rb") as f:
+        raw = f.read().decode(errors="replace").splitlines()
+        pos = f.tell()
+    recent = chat_view(raw[-400:], "\0", full, {})[-12:]     # the recent past, your own lines included
+    st = {}
+    short = lambda line: line                                  # chat_view has already shaped the lines
 
     def new_lines():
-        nonlocal pos, mine
+        nonlocal pos
         with open(out_path, "rb") as f:
             if os.fstat(f.fileno()).st_size < pos:   # cleared at compaction: start from the top
                 pos = 0
@@ -2914,13 +2965,7 @@ def cmd_chat(agent_id):
             chunk = f.read()
         cut = chunk.rfind(b"\n") + 1   # whole lines only
         pos += cut
-        shown = []
-        for line in chunk[:cut].decode(errors="replace").splitlines():
-            if not line.startswith("    "):
-                mine = line[20:].startswith(own)
-            if not mine:
-                shown.append(short(line))
-        return shown
+        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st)
 
     if sys.stdin.isatty():
         return chat_terminal(agent_id, d, fifo, recent, new_lines, short)
@@ -3249,9 +3294,10 @@ def main(argv):
     if argv[:1] == ["service"]:
         return cmd_service(argv[1:])
     if argv[:1] == ["chat"]:
-        if len(argv) != 2:
-            sys.exit("usage: hobkin chat ID")
-        return cmd_chat(argv[1])
+        pos, opts = split_args(argv[1:], {"--full"}, set())
+        if len(pos) != 1:
+            sys.exit("usage: hobkin chat ID [--full]   (--full: tool output too, as in the out file)")
+        return cmd_chat(pos[0], full=bool(opts.get("--full")))
     if argv[:1] == ["send"]:
         if len(argv) < 3:
             sys.exit("usage: hobkin send ID TEXT")

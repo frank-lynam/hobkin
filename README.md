@@ -77,6 +77,9 @@ Without `URL MODEL KEY` it uses the model you've already set up.
   and see exactly what the model sees with `cat`.
 - **Many per account.** Each agent has its own id and folder, and a lock stops
   two processes running the same one.
+- **With or without a work system.** Give it skills for a tracker or a queue and it
+  pulls work from there; with none, its work is what you ask it in the chat, and
+  between requests it waits rather than wandering the machine.
 
 ## The long way
 
@@ -94,7 +97,9 @@ Then, from another terminal, chat with it:
 hobkin chat 7f3a91c2
 ```
 
-Its output appears as it comes, and each line you type (or paste) is sent;
+Its replies appear as they come, and each tool call as one line (a command, a file
+read, a failed exit status), without its output; `hobkin chat ID --full` shows the
+output too, as the `out` file has it. Each line you type (or paste) is sent;
 `/stop` and the other commands work, and Ctrl-D leaves. Output never wipes out
 what you're typing (the line is redrawn below it), and you get the usual line
 editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
