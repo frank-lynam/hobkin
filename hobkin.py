@@ -51,7 +51,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 import email.utils
 import base64
@@ -482,7 +482,8 @@ TOOLS = [
     {"name": "read_file",
      "description": ("Show a file with line numbers (or list a folder). Long files come in pages: use offset "
                      "and limit to read more. Paths are relative to your shell's current folder; $HOBKIN_WORK, "
-                     "$HOBKIN_MEMORY, $HOBKIN_BLOOPERS and ~ work."),
+                     "$HOBKIN_MEMORY, $HOBKIN_BLOOPERS and ~ work. Several files? Call it once per file, all in "
+                     "the same reply."),
      "input_schema": {"type": "object", "properties": {
          "path": {"type": "string"},
          "offset": {"type": "integer", "description": "First line to show (1 = the start)."},
@@ -611,6 +612,11 @@ HOT_TAKE_CHAT = ("[hobkin: a task or an idea? Start your reply with a hot take: 
 FORMATTING = ("# Formatting\n\nPeople read you in a terminal that colours your replies: put file names, paths, "
               "commands, ids and other names of things in `backticks`, and the key point in **bold**. Use those "
               "two, not colour codes.")
+
+BATCHING = ("# Fewer, fuller replies\n\nEvery reply you send is one request, and requests are what's rate-limited, "
+            "not their size. So do independent things together: several tool calls in one reply (read three files "
+            "at once, or a read_file plus a grep), or one bash command that does several things (`cat a.py b.py`, "
+            "`ls src tests`, `grep -n name *.py`). Wait for a result only when your next step depends on it.")
 
 NO_WORK_SYSTEM = ("# Where your work comes from\n\nYou have no skills, so no work system (no tracker, no queue). "
                   "Your work is what people ask you for here. Do it, report, and then end your turn and wait for "
@@ -1804,6 +1810,7 @@ class Agent:
             if text.strip():
                 parts.append(text.strip())
         parts.append(FORMATTING)
+        parts.append(BATCHING)
         if self.cfg.get("wake") if hasattr(self, "cfg") else None:
             parts.append(WAKE_NOTE)
         if getattr(self, "safe", None):

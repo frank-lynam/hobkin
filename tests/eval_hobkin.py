@@ -404,9 +404,36 @@ def four_steps(args):
         r.cleanup()
 
 
+def batching(args):
+    """Three small files to read for one answer: how many model requests does it take? (Rate limits are per
+    request, so reading them together beats one at a time.)"""
+    r = Run(args, "batch")
+    try:
+        facts = {"colour.txt": "The colour is teal.", "animal.txt": "The animal is an otter.", "number.txt": "The number is 4417."}
+        for name, text in facts.items():
+            open(os.path.join(r.home, name), "w").write(text + "\n")
+        paths = ", ".join(os.path.join(r.home, n) for n in facts)
+        r.say(f"Read these three files and tell me the colour, the animal and the number in one sentence: {paths}")
+        r.settle(quiet=15, limit=240)
+        msgs = r.context()[1:]
+        requests, answered = 0, None
+        for m in msgs:
+            if m["role"] == "assistant":
+                requests += 1
+                text = " ".join(b.get("text", "") for b in m["content"] if b.get("type") == "text").lower()
+                if all(w in text for w in ("teal", "otter", "4417")):
+                    answered = requests
+                    break
+        return {"answered": answered is not None,
+                "in 2 requests or fewer": answered is not None and answered <= 2,
+                "in 3 requests or fewer": answered is not None and answered <= 3}
+    finally:
+        r.cleanup()
+
+
 SCENARIOS = {"queue": queue_job, "badidea": bad_idea, "memory": stale_memory, "hello": hello,
              "reading": honest_reading, "slow": slow_command, "chatidle": chat_idle, "chatbusy": chat_busy,
-             "chatpoll": chat_poll, "fresh": fresh_hi, "steps": four_steps}
+             "chatpoll": chat_poll, "fresh": fresh_hi, "steps": four_steps, "batch": batching}
 
 
 def main():
