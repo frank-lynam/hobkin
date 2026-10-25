@@ -624,7 +624,7 @@ PRUNE = ("[hobkin: your {what} is {n} lines, over its {limit}-line limit. Prune 
 
 PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: **How it works:** what you "
               "looked at and saw; **Why it doesn't:** do the thing, with the evidence; **What would:** make it do "
-              "the thing, and how you'll check. Then make this change.")
+              "the thing, and how you'll check. Then make this change.{missing}")
 
 # Files that are part of planning (or memory), not the work: always writable
 PLANNING_FILES = {"checklist.md", "notes.md", "memory.md", "bloopers.md"}
@@ -639,8 +639,9 @@ SAFE_REFUSED = ("Not written: safe mode lets you write only in your workspace ($
                 "does it, and ask a human to review and run it.")
 
 CONTEXT_HALF = ("[hobkin: your context is {pct}% full. Read narrowly from here (grep for what you need, read_file "
-                "with offset and limit, `| tail`), keep your checklist and MEMORY.md current, and finish the step "
-                "you're on: your context will be compacted after it, and the checklist is what carries you over.]")
+                "with offset and limit, `| tail`; a grep plus a targeted read still counts as reading it), keep your "
+                "checklist, NOTES.md and MEMORY.md current, and finish the step you're on: your context will be "
+                "compacted after it, and those files are what carry you over.]")
 
 # The front desk: what the agent is asked when someone writes while one of its commands is still running
 FRONT_DESK = ("[hobkin: {who} just wrote to you{where}, {stamp}, while that is still running:]\n{text}\n[hobkin: answer them "
@@ -1523,6 +1524,7 @@ class Agent:
         self.half_warned = False           # told once per context that it's half full
         self.idle_compact_tried = False
         self.plan_checked = False
+        self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
@@ -1993,7 +1995,10 @@ class Agent:
         for n, job in list((self.state.get("jobs") or {}).items()):
             exit_file = os.path.join(job["dir"], "exit")
             if not os.path.exists(exit_file):
-                continue
+                if not self.job_alive(job):
+                    write_atomic(exit_file, "?\n")      # gone without an exit code (killed, or its folder cleared)
+                else:
+                    continue
             code = read(exit_file).strip() or "?"
             ended = os.path.getmtime(exit_file)
             tail = clip(read(os.path.join(job["dir"], "out.log")), 0, 2000).lstrip("\n")
@@ -2006,6 +2011,19 @@ class Agent:
             self.log("job", text)
             out.append(text)
         return out
+
+    @staticmethod
+    def job_alive(job: dict) -> bool:
+        """Is a background job's process still there? (A minute's grace, for a job that's just starting.)"""
+        if time.time() - job.get("started", 0) < 60:
+            return True
+        try:
+            os.kill(int(job.get("pid") or 0), 0)
+            return True
+        except (ProcessLookupError, ValueError):
+            return False
+        except PermissionError:
+            return True
 
     def due_events(self) -> list[str]:
         """What's come due on its own: reminders, finished background jobs, and a hello when someone's
@@ -2131,7 +2149,12 @@ class Agent:
                 head = outf.read(keep // 2).decode(errors="replace")
                 outf.seek(size - keep // 2)
                 tail = outf.read().decode(errors="replace")
-                out = f"{head}\n... [{size - keep} bytes cut] ...\n{tail}"
+                full = self.p("last-output.log")             # all of it, for the part that was cut
+                outf.seek(0)
+                with open(full, "wb") as f:
+                    shutil.copyfileobj(outf, f)
+                out = (f"{head}\n... [{size - keep} bytes cut: the whole output is in {full} until your next long "
+                       f"command; grep it] ...\n{tail}")
         new_cwd = read(cwd_file).strip()
         if new_cwd and os.path.isdir(new_cwd):
             cwd = new_cwd
@@ -2689,7 +2712,10 @@ class Agent:
                 and not str(inp.get("path", "")).startswith(("$HOBKIN_MEMORY", "$HOBKIN_BLOOPERS")):
             self.plan_checked = True               # once per turn: a second try goes through
             self.log(name, f"(not run: no plan said yet) {inp.get('path', '')}")
-            return PLAN_FIRST, True
+            said = [label for pattern, label in ((r"\bhow it works", "How it works"), (r"\bwhy it doesn", "Why it doesn't"))
+                    if re.search(pattern, self.turn_said, re.I)]
+            missing = f" You've said {' and '.join(said)}; what's missing is **What would:**." if said else ""
+            return PLAN_FIRST.format(missing=missing), True
         tools = {
             "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")),
                                           bool(inp.get("background")), inp.get("announced")),
@@ -2886,6 +2912,10 @@ class Agent:
         if checklist:
             text += (f"[Your checklist, as it is now ({checklist[0]}): carry on from its first unchecked step.]\n"
                      f"{clip(checklist[1], 6000, 2000)}\n\n")
+            notes = os.path.join(os.path.dirname(checklist[0]), "NOTES.md")
+            if os.path.isfile(notes):                    # ids, shapes, what was asked: verbatim, not remembered
+                text += f"[Your notes for this task, as they are now ({notes}):]\n{clip(read(notes), 6000, 2000)}\n\n"
+            self.plan_carried = True                     # the plan came over with it: no need to say it again
         text += "\n\n".join(carry) if carry else ("[You'd finished; nothing in progress.]" if idle else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
         stamp, n = time.strftime('%Y%m%d-%H%M%S'), 1
@@ -3171,11 +3201,12 @@ class Agent:
 
     def plan_said(self) -> bool:
         """Has the agent said **What would:** (its plan) out loud in this turn?"""
-        return re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
+        return self.plan_carried or re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
 
     def add_user(self, text: str) -> None:
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
+        self.plan_carried = False
         block = {"type": "text", "text": text}
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages[-1]["content"].append(block)
