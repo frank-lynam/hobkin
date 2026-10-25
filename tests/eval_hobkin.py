@@ -392,9 +392,10 @@ def four_steps(args):
         log = r.read("out")
         change = re.search(r"^\S+ \S+ (?:write_file|edit_file)> (?!\(not run)(?!.*(?:CHECKLIST|NOTES|MEMORY|BLOOPERS))", log, re.M | re.I)
         before = log[:change.start()] if change else log
-        said = "\n".join(re.findall(r"^\S+ \S+ agent> (.*(?:\n    .*)*)", before, re.M)).lower()
+        said = "\n".join(re.findall(r"^\S+ \S+ (?:agent|goal)> (.*(?:\n    .*)*)", before, re.M)).lower()   # replies and goals
         pos = [said.find(h) for h in ("how it works", "why it doesn", "what would")]
         return {"fixed it": out == "3",
+                "set a goal": "goal> Goal:" in log,
                 "said how it works before changing anything": pos[0] >= 0,
                 "said why it doesn't before changing anything": pos[1] >= 0,
                 "said what would before changing anything": pos[2] >= 0,

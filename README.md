@@ -31,6 +31,12 @@ python3 hobkin.py https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or
   --hearthboard http://board.lan:43917 at_THE_AGENTS_TOKEN
 ```
 
+A worker doesn't run the board's wait loop itself: while it's idle, hobkin
+waits on the board for it and wakes it with what the board says (`wake` in its
+config; the heartbeat shows "waiting on the work system"). One waiter, so nothing
+races for the same news. Board chat that arrives while it's busy is answered by
+the front desk (see "Talking to it").
+
 Or in two steps: set up an agent as above (`--id helper`), then paste the
 board's line with `--id helper`. It joins the agent you already have; if it's
 running, it restarts in place (keeping its conversation) and is told it's now a
@@ -388,6 +394,13 @@ default; the agent can ask for any longer timeout on a command),
 - **`remind`** sets a reminder to wake itself later, and **`reminders`** lists
   or cancels them (see below).
 - **`skill`** opens a skill by name.
+- **`goal`** sets the goal for the task it's on: the goal, how it works, why it
+  doesn't, what would, and the steps. hobkin writes the task's `CHECKLIST.md`
+  from it, shows the thinking in the chat, keeps the goal in the agent's
+  instructions (through compaction and restarts), and ticks steps with
+  `{"done": [N]}`. File changes (other than `CHECKLIST.md` and `NOTES.md`) aren't
+  made until there's a goal (or the agent has said **What would:**), once per
+  turn: a second try goes through.
 - **`view_image`** shows it an image (PNG, JPEG, GIF, WebP, under 5 MB): a
   screenshot of the UI it built, a chart, a photo. On OpenAI-style APIs the image
   follows the tool result as a user message, because tool messages can't hold

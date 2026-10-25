@@ -809,9 +809,9 @@ try:
           and not os.path.exists(hs + "/_shared/skills/hearthboard")
           and "HEARTHBOARD_TOKEN=hb-good" in sec and "HEARTHBOARD_URL=http://127.0.0.1:48790/board" in sec
           and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
-    check("[hearthboard] on the configured model, with the board's wait loop as its idle prompt",
+    check("[hearthboard] on the configured model, with hobkin waiting on the board for it",
           "hi board" in open(ad + "/context.jsonl").read() and "You're now a worker" in open(ad + "/context.jsonl").read()
-          and "wait loop" in json.load(open(ad + "/config.json"))["idle_prompt"]
+          and "/api/wait" in json.load(open(ad + "/config.json"))["wake"]["url"]
           and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
     check("[hearthboard] other agents here don't get the board's skill (s1 isn't a worker)",
           "You have no skills, so no work system" in open(hs + "/s1/context.jsonl").read())
@@ -837,7 +837,7 @@ try:
           r.returncode == 0 and "an agent you already have (running)" in r.stdout and "restarted" in r.stdout
           and open(hs + "/s3/out").read().count(" up: ") > ups and os.path.exists(hs + "/s3/skills/hearthboard/SKILL.md")
           and "HEARTHBOARD_TOKEN=hb-good" in open(hs + "/s3/secrets.env").read()
-          and "wait loop" in json.load(open(hs + "/s3/config.json"))["idle_prompt"]
+          and "/api/wait" in json.load(open(hs + "/s3/config.json"))["wake"]["url"]
           and "You're now a worker on the hearthboard at http://127.0.0.1:48790/board, as worker.7" in c3, r.stdout + r.stderr)
     run("send", "s3", "/stop")
     run("send", "worker-7", "/stop")

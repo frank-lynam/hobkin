@@ -51,7 +51,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 import email.utils
 import base64
@@ -173,6 +173,10 @@ DEFAULT_CONFIG = {
     # The url returns {"messages": [{"id", "thread", "from", "text", "needs_reply"}]}; replies are POSTed
     # to `reply` as plain text. ${NAME} in headers comes from secrets.env.
     "inbox": None,
+    # Waiting for work, done by hobkin instead of by the agent (set up by --hearthboard): while the agent is
+    # idle, hobkin long-polls `url` (headers as for inbox) and wakes it with the answer, unless the answer
+    # matches `quiet` (e.g. {"reason": "timeout"}). One waiter, so nothing races for the same news.
+    "wake": None,
     # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
     # for one (so an SSO login server in a redirect chain gets it too):
     # {"cert": "~/.certs/me.pem", "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem", "password_file": ...}
@@ -208,7 +212,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
-                "inbox": (dict, type(None))}
+                "inbox": (dict, type(None)), "wake": (dict, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -351,12 +355,15 @@ off track; don't wait for them, though):
    two sentences, with the evidence (the file and line, the output, the error).
    For new work, what's missing. Not sure yet? Look more; never guess a cause
    and then fix the guess.
-5. **What would.** Say **What would:** what would make it do the thing, which
-   files and commands you'll change, and how you'll check it worked. Write it
-   in `CHECKLIST.md` in the task folder as small `- [ ]` steps, each one you
-   can check, ending with "verify the result" and "tidy up".
-6. **Make it do the thing**, one checklist step at a time. After each step,
-   check it really worked, then mark it `- [x]`. Found more work? Add steps.
+5. **What would.** Set it with the **goal** tool: the goal, how it works, why
+   it doesn't, what would make it do the thing (which files and commands you'll
+   change, and how you'll check), and the steps, small ones you can check,
+   ending with "verify the result" and "tidy up". It writes `CHECKLIST.md` in
+   the task folder, shows your thinking to whoever's watching, and keeps it
+   through compaction. File changes wait until a goal's set.
+6. **Make it do the thing**, one step at a time. After each step, check it
+   really worked, then tick it: goal with `{"done": [N]}`. Found more work? Set
+   the goal again with the extra steps.
    Then verify the whole result: run the tests, run the program, look at the
    output. "It should work" is not done; "I ran it and it printed 377" is done.
 7. **Tidy up and report** (see "Finishing a task"), then grab the next task.
@@ -531,6 +538,19 @@ TOOLS = [
     {"name": "skill",
      "description": "Open a skill by name: its instructions, its folder and its files. Open the skill before a task it covers.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "goal",
+     "description": ("Set the goal for the task you're on, once you've worked out what would do it: hobkin writes "
+                     "CHECKLIST.md in the task folder (your current folder, or a new one named for the goal), shows "
+                     "it to whoever's watching, and keeps it in front of you, through compaction too. Until a goal "
+                     "is set, file changes (other than CHECKLIST.md and NOTES.md) aren't made. After each step, "
+                     "call it with just {\"done\": [N]} to tick it."),
+     "input_schema": {"type": "object", "properties": {
+         "goal": {"type": "string", "description": "What done looks like, in a sentence."},
+         "how_it_works": {"type": "string", "description": "What you looked at and saw."},
+         "why_it_doesnt": {"type": "string", "description": "Why it doesn't do the thing, with the evidence (for new work: what's missing)."},
+         "what_would": {"type": "string", "description": "What would make it do the thing, and how you'll check it worked."},
+         "steps": {"type": "array", "items": {"type": "string"}, "description": "Small steps you can check, in order."},
+         "done": {"type": "array", "items": {"type": "integer"}, "description": "Step numbers just finished, e.g. [2]."}}}},
 ]
 
 
@@ -651,6 +671,11 @@ FRONT_DESK = ("[hobkin: {who} just wrote to you{where}, {stamp}, while that is s
 STILL_RUNNING = "(still running: not finished yet)"
 FRONT_DESK_DONE = ("[While that ran, {who} wrote{where} and you answered straight away{posted}:]\n{who}: {text}\n"
                    "you: {reply}\n[If they asked for something, do it now or put it in your checklist.]")
+
+WAKE_NOTE = ("# Waiting for work\n\nhobkin waits on your work system for you: when you've nothing left to do, just "
+             "end your turn, and you'll be woken with what it says there. Don't run its wait loop yourself (one "
+             "waiter, so nothing races for the same news).")
+WOKEN = "[from hobkin: woken by your work system, {stamp}. It says:]\n{body}"
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -1529,6 +1554,10 @@ class Agent:
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
         self.inbox_checked = 0.0
+        self.waker = None                  # the thread long-polling the wake URL while idle
+        self.woken = None                  # what it brought back: (ok, body)
+        self.wake_backoff = 0.0
+        self.wake_last = ("", 0.0)         # the last answer delivered, and when (the same one isn't sent twice soon)
         self.wrap_up_sent = False
         self.voice_sent = False
         self.pending = []          # operator messages not yet given to the model
@@ -1775,6 +1804,8 @@ class Agent:
             if text.strip():
                 parts.append(text.strip())
         parts.append(FORMATTING)
+        if self.cfg.get("wake") if hasattr(self, "cfg") else None:
+            parts.append(WAKE_NOTE)
         if getattr(self, "safe", None):
             parts.append(SAFE_MODE.format(coverage=self.state.get("safe_mode", "")))
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
@@ -1785,6 +1816,10 @@ class Agent:
                          "Before you start a task that a skill below covers, open it with the `skill` tool and follow "
                          "it step by step.\n\n"
                          + "\n".join(f"- **{n}**: {d}" for n, (d, p) in sorted(skills.items())))
+        g = (self.state.get("goal") or {}) if hasattr(self, "state") else {}
+        if g.get("open"):
+            parts.append(f"# Your current goal ({g['folder']})\n\n{g['goal']}\n\n**What would:** {g['what_would']}\n\n"
+                         + "\n".join(f"- [{'x' if i + 1 in g['done'] else ' '}] {i + 1}. {t}" for i, t in enumerate(g["steps"])))
         if os.path.exists(self.p("reminders.json")):
             data, ok = self.load_reminders()
             if ok and data["items"]:
@@ -2011,6 +2046,56 @@ class Agent:
             self.log("job", text)
             out.append(text)
         return out
+
+    def goal_checklist(self, g: dict) -> str:
+        return (f"# Goal\n\n{g['goal']}\n\n## How it works\n\n{g['how_it_works'] or '-'}\n\n## Why it doesn't\n\n"
+                f"{g['why_it_doesnt'] or '-'}\n\n## What would\n\n{g['what_would']}\n\n## Steps\n\n"
+                + "".join(f"- [{'x' if i + 1 in g['done'] else ' '}] {i + 1}. {t}\n" for i, t in enumerate(g["steps"])))
+
+    def tool_goal(self, inp: dict) -> ToolResult:
+        """Set the task's goal (writes CHECKLIST.md, shows the thinking, opens file changes) or tick steps."""
+        g = self.state.get("goal") or {}
+        if inp.get("done") is not None and not inp.get("goal"):
+            if not g.get("open"):
+                return "No goal is set. Set one first (goal, what_would, steps).", True
+            done = inp["done"] if isinstance(inp["done"], list) else [inp["done"]]
+            bad = [n for n in done if not isinstance(n, int) or not 1 <= n <= len(g["steps"])]
+            if bad:
+                return f"No step {bad[0]}: the steps are 1 to {len(g['steps'])}.", True
+            g["done"] = sorted(set(g["done"]) | set(done))
+            write_atomic(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g))
+            self.step_done = True                      # a good moment to compact, if it's due
+            self.log("goal", "ticked " + ", ".join(f"{n}. {g['steps'][n - 1]}" for n in done))
+            left = [i + 1 for i in range(len(g["steps"])) if i + 1 not in g["done"]]
+            if not left:
+                g["open"] = False
+                self.save_state()
+                return f"All {len(g['steps'])} steps done: the goal is closed. Report what you did.", False
+            self.save_state()
+            return f"Ticked. Next: {left[0]}. {g['steps'][left[0] - 1]}", False
+        missing = [k for k in ("goal", "what_would", "steps") if not inp.get(k)]
+        if missing:
+            return f"A goal needs {', '.join(missing)} (and how_it_works, why_it_doesnt).", True
+        folder = self.cwd()
+        if os.path.realpath(folder) == os.path.realpath(self.work):   # not in a task folder yet: make one
+            slug = re.sub(r"[^a-z0-9]+", "-", str(inp["goal"]).lower()).strip("-")[:40] or "task"
+            folder = os.path.join(self.work, slug)
+            os.makedirs(folder, exist_ok=True)
+        keep = g.get("done", []) if g.get("open") and g.get("folder") == folder else []
+        g = {"goal": str(inp["goal"]), "how_it_works": str(inp.get("how_it_works") or ""),
+             "why_it_doesnt": str(inp.get("why_it_doesnt") or ""), "what_would": str(inp["what_would"]),
+             "steps": [str(t) for t in inp["steps"]], "done": [n for n in keep if n <= len(inp["steps"])],
+             "folder": folder, "open": True, "set": time.time()}
+        self.state["goal"] = g
+        path = os.path.join(folder, "CHECKLIST.md")
+        write_atomic(path, self.goal_checklist(g))
+        self.save_state()
+        self.log("goal", f"Goal: {g['goal']}\nHow it works: {g['how_it_works'] or '-'}\nWhy it doesn't: "
+                         f"{g['why_it_doesnt'] or '-'}\nWhat would: {g['what_would']}\n"
+                 + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(g["steps"])))
+        return (f"Goal set: {path} written ({len(g['steps'])} steps). " +
+                (f"Your task folder is {folder}: work from there. " if folder != self.cwd() else "") +
+                "Now make it do the thing, one step at a time; after each, call goal with {\"done\": [N]}."), False
 
     @staticmethod
     def job_alive(job: dict) -> bool:
@@ -2478,6 +2563,56 @@ class Agent:
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.read()
 
+    def start_waker(self) -> None:
+        """While idle: long-poll the wake URL in a thread (the main loop keeps reading messages meanwhile)."""
+        wake = self.cfg.get("wake") or {}
+        if self.waker or time.time() < self.wake_backoff or not wake.get("url"):
+            return
+        env = {**os.environ, **load_env_file(os.path.join(SHARED, "secrets.env")), **load_env_file(self.p("secrets.env"))}
+        headers = {k: re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), ""), str(v))
+                   for k, v in (wake.get("headers") or {}).items()}
+        headers["user-agent"] = USER_AGENT
+
+        def poll():
+            started = time.time()
+            try:
+                req = urllib.request.Request(str(wake["url"]), headers=headers)
+                with urllib.request.urlopen(req, timeout=float(wake.get("timeout") or 70)) as r:
+                    self.woken = (True, r.read().decode(errors="replace"), started)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                self.woken = (False, str(e), started)
+        self.waker = threading.Thread(target=poll, daemon=True)
+        self.waker.start()
+
+    def take_wake(self) -> str | None:
+        """What the waker brought back, if it's worth waking the agent for (else None, and it waits again)."""
+        if not self.woken:
+            return None
+        ok, body, started = self.woken
+        self.woken, self.waker = None, None
+        if not ok:
+            if not self.state.get("wake_warned"):
+                self.state["wake_warned"] = True
+                self.log("hobkin", f"couldn't wait on the work system ({body}); trying again every 30s")
+            self.wake_backoff = time.time() + 30
+            return None
+        self.state.pop("wake_warned", None)
+        if time.time() - started < 5:
+            self.wake_backoff = time.time() + 5          # it answered at once: don't hammer it
+        quiet = (self.cfg.get("wake") or {}).get("quiet") or {}
+        try:
+            data = json.loads(body) if body.strip() else None
+        except ValueError:
+            data = body
+        if data is None or (isinstance(data, dict) and quiet and all(data.get(k) == v for k, v in quiet.items())):
+            return None
+        same = body.strip() == self.wake_last[0]
+        if same and time.time() - self.wake_last[1] < 300:   # it was told this already: give it time
+            self.wake_backoff = time.time() + 60
+            return None
+        self.wake_last = (body.strip(), time.time())
+        return clip(body.strip(), 6000, 2000)
+
     def check_inbox(self) -> None:
         """The other inbox (a tracker's chat, say): new messages that need a reply are answered by the front
         desk while the command runs, and the reply is posted back. Messages that only need reading are left
@@ -2725,6 +2860,7 @@ class Agent:
             "remind": lambda: self.tool_remind(inp),
             "reminders": lambda: self.tool_reminders(inp),
             "skill": lambda: self.open_skill(s("name")),
+            "goal": lambda: self.tool_goal(inp),
             "view_image": lambda: self.view_image(s("path")),
             "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
             "web_search": lambda: self.web_search(s("query")),
@@ -3088,6 +3224,8 @@ class Agent:
             return "working"
         if self.state.get("jobs"):
             return f"on duty, background job #{', #'.join(sorted(self.state['jobs']))} running"
+        if self.cfg.get("wake"):
+            return "on duty, waiting on the work system"
         coming = []
         try:                                       # read-only: never logs from this thread
             items = json.loads(read(self.p("reminders.json"), "{}") or "{}").get("items", [])
@@ -3165,6 +3303,17 @@ class Agent:
                     self.compact("a task is done: a good moment", idle=True)   # between tasks, not mid-way
                     continue
                 self.save_state("idle")
+                if self.cfg.get("wake") and not self.paused:
+                    news = self.take_wake()
+                    if news:
+                        self.log("hobkin", "woken by the work system")
+                        self.add_user(WOKEN.format(stamp=self.stamp(), body=news))
+                        idle_since = time.time()
+                        continue
+                    self.start_waker()
+                    self.save_state("idle")
+                    self.poll_input(min(1.0, self.next_reminder_in() or 1.0))
+                    continue
                 prompt, every = self.cfg.get("idle_prompt"), float(self.cfg.get("idle_seconds") or 300)
                 if prompt == DEFAULT_CONFIG["idle_prompt"] and not self.has_work_system():
                     prompt = None        # the default points at work sources, and there are none: nothing to nag about
@@ -3201,6 +3350,8 @@ class Agent:
 
     def plan_said(self) -> bool:
         """Has the agent said **What would:** (its plan) out loud in this turn?"""
+        if (self.state.get("goal") or {}).get("open"):
+            return True
         return self.plan_carried or re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
 
     def add_user(self, text: str) -> None:
@@ -3365,7 +3516,7 @@ def cmd_send(agent_id, text):
 
 # Out-log entries that are tool calls (chat shows them as one line): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full.
-TOOL_WHO = {"$", "=", "job", "reminder"} | {t["name"] for t in TOOLS}
+TOOL_WHO = ({"$", "=", "job", "reminder"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
 
 
 # Colour in chat (only on a terminal, and not with NO_COLOR set): who's talking, `code` and file
@@ -3637,9 +3788,6 @@ def cmd_models(argv):
     print(models_text(Model(name, cfg["models"][name])))
 
 
-HEARTHBOARD_IDLE = "Run your hearthboard wait loop (GET /api/wait, as your hearthboard skill says) and do what it says."
-
-
 def hearthboard_user(url: str, token: str) -> dict:
     """Who a hearthboard token belongs to ({username, kind, ...}), or exit saying why not."""
     try:
@@ -3673,7 +3821,10 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
         cfg = json.loads(read(cfg_path) or "{}")
     except json.JSONDecodeError:
         cfg = {}
-    cfg.update({"idle_prompt": HEARTHBOARD_IDLE, "idle_seconds": 60,
+    cfg.update({"idle_prompt": None,
+                # hobkin waits on the board while the agent's idle, and wakes it with what the board says
+                "wake": {"url": f"{url}/api/wait?timeout=50", "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"},
+                         "quiet": {"reason": "timeout"}},
                 # The board's chat, for the front desk: answered while the agent's busy running a command
                 "inbox": {"url": f"{url}/api/chat/inbox?flat=1", "reply": f"{url}/api/chat/{{thread}}/messages",
                           "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"}, "every": 15}})
