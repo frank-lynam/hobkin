@@ -518,6 +518,38 @@ job logs, with a private temp folder instead of `/tmp`.
   the state before and after), so the agent reads the results itself: you run it
   and say "done".
 
+## Break glass
+
+For an incident, when you want the agent working it as one of the hands on deck:
+
+```sh
+hobkin breakglass ops-1 "api returning 500s since 14:10" --for 2h [--budget 50|none]
+hobkin breakglass ops-1 --off          # end it early
+```
+
+Until it expires the agent works fully on its own:
+- **No brakes:** safe mode is lifted, and nothing is announced first or waits.
+- **Budget:** the daily budget is whatever `--budget` says, if you give one.
+- **Its instructions say:** it's an incident. Stabilize first, then find the
+  cause. Prefer changes that can be undone, and note how. Say each significant
+  action before taking it, and post a status every 10–15 minutes. Still ask
+  before destroying data. Keep going until it's stable.
+- **When idle,** it's nudged every 2 minutes to check and post a status, instead
+  of waiting quietly.
+- **A timeline** of every command (with its exit code), every file change and
+  everything it says goes to `work/incident-<time>.md`. hobkin writes it, not the
+  agent, so it's complete for the post-mortem.
+- **Start and end** go through `alert_command`. When time's up it goes back to
+  normal (back into the sandbox, if it was in safe mode) and is asked for a
+  summary: what happened, what it changed and how to undo it, what's still open.
+
+The switch is a command you run, recorded in the agent's own `config.json`. A
+safe-mode agent can't write there, so it can't break the glass itself. (An agent
+not in safe mode can already do anything your account can.) Running it again
+extends it; a running agent picks it up by restarting in place, keeping its
+conversation. hobkin can't grant `sudo`: for a crisis account with more
+privileges, run the agent as that user.
+
 ## Reminders
 
 An agent can schedule its own wake-ups: `remind` with `in` ("20m", "2h",

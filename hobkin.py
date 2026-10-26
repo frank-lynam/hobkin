@@ -13,6 +13,7 @@ line, or as a worker on hearthboard.
     hobkin send ID TEXT    message an agent (queued if it isn't running)
     hobkin list            list agents
     hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
+    hobkin breakglass ID "what's wrong" [--for 2h]   an incident: the agent acts fully on its own (--off ends it)
     hobkin --version
 
 Set up and go in one line (no config editing):
@@ -51,7 +52,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 import email.utils
 import base64
@@ -177,6 +178,10 @@ DEFAULT_CONFIG = {
     # idle, hobkin long-polls `url` (headers as for inbox) and wakes it with the answer, unless the answer
     # matches `quiet` (e.g. {"reason": "timeout"}). One waiter, so nothing races for the same news.
     "wake": None,
+    # Break-glass mode, for an incident: set by a person with `hobkin breakglass ID "reason" --for 2h`, never by
+    # the agent. Until it expires the agent works fully autonomously: safe mode lifted, nothing announced
+    # first, the daily budget as given, an incident timeline kept for it. {"reason", "by", "declared", "until"}
+    "break_glass": None,
     # fetch_url and web_search. client_cert: x509 for internal sites, offered to any site that asks
     # for one (so an SSO login server in a redirect chain gets it too):
     # {"cert": "~/.certs/me.pem", "key": "~/.certs/me.key", "ca": "~/.certs/corp-ca.pem", "password_file": ...}
@@ -212,7 +217,8 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
-                "inbox": (dict, type(None)), "wake": (dict, type(None))}
+                "inbox": (dict, type(None)), "wake": (dict, type(None)),
+                "break_glass": (dict, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -682,6 +688,25 @@ WAKE_NOTE = ("# Waiting for work\n\nhobkin waits on your work system for you: wh
              "end your turn, and you'll be woken with what it says there. Don't run its wait loop yourself (one "
              "waiter, so nothing races for the same news).")
 WOKEN = "[from hobkin: woken by your work system, {stamp}. It says:]\n{body}"
+
+BREAK_GLASS = ("# Break glass: an incident\n\n{by} declared an incident at {declared}: {reason}. Until {until} you're "
+               "in break-glass mode: all hands on deck, and you're one of the hands. You act on your own, fully: "
+               "nothing waits for approval{lifted}. Use it well:\n"
+               "- **Stabilize first, then find the cause.** Getting the service back comes before understanding it.\n"
+               "- **Prefer what can be undone:** copy a config before you edit it, note how to undo each change.\n"
+               "- **Keep people with you:** say each significant action before you take it, and post a short status "
+               "every 10-15 minutes where the people are (your work system's chat, or here). Short and often.\n"
+               "- **Still ask first** before anything that destroys data: dropping a database, deleting volumes or "
+               "backups, force-pushing.\n"
+               "- **Keep going** until it's stable; don't wait to be told.\n"
+               "- **When it's over** (or the time runs out), write a summary: what happened, what you changed (and how "
+               "to undo it), what's still open.\n\n"
+               "hobkin keeps a timeline of every command, change and message in {log}.")
+GLASS_IDLE = ("[from hobkin: the incident is still open ({reason}), {stamp}. Check the state of things, post a short "
+              "status where the people are, and carry on.]")
+GLASS_ENDED = ("[from hobkin: break-glass mode has ended, {stamp}; you're back to normal{safe}. Write your summary now, "
+               "where the people are: what happened, what you changed (and how to undo it), what's still open. The "
+               "timeline is in {log}.]")
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -1558,6 +1583,7 @@ class Agent:
         self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
+        self.glass = None                  # break-glass mode, while it's on: the config entry
         self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
         self.inbox_checked = 0.0
         self.waker = None                  # the thread long-polling the wake URL while idle
@@ -1619,6 +1645,7 @@ class Agent:
             sys.exit(f"hobkin: {msg}")
         self.state = self.load_state()
         self.state.update({"id": self.id, "pid": os.getpid(), "model": self.model.describe()})
+        self.setup_glass()
         self.setup_safe_mode()
         self.state.setdefault("created", now())
         self.messages = self.load_context()
@@ -1632,10 +1659,51 @@ class Agent:
                  f"{self.state.get('context_tokens') or 'unknown'} ({self.state.get('context_source') or 'will learn from errors'})")
         self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
 
+    def setup_glass(self) -> None:
+        """Break-glass mode, if a person has declared one that hasn't expired: start its timeline and say so."""
+        g = self.cfg.get("break_glass")
+        if not g or float(g.get("until") or 0) <= time.time():
+            self.glass = None
+            self.state.pop("break_glass", None)
+            return
+        self.glass = g
+        self.glass_log = os.path.join(self.work, time.strftime("incident-%Y%m%d-%H%M.md", time.localtime(float(g["declared"]))))
+        if not os.path.exists(self.glass_log):
+            os.makedirs(self.work, exist_ok=True)
+            write_atomic(self.glass_log, f"# Incident: {g['reason']}\n\nDeclared by {g.get('by', '?')} at "
+                                         f"{when_text(float(g['declared']))}, break-glass until {when_text(float(g['until']))}.\n\n"
+                                         "## Timeline (written by hobkin)\n\n")
+        self.state["break_glass"] = f"on until {when_text(float(g['until']))}: {g['reason']}"
+        self.log("hobkin", f"break-glass mode: {self.state['break_glass']} (timeline: {self.glass_log})")
+        if self.state.get("glass_alerted") != g["declared"]:
+            self.state["glass_alerted"] = g["declared"]
+            self.alert(f"hobkin {self.id}: break-glass mode ON until {when_text(float(g['until']))}: {g['reason']}")
+
+    def timeline(self, line: str) -> None:
+        """A line in the incident's timeline (break-glass mode only), written by hobkin, not the agent."""
+        if self.glass:
+            with open(self.glass_log, "a", encoding="utf-8") as f:
+                f.write(f"- {time.strftime('%H:%M:%S')} {line}\n")
+
+    def end_glass(self) -> None:
+        """Break-glass time is up: back to normal (re-sandboxed, if it was in safe mode), and asked for a summary."""
+        log = self.glass_log
+        self.timeline("break-glass mode ended")
+        self.glass = None
+        self.state.pop("break_glass", None)
+        self.log("hobkin", "break-glass mode ended")
+        self.alert(f"hobkin {self.id}: break-glass mode OFF; back to normal. Timeline: {log}")
+        self.setup_safe_mode()
+        self.add_user(GLASS_ENDED.format(stamp=self.stamp(), log=log, safe=" (safe mode)" if self.safe else ""))
+
     def setup_safe_mode(self) -> None:
         """Safe mode: check the kernel can sandbox (and that it really does, here), or refuse to start."""
         conf = self.cfg.get("safe_mode")
         self.safe = None
+        if conf and self.glass:                    # break glass lifts it, until it ends
+            self.log("hobkin", "safe mode lifted for break-glass mode")
+            self.state.pop("safe_mode", None)
+            return
         if not conf:
             self.state.pop("safe_mode", None)
             return
@@ -1815,8 +1883,13 @@ class Agent:
             parts.append(WAKE_NOTE)
         if getattr(self, "safe", None):
             parts.append(SAFE_MODE.format(coverage=self.state.get("safe_mode", "")))
+        if getattr(self, "glass", None):
+            g = self.glass
+            parts.append(BREAK_GLASS.format(by=g.get("by", "someone"), declared=when_text(float(g["declared"])),
+                                            reason=g["reason"], until=when_text(float(g["until"])), log=self.glass_log,
+                                            lifted=" (and safe mode is lifted)" if self.cfg.get("safe_mode") else ""))
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
-        if not skills:
+        if not skills and not getattr(self, "glass", None):
             parts.append(NO_WORK_SYSTEM)
         if skills:
             parts.append("# Skills\n\nA skill is a set of instructions (and sometimes scripts) for one kind of task. "
@@ -2142,6 +2215,8 @@ class Agent:
     def announce_check(self, command: str, announced: str | None) -> ToolResult | None:
         """Outward-facing commands are announced first and run after announce_delay unless vetoed.
         None: go ahead. Otherwise the (not-run) result to give the agent."""
+        if self.glass:                               # break glass: fully autonomous
+            return None
         label = next((name for name, rx in (self.cfg.get("announce_first") or {}).items()
                       if re.search(rx, command)), None)
         if not label:
@@ -2252,6 +2327,7 @@ class Agent:
             cwd = new_cwd
         self.state["cwd"] = cwd
         status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)}"
+        self.timeline(f"`{clip(command.strip(), 300, 100)}` ({reason or f'exit code {proc.returncode}'})")
         shown = clip(out, 1000, 800)
         self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
         return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
@@ -2555,6 +2631,7 @@ class Agent:
             if not reply:
                 return
             self.log("agent", reply)
+            self.timeline(f"answered {self.who}: " + clip(" ".join(reply.split()), 300, 100))
             self.answered.append((self.who, self.pending.pop(0), reply, "", ""))
             self.owe_reply = False
 
@@ -3102,7 +3179,7 @@ class Agent:
 
     # --- the loop: one step at a time; the heartbeat; run()
     def over_budget(self) -> bool:
-        budget = self.cfg.get("daily_budget_usd")
+        budget = self.glass["budget"] if self.glass and "budget" in self.glass else self.cfg.get("daily_budget_usd")
         return bool(budget) and self.state.get("spend_day") == time.strftime("%Y-%m-%d") \
             and self.state.get("spend_today", 0) >= float(budget)
 
@@ -3168,6 +3245,7 @@ class Agent:
             if b.get("type") == "text":
                 self.log("agent", b["text"])
                 self.turn_said += "\n" + b["text"]
+                self.timeline("said: " + clip(" ".join(b["text"].split()), 400, 100))
         calls = [b for b in blocks if b.get("type") == "tool_use"]
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
@@ -3185,6 +3263,8 @@ class Agent:
                 content, err = "Not run: hobkin is stopping.", True
             else:
                 content, err = self.run_tool(b.get("name"), b.get("input") or {})
+                if not err and b.get("name") in ("write_file", "edit_file"):
+                    self.timeline(f"{'wrote' if b['name'] == 'write_file' else 'edited'} {(b.get('input') or {}).get('path')}")
                 content = self.tool_nudges(b.get("name"), b.get("input") or {}, content, err)
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
         # Reminders that came due and operator messages that came in meanwhile ride along
@@ -3271,6 +3351,8 @@ class Agent:
         idle_since = time.time()
         try:
             while not self.stop and not self.restart_requested:
+                if self.glass and float(self.glass["until"]) <= time.time():
+                    self.end_glass()
                 if self.paused:
                     if self.budget_paused and not self.over_budget():      # a new day
                         self.paused = self.budget_paused = False
@@ -3310,6 +3392,15 @@ class Agent:
                     self.compact("a task is done: a good moment", idle=True)   # between tasks, not mid-way
                     continue
                 self.save_state("idle")
+                if self.glass:                           # an incident: no waiting quietly
+                    every = 120.0
+                    self.next_idle_prompt = idle_since + every
+                    self.poll_input(max(0.0, min(30.0, idle_since + every - time.time())))
+                    if not self.pending and not self.paused and time.time() - idle_since >= every:
+                        self.log("hobkin", "idle prompt (incident)")
+                        self.add_user(GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp()))
+                        idle_since = time.time()
+                    continue
                 if self.cfg.get("wake") and not self.paused:
                     news = self.take_wake()
                     if news:
@@ -4021,6 +4112,42 @@ def start_agent(agent_id, opts):
     print(f"talk: hobkin chat {agent_id}")
 
 
+def cmd_breakglass(argv):
+    """hobkin breakglass ID "what's wrong" [--for 2h] [--budget DOLLARS|none] [--off]"""
+    pos, opts = split_args(argv, {"--off"}, {"--for", "--budget"})
+    if len(pos) != (1 if opts.get("--off") else 2):
+        sys.exit('usage: hobkin breakglass ID "what\'s wrong" [--for 2h] [--budget DOLLARS|none]\n'
+                 '       hobkin breakglass ID --off')
+    agent_id = valid_id(pos[0])
+    d = os.path.join(HOME, agent_id)
+    if not os.path.isdir(d):
+        sys.exit(f"hobkin: no agent {agent_id}")
+    path = os.path.join(d, "config.json")
+    cfg = json.loads(read(path) or "{}")
+    if opts.get("--off"):
+        if not cfg.pop("break_glass", None):
+            return print(f"{agent_id}: not in break-glass mode")
+        write_atomic(path, json.dumps(cfg, indent=2) + "\n")
+        print(f"{agent_id}: break-glass mode off")
+    else:
+        try:
+            seconds = parse_duration(opts.get("--for") or "2h")
+        except ValueError as e:
+            sys.exit(f"hobkin: --for: {e}")
+        now = time.time()
+        g = {"reason": pos[1], "by": os.environ.get("USER") or os.environ.get("LOGNAME") or "someone",
+             "declared": (cfg.get("break_glass") or {}).get("declared", now), "until": now + seconds}
+        if opts.get("--budget"):
+            g["budget"] = None if opts["--budget"].lower() == "none" else float(opts["--budget"])
+        cfg["break_glass"] = g
+        write_atomic(path, json.dumps(cfg, indent=2) + "\n")
+        print(f"{agent_id}: break-glass mode until {when_text(g['until'])}: {g['reason']}")
+    if is_running(d):
+        restart_running(agent_id)      # picks it up (conversation kept)
+    else:
+        print(f"{agent_id} isn't running: it applies when it starts (hobkin {agent_id})")
+
+
 def main(argv):
     if argv[:1] == ["__sandbox"]:          # safe mode's helper: restrict itself, then run the command
         return run_sandboxed(argv[1:])
@@ -4032,6 +4159,8 @@ def main(argv):
         return
     if argv[:1] == ["list"]:
         return cmd_list()
+    if argv[:1] == ["breakglass"]:
+        return cmd_breakglass(argv[1:])
     if argv[:1] == ["models"]:
         return cmd_models(argv[1:])
     if argv and (argv[0].startswith(("http://", "https://")) or "--hearthboard" in argv):
