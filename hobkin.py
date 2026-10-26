@@ -52,7 +52,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 import email.utils
 import base64
@@ -704,9 +704,11 @@ BREAK_GLASS = ("# Break glass: an incident\n\n{by} declared an incident at {decl
                "hobkin keeps a timeline of every command, change and message in {log}.")
 GLASS_IDLE = ("[from hobkin: the incident is still open ({reason}), {stamp}. Check the state of things, post a short "
               "status where the people are, and carry on.]")
-GLASS_ENDED = ("[from hobkin: break-glass mode has ended, {stamp}; you're back to normal{safe}. Write your summary now, "
-               "where the people are: what happened, what you changed (and how to undo it), what's still open. The "
-               "timeline is in {log}.]")
+GLASS_ENDED = ("[from hobkin: break-glass mode has ended, {stamp}{how}; you're back to normal{safe}. Write your summary "
+               "now, where the people are: what happened, what you changed (and how to undo it), what's still open. "
+               "Then put a few lines of it in your MEMORY.md, in your own words: what you found, what's still open, how "
+               "you'd pick it back up, so a restarted you doesn't have to investigate it all again. The timeline is in "
+               "{log}.]")
 
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
 
@@ -1584,6 +1586,8 @@ class Agent:
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.glass = None                  # break-glass mode, while it's on: the config entry
+        self.glass_ended = None            # set at start-up when it ended while hobkin wasn't running
+        self.glass_extension = None
         self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
         self.inbox_checked = 0.0
         self.waker = None                  # the thread long-polling the wake URL while idle
@@ -1651,6 +1655,9 @@ class Agent:
         self.messages = self.load_context()
         self.discover_limits()
         self.repair_context()
+        if self.glass_ended is not None:
+            self.add_user(GLASS_ENDED.format(stamp=self.stamp(), how=self.glass_ended, log=self.glass_log,
+                                             safe=" (safe mode)" if self.cfg.get("safe_mode") else ""))
         if self.state.pop("restarting", None):
             self.add_user(f"[from hobkin: restarted as asked, now hobkin {__version__}, at {when_text(time.time())}.]")
         self.prune()
@@ -1660,13 +1667,31 @@ class Agent:
         self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
 
     def setup_glass(self) -> None:
-        """Break-glass mode, if a person has declared one that hasn't expired: start its timeline and say so."""
+        """Break-glass mode, if a person has declared one that hasn't expired: start its timeline and say so.
+        Every extension is put on the record and alerted, whoever made it (the command or an edit of the
+        config, which the agent itself could make while the glass is broken); an end that happened while
+        hobkin wasn't running (--off, or it expired) gets the usual ending."""
         g = self.cfg.get("break_glass")
+        seen = self.state.get("glass_seen") or {}
         if not g or float(g.get("until") or 0) <= time.time():
             self.glass = None
-            self.state.pop("break_glass", None)
+            if self.state.pop("break_glass", None):          # it was on: end it properly now
+                self.glass_log = self.state.get("glass_log", "")
+                how = " (switched off)" if not g else ""
+                if self.glass_log and os.path.exists(self.glass_log):
+                    with open(self.glass_log, "a", encoding="utf-8") as f:
+                        f.write(f"- {time.strftime('%H:%M:%S')} break-glass mode ended{how}\n")
+                self.alert(f"hobkin {self.id}: break-glass mode OFF{how}; back to normal. Timeline: {self.glass_log}")
+                self.glass_ended = how
+            self.state.pop("glass_seen", None)
             return
         self.glass = g
+        if seen.get("declared") == g["declared"] and float(g["until"]) != float(seen.get("until", 0)):
+            by_command = int(g.get("extensions", 0)) > int(seen.get("extensions", 0))
+            change = (f"extended by {g.get('extended_by', '?')} (extension {g.get('extensions')})" if by_command else
+                      "end time changed outside `hobkin breakglass` (an edit of config.json)")
+            self.glass_extension = f"{change}: now until {when_text(float(g['until']))}"
+        self.state["glass_seen"] = {"declared": g["declared"], "until": g["until"], "extensions": g.get("extensions", 0)}
         self.glass_log = os.path.join(self.work, time.strftime("incident-%Y%m%d-%H%M.md", time.localtime(float(g["declared"]))))
         if not os.path.exists(self.glass_log):
             os.makedirs(self.work, exist_ok=True)
@@ -1674,6 +1699,10 @@ class Agent:
                                          f"{when_text(float(g['declared']))}, break-glass until {when_text(float(g['until']))}.\n\n"
                                          "## Timeline (written by hobkin)\n\n")
         self.state["break_glass"] = f"on until {when_text(float(g['until']))}: {g['reason']}"
+        self.state["glass_log"] = self.glass_log
+        if getattr(self, "glass_extension", None):
+            self.timeline(f"break-glass {self.glass_extension}")
+            self.alert(f"hobkin {self.id}: break-glass {self.glass_extension} ({g['reason']})")
         self.log("hobkin", f"break-glass mode: {self.state['break_glass']} (timeline: {self.glass_log})")
         if self.state.get("glass_alerted") != g["declared"]:
             self.state["glass_alerted"] = g["declared"]
@@ -1692,9 +1721,11 @@ class Agent:
         self.glass = None
         self.state.pop("break_glass", None)
         self.log("hobkin", "break-glass mode ended")
-        self.alert(f"hobkin {self.id}: break-glass mode OFF; back to normal. Timeline: {log}")
+        self.state.pop("glass_seen", None)
+        self.alert(f"hobkin {self.id}: break-glass mode OFF (time's up); back to normal. Timeline: {log}")
         self.setup_safe_mode()
-        self.add_user(GLASS_ENDED.format(stamp=self.stamp(), log=log, safe=" (safe mode)" if self.safe else ""))
+        self.add_user(GLASS_ENDED.format(stamp=self.stamp(), how=" (time's up)", log=log,
+                                         safe=" (safe mode)" if self.safe else ""))
 
     def setup_safe_mode(self) -> None:
         """Safe mode: check the kernel can sandbox (and that it really does, here), or refuse to start."""
@@ -2601,6 +2632,10 @@ class Agent:
             if self.state.get("spend_day") != today:
                 self.state.update({"spend_day": today, "spend_today": 0.0})
             self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
+            if self.glass:                             # the incident's own spend: its budget, not the day's
+                if self.state.get("glass_spend_day") != today:
+                    self.state.update({"glass_spend_day": today, "glass_spend": 0.0})
+                self.state["glass_spend"] = round(self.state["glass_spend"] + cost, 6)
             self.model.last_cost = None
 
     def front_desk_reply(self, who: str, text: str, where: str = "") -> str | None:
@@ -2631,7 +2666,8 @@ class Agent:
             if not reply:
                 return
             self.log("agent", reply)
-            self.timeline(f"answered {self.who}: " + clip(" ".join(reply.split()), 300, 100))
+            self.timeline(f"{self.who} asked: {clip(' '.join(self.pending[0].split()), 300, 100)}; answered: "
+                          + clip(" ".join(reply.split()), 300, 100))
             self.answered.append((self.who, self.pending.pop(0), reply, "", ""))
             self.owe_reply = False
 
@@ -3179,26 +3215,40 @@ class Agent:
 
     # --- the loop: one step at a time; the heartbeat; run()
     def over_budget(self) -> bool:
-        budget = self.glass["budget"] if self.glass and "budget" in self.glass else self.cfg.get("daily_budget_usd")
-        return bool(budget) and self.state.get("spend_day") == time.strftime("%Y-%m-%d") \
-            and self.state.get("spend_today", 0) >= float(budget)
+        budget, spent = self.budget_now()
+        return bool(budget) and spent >= float(budget)
+
+    def budget_now(self) -> tuple:
+        """(the budget that applies now, what's been spent against it today). An incident counts against its own
+        budget (--budget); outside one, the day's budget counts only what wasn't spent on an incident, so a
+        costly incident doesn't pause the agent after it."""
+        today = time.strftime("%Y-%m-%d")
+        if self.state.get("spend_day") != today:
+            return None, 0.0
+        incident = self.state.get("glass_spend", 0) if self.state.get("glass_spend_day") == today else 0
+        if self.glass:
+            budget = self.glass["budget"] if "budget" in self.glass else self.cfg.get("daily_budget_usd")
+            spent = incident if "budget" in self.glass else self.state.get("spend_today", 0)
+        else:
+            budget, spent = self.cfg.get("daily_budget_usd"), self.state.get("spend_today", 0) - incident
+        return budget, spent
 
     def step(self) -> None:
         """One model call, then run any commands it asked for."""
         if self.over_budget():
-            today = time.strftime("%Y-%m-%d")
+            today, (budget, spent) = time.strftime("%Y-%m-%d"), self.budget_now()
             if self.state.get("budget_notice") != today:
                 # One last turn: let people know where they'll see it
                 self.state["budget_notice"] = today
-                self.add_user(f"[from hobkin: today's budget (${self.cfg['daily_budget_usd']}) is used up "
-                              f"(${self.state['spend_today']:.2f} spent). Post where people will see it that you're "
+                self.add_user(f"[from hobkin: today's budget (${budget}) is used up "
+                              f"(${spent:.2f} spent). Post where people will see it that you're "
                               "pausing until tomorrow (or until someone raises daily_budget_usd), then stop.]")
             else:
                 self.paused = self.budget_paused = True
                 self.save_state("paused (budget)")
-                self.log("hobkin", f"daily budget used up (${self.state['spend_today']:.2f}): pausing until tomorrow")
-                self.alert(f"hobkin {self.id} paused until tomorrow: today's budget (${self.cfg['daily_budget_usd']}) "
-                           f"is used up (${self.state['spend_today']:.2f} spent)")
+                self.log("hobkin", f"daily budget used up (${spent:.2f}): pausing until tomorrow")
+                self.alert(f"hobkin {self.id} paused until tomorrow: today's budget (${budget}) "
+                           f"is used up (${spent:.2f} spent)")
                 return
         if self.compact_requested:
             self.compact_requested = False
@@ -3281,6 +3331,7 @@ class Agent:
         self.answered = []
         for text in self.pending:
             results.append({"type": "text", "text": self.from_operator(text, busy=True)})
+            self.timeline(f"told (while working), by {self.who}: " + clip(" ".join(text.split()), 400, 100))
         self.pending = []
         self.messages.append({"role": "user", "content": results})
         self.save_context()
@@ -3398,7 +3449,7 @@ class Agent:
                     self.poll_input(max(0.0, min(30.0, idle_since + every - time.time())))
                     if not self.pending and not self.paused and time.time() - idle_since >= every:
                         self.log("hobkin", "idle prompt (incident)")
-                        self.add_user(GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp()))
+                        self.add_user(GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp()), record=False)
                         idle_since = time.time()
                     continue
                 if self.cfg.get("wake") and not self.paused:
@@ -3452,7 +3503,9 @@ class Agent:
             return True
         return self.plan_carried or re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
 
-    def add_user(self, text: str) -> None:
+    def add_user(self, text: str, record: bool = True) -> None:
+        if record:                         # people's messages and hobkin's notices, in an incident's timeline
+            self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False
@@ -4135,8 +4188,11 @@ def cmd_breakglass(argv):
         except ValueError as e:
             sys.exit(f"hobkin: --for: {e}")
         now = time.time()
-        g = {"reason": pos[1], "by": os.environ.get("USER") or os.environ.get("LOGNAME") or "someone",
-             "declared": (cfg.get("break_glass") or {}).get("declared", now), "until": now + seconds}
+        who = os.environ.get("USER") or os.environ.get("LOGNAME") or "someone"
+        old = cfg.get("break_glass") or {}
+        g = {"reason": pos[1], "by": old.get("by", who), "declared": old.get("declared", now), "until": now + seconds}
+        if old:                                     # an extension: counted and attributed (and alerted at restart)
+            g.update({"extensions": int(old.get("extensions", 0)) + 1, "extended_by": who})
         if opts.get("--budget"):
             g["budget"] = None if opts["--budget"].lower() == "none" else float(opts["--budget"])
         cfg["break_glass"] = g

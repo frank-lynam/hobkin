@@ -529,25 +529,35 @@ hobkin breakglass ops-1 --off          # end it early
 
 Until it expires the agent works fully on its own:
 - **No brakes:** safe mode is lifted, and nothing is announced first or waits.
-- **Budget:** the daily budget is whatever `--budget` says, if you give one.
+- **Budget:** the incident has its own budget, `--budget`, if you give one. What
+  it spends doesn't count against the normal daily budget afterwards, so a costly
+  incident doesn't pause the agent once it's over.
 - **Its instructions say:** it's an incident. Stabilize first, then find the
   cause. Prefer changes that can be undone, and note how. Say each significant
   action before taking it, and post a status every 10–15 minutes. Still ask
   before destroying data. Keep going until it's stable.
 - **When idle,** it's nudged every 2 minutes to check and post a status, instead
   of waiting quietly.
-- **A timeline** of every command (with its exit code), every file change and
-  everything it says goes to `work/incident-<time>.md`. hobkin writes it, not the
-  agent, so it's complete for the post-mortem.
-- **Start and end** go through `alert_command`. When time's up it goes back to
-  normal (back into the sandbox, if it was in safe mode) and is asked for a
-  summary: what happened, what it changed and how to undo it, what's still open.
+- **A timeline** goes to `work/incident-<time>.md`: every command (with its exit
+  code), every file change, everything it says, and everything it's told (people's
+  messages, hobkin's notices; questions answered while it was busy are there with
+  their answers). hobkin writes it, not the agent, so it's complete for the
+  post-mortem.
+- **Start, extensions and end** go through `alert_command`. When it ends (time's
+  up, or `--off`, even if the agent wasn't running then) it goes back to normal
+  (back into the sandbox, if it was in safe mode) and is asked for a summary: what
+  happened, what it changed and how to undo it, what's still open. A few lines of
+  it go in its `MEMORY.md` too, so a restarted agent can pick the incident back up.
 
 The switch is a command you run, recorded in the agent's own `config.json`. A
 safe-mode agent can't write there, so it can't break the glass itself. (An agent
 not in safe mode can already do anything your account can.) Running it again
 extends it; a running agent picks it up by restarting in place, keeping its
-conversation. hobkin can't grant `sudo`: for a crisis account with more
+conversation. Every extension is counted and attributed in the config, and
+alerted and put in the timeline, including one made by editing `config.json`
+directly, which a non-safe-mode agent could do to itself. The agent sees its
+deadline: hiding it wouldn't stop it from reading its own config, and knowing
+when it's handing back helps it plan the hand-over. hobkin can't grant `sudo`: for a crisis account with more
 privileges, run the agent as that user.
 
 ## Reminders
