@@ -189,12 +189,13 @@ try:
             if json.load(open(d + "/state.json")).get("status") == "idle": break
             time.sleep(0.2)
         say(d, "still there?"); wait_for(d, "operator> still there?")
-        for _ in range(100):
-            tail = open(d + "/out").read().split("operator> still there?")[-1]
+        for _ in range(100):                                   # (an idle compaction right after may archive the answer)
+            logs = "".join(open(f"{d}/archive/{n}").read() for n in sorted(os.listdir(d + "/archive")) if n.startswith("out-"))
+            tail = (logs + open(d + "/out").read()).split("operator> still there?")[-1]
             if "agent> echo:" in tail: break
             time.sleep(0.2)
-        last_user = "".join(b.get("text", "") for b in [m for m in ctx(d) if m["role"] == "user"][-1]["content"])
-        check(f"[{api}] answers after compaction, with the message in its context", "agent> echo:" in tail and "still there?" in last_user, tail[-300:])
+        seen = "".join(open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive") if n.startswith("context-")) + open(d + "/context.jsonl").read()
+        check(f"[{api}] answers after compaction, with the message in its context", "agent> echo:" in tail and "still there?" in seen, tail[-300:])
         p.send_signal(signal.SIGTERM); p.wait(10)
     # the front desk: a message while a command runs is answered then, the command keeps going, the worker hears it
     h = home("frontdesk", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
@@ -243,7 +244,7 @@ try:
                          "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000, "compact_early": 0.5,
                                                      "output_limit": 50000})
     p, aid, d = start(h)
-    say(d, "run: seq 1 9000")
+    say(d, "run: seq 1 7000")              # past half the budget, but not nearly full (that compacts mid-task)
     wait_for(d, "compacted; note", 20)
     why = "".join(open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive") if n.startswith("out-"))
     for _ in range(50):
