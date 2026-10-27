@@ -977,7 +977,8 @@ try:
         say(d, f"run: echo again > {outside}; echo tried-again"); wait_for(d, "\n    tried-again"); time.sleep(0.5)
         check("[glass] back in safe mode afterwards", not os.path.exists(outside))
     # time's up: it ends on its own
-    glass("still flaky", "--for", "6s"); wait_for(d, "break-glass mode ended", 30)
+    glass("still flaky", "--for", "6s"); t0 = time.time(); wait_for(d, "break-glass mode ended", 30)
+    check("[glass] it ends on time, not at the next idle check", time.time() - t0 < 15, time.time() - t0)
     wait_for(d, "time's up", 20, file="context.jsonl")
     check("[glass] it ends when time's up, and asks for the summary", "OFF (time's up)" in alerts(), alerts())
     # salvage: nothing said (and the incident that ran out is over, not extended); an extension keeps it;

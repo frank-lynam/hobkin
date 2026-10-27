@@ -3699,7 +3699,8 @@ class Agent:
                 if self.glass:                           # an incident: no waiting quietly
                     every = 120.0
                     self.next_idle_prompt = idle_since + every
-                    self.poll_input(max(0.0, min(30.0, idle_since + every - time.time())))
+                    self.poll_input(max(0.0, min(30.0, idle_since + every - time.time(),
+                                                 float(self.glass["until"]) - time.time())))   # ends on time
                     if not self.pending and not self.paused and time.time() - idle_since >= every:
                         self.log("hobkin", "idle prompt (incident)")
                         self.add_user("\n\n".join([GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp())]
