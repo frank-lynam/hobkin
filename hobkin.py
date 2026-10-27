@@ -15,6 +15,7 @@ line, or as a worker on hearthboard.
     hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
     hobkin breakglass ID "what's wrong" [--for 2h]   an incident: the agent acts fully on its own (--off ends it)
     hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
+    hobkin pack ID [--to DIR]   a bundle of the agent (hobkin, memory, conversation, notes; no secrets) to restart elsewhere
     hobkin --version
 
 Set up and go in one line (no config editing):
@@ -53,7 +54,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 import email.utils
 import base64
@@ -62,6 +63,7 @@ import errno
 import difflib
 import fcntl
 import html
+import io
 import html.parser
 import http.client
 import http.cookiejar
@@ -78,6 +80,7 @@ import ssl
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -729,6 +732,10 @@ SALVAGE = ("## No guidance given: salvage\n\n"
            "what knocks it over.\n"
            "4. **Keep a manifest** in your workspace: each thing saved, where it went, its size and checksum, and "
            "what you couldn't save and why. Upload it with the copies.\n"
+           "5. **Save yourself too,** so you can be started again elsewhere to answer questions about what you found: "
+           "put your findings in your MEMORY.md, then `python3 $HOBKIN_SELF pack $HOBKIN_ID` bundles this hobkin "
+           "with your memory, conversation, archive, timeline and notes (no secrets), and says where. Upload it with "
+           "the copies, early and again at the end.\n"
            "- Delete nothing of the system's, not even to free space (only your own temporary copies).\n"
            "- Post a status after each step, and tell whoever turns up exactly where everything is.")
 GLASS_IDLE = ("[from hobkin: the incident is still open ({reason}), {stamp}. Check the state of things, post a short "
@@ -2188,7 +2195,8 @@ class Agent:
         env.update(load_env_file(os.path.join(SHARED, "secrets.env")))
         env.update(load_env_file(self.p("secrets.env")))
         env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work,
-                    "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md")})
+                    "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"),
+                    "HOBKIN_SELF": os.path.abspath(__file__)})
         return env
 
     # --- background jobs: started by bash with background: true; a message arrives when each finishes
@@ -2380,7 +2388,7 @@ class Agent:
         self.interrupt = False
         env = self.safe_env(self.tool_env())
         env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
-                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_NOSAVE",
+                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_SELF", "HOBKIN_NOSAVE",
                                                               "HOBKIN_SANDBOX", "TMPDIR"])
         restore = os.path.exists(state_file)
         script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
@@ -4247,6 +4255,94 @@ def start_agent(agent_id, opts):
     print(f"talk: hobkin chat {agent_id}")
 
 
+# A packed agent (hobkin pack): what's left out, and what it's told when it's started from the bundle
+PACK_SKIP = {"secrets.env", "keys", "in", "lock", "shell", "shell.sh", ".cwd", "last-output.log", ".tmp"}
+PACK_BIG = 2 * 1024 * 1024          # bigger files in its workspace stay out (salvaged copies went elsewhere)
+RESTORED = ("[from hobkin: you've been started from a bundle of yourself, packed {stamp} on {host}, where your "
+            "folder was {old}; it's now your folder ($HOBKIN_DIR), so read old paths under it as being there. The "
+            "system you were on may be gone: what you know of it is your MEMORY.md, your workspace (notes, "
+            "manifests, the incident timeline), your conversation and archive/. People will ask what you found: "
+            "answer from those, say where each thing was saved, and say when you aren't sure.]")
+RESTORE_MD = """# {aid}, packed {stamp} on {host}
+
+This is hobkin agent {aid}: the program (hobkin.py), its instructions, memory, conversation, archive and
+workspace notes, without secrets, API keys or big files from its workspace. Start it with any model:
+
+    tar xzf {name}.tar.gz && cd {name}
+    HOBKIN_HOME=$PWD/home python3 hobkin.py URL MODEL [KEY] --id {aid} --no-service --chat
+
+(e.g. URL MODEL = https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5). Its first message tells it it's
+a restored copy, so ask it what it found. Left out: {left}.
+"""
+
+
+def cmd_pack(argv):
+    """hobkin pack ID [--to DIR]: the agent as a .tar.gz that starts again anywhere (RESTORE.md inside says
+    how). No secrets (secrets.env, keys, model headers) and no shell state; break-glass mode is left behind."""
+    pos, opts = split_args(argv, set(), {"--to"})
+    if len(pos) != 1:
+        sys.exit("usage: hobkin pack ID [--to DIR]")
+    aid = valid_id(pos[0])
+    d = os.path.join(HOME, aid)
+    if not os.path.isdir(d):
+        sys.exit(f"hobkin: no agent {aid}")
+    stamp, host = time.strftime("%Y%m%d-%H%M%S"), os.uname().nodename
+    name = f"hobkin-{aid}-{stamp}"
+    out_dir = os.path.abspath(os.path.expanduser(opts.get("--to") or os.path.join(d, "work")))
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, name + ".tar.gz")
+    left = ["secrets.env and API keys", "shell state"]
+
+    def clean_cfg(path):
+        cfg = json.loads(read(path) or "{}")
+        cfg.pop("break_glass", None)
+        for m in (cfg.get("models") or {}).values():
+            if isinstance(m, dict):
+                m.pop("headers", None)
+        return cfg
+
+    def add_text(tar, arc, text):
+        data = text.encode()
+        info = tarfile.TarInfo(arc)
+        info.size, info.mtime, info.mode = len(data), int(time.time()), 0o600
+        tar.addfile(info, io.BytesIO(data))
+
+    def add_tree(tar, src, arc, replaced):          # replaced: files at this level written cleaned instead
+        for name_ in sorted(os.listdir(src)):
+            full, a = os.path.join(src, name_), f"{arc}/{name_}"
+            if name_ in PACK_SKIP or name_.endswith(".key") or os.path.islink(full) or full == out \
+                    or name_ in replaced:
+                continue
+            if os.path.isdir(full):
+                add_tree(tar, full, a, ())
+            elif os.path.isfile(full):
+                if f"/{aid}/work/" in a and os.path.getsize(full) > PACK_BIG:
+                    left.append(f"{a.split('/home/', 1)[1]} ({os.path.getsize(full) // 1024} KB)")
+                    continue
+                tar.add(full, a, recursive=False)
+
+    with tarfile.open(out + ".part", "w:gz") as tar:
+        tar.add(os.path.abspath(__file__), f"{name}/hobkin.py")
+        if os.path.isdir(SHARED):
+            add_tree(tar, SHARED, f"{name}/home/_shared", ("config.json",))
+        if os.path.exists(os.path.join(SHARED, "config.json")):
+            add_text(tar, f"{name}/home/_shared/config.json",
+                     json.dumps(clean_cfg(os.path.join(SHARED, "config.json")), indent=2) + "\n")
+        add_tree(tar, d, f"{name}/home/{aid}", ("config.json", "state.json", "queue"))
+        add_text(tar, f"{name}/home/{aid}/config.json", json.dumps(clean_cfg(os.path.join(d, "config.json")), indent=2) + "\n")
+        state = json.loads(read(os.path.join(d, "state.json")) or "{}")
+        for k in ("break_glass", "glass_seen", "glass_log", "pid", "status"):
+            state.pop(k, None)
+        add_text(tar, f"{name}/home/{aid}/state.json", json.dumps(state, indent=2) + "\n")
+        queued = read(os.path.join(d, "queue"))
+        add_text(tar, f"{name}/home/{aid}/queue", queued + json.dumps(RESTORED.format(stamp=when_text(time.time()),
+                                                                                      host=host, old=d)) + "\n")
+        add_text(tar, f"{name}/RESTORE.md", RESTORE_MD.format(aid=aid, stamp=when_text(time.time()), host=host,
+                                                              name=name, left="; ".join(left)))
+    os.replace(out + ".part", out)
+    print(f"{aid}: packed into {out} ({os.path.getsize(out) // 1024} KB); RESTORE.md inside says how to start it")
+
+
 def cmd_breakglass(argv):
     """hobkin breakglass ID ["what's wrong"] [--for 2h] [--budget DOLLARS|none] [--off]
     With nothing said about what's wrong, it's a salvage: save what can't be replaced (SALVAGE)."""
@@ -4308,6 +4404,8 @@ def main(argv):
         return cmd_list()
     if argv[:1] == ["breakglass"]:
         return cmd_breakglass(argv[1:])
+    if argv[:1] == ["pack"]:
+        return cmd_pack(argv[1:])
     if argv[:1] == ["models"]:
         return cmd_models(argv[1:])
     if argv and (argv[0].startswith(("http://", "https://")) or "--hearthboard" in argv):

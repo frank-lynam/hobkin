@@ -548,8 +548,33 @@ there. It copies the most precious first: data nobody else has (dumped the
 database's own way, not live files), then logs, config, and a snapshot of how
 things stand, gently (`nice`/`ionice`). It keeps a manifest (what's saved, where,
 size and checksum, and what couldn't be saved), deletes nothing of the system's,
-and posts a status after each step. Extending it without a reason keeps it a
-salvage; giving a reason makes it an ordinary incident.
+and posts a status after each step. It also saves itself: it writes its findings
+into `MEMORY.md`, runs `hobkin pack` (below) and uploads the bundle with the
+copies, early and again at the end. If the machine is lost, you can start that
+bundle anywhere and ask it what it found. Extending it without a reason keeps it
+a salvage; giving a reason makes it an ordinary incident.
+
+### Packing an agent
+
+```sh
+hobkin pack ops-1 [--to DIR]     # default: the agent's work/
+```
+
+writes `hobkin-ops-1-<time>.tar.gz`. It holds hobkin.py itself, the shared
+instructions and skills, and the agent's folder: memory, conversation,
+`archive/`, out log, reminders, and its workspace notes (the manifest, the
+incident timeline). It leaves out `secrets.env`, API keys, model `headers`,
+shell state, and files over 2 MB in its workspace (salvaged copies went
+elsewhere). The `RESTORE.md` inside lists what was left out and says how to start it:
+
+```sh
+tar xzf hobkin-ops-1-<time>.tar.gz && cd hobkin-ops-1-<time>
+HOBKIN_HOME=$PWD/home python3 hobkin.py URL MODEL [KEY] --id ops-1 --no-service --chat
+```
+
+The copy starts out of break-glass mode. Its first message tells it it's a
+restored copy, which folder its old paths were in, and to answer questions from
+what it saved. Agents find the program as `$HOBKIN_SELF`.
 
 Until it expires the agent works fully on its own:
 - **No brakes:** safe mode is lifted, and nothing is announced first or waits.
