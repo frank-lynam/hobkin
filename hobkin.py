@@ -56,7 +56,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 
 import email.utils
 import base64
@@ -2305,7 +2305,7 @@ class Agent:
         any that can't be offered, read fresh each time so a new one is there from the next reply."""
         defs, runs, problems = [], {}, []
         root = os.path.join(self.work, "tools")
-        builtin = {t["name"] for t in TOOLS}
+        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL]}     # hold too: it's offered on a shared incident
         for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
             d = os.path.join(root, name)
             if not os.path.isdir(d):

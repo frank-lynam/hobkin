@@ -1016,13 +1016,14 @@ try:
     h = home("owntools", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}, {"idle_prompt": None})
     p, aid, d = start(h)
     t = d + "/work/tools"
-    os.makedirs(t + "/strum"); os.makedirs(t + "/broken"); os.makedirs(t + "/bash"); os.makedirs(t + "/noexec")
+    os.makedirs(t + "/strum"); os.makedirs(t + "/broken"); os.makedirs(t + "/bash"); os.makedirs(t + "/hold"); os.makedirs(t + "/noexec")
     spec = {"description": "Strum a chord on the synth", "input_schema": {"type": "object", "properties": {"chord": {"type": "string"}}}}
     json.dump(spec, open(t + "/strum/tool.json", "w"))
     open(t + "/strum/run", "w").write("#!/usr/bin/env python3\nimport json, os, sys\nprint('strummed', json.load(sys.stdin)['chord'], 'in', os.path.basename(os.getcwd()))\n")
     os.chmod(t + "/strum/run", 0o755)
     open(t + "/broken/tool.json", "w").write("{")
-    json.dump(spec, open(t + "/bash/tool.json", "w")); json.dump(spec, open(t + "/noexec/tool.json", "w")); open(t + "/noexec/run", "w").write("echo hi\n")
+    json.dump(spec, open(t + "/bash/tool.json", "w")); json.dump(spec, open(t + "/noexec/tool.json", "w"))
+    json.dump(spec, open(t + "/hold/tool.json", "w")); open(t + "/hold/run", "w").write("#!/bin/sh\necho mine\n"); os.chmod(t + "/hold/run", 0o755); open(t + "/noexec/run", "w").write("echo hi\n")
     say(d, "run: mkdir -p songs && cd songs"); wait_for(d, "now in songs/")
     say(d, 'call: strum {"chord": "E minor"}'); wait_for(d, "Done. Output was: strummed E minor in songs")
     body = [json.loads(l)["body"] for l in open(LOG) if '"path"' in l and '"strum"' in l][-1]
@@ -1030,7 +1031,8 @@ try:
           any(x.get("function", {}).get("name") == "strum" for x in body["tools"]), [x.get("function", {}).get("name") for x in body["tools"]])
     sysp = ctx(d)[0]["content"]
     check("[own tools] the ones that can't be offered are listed with why", "tools/broken: not offered: tool.json isn't valid JSON" in sysp
-          and "tools/bash: not offered: that's the name of a built-in tool" in sysp and "tools/noexec: not offered: it has no executable `run`" in sysp, sysp[-900:])
+          and "tools/bash: not offered: that's the name of a built-in tool" in sysp
+          and "tools/hold: not offered: that's the name of a built-in tool" in sysp and "tools/noexec: not offered: it has no executable `run`" in sysp, sysp[-900:])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # hobkin pack: a bundle without secrets that starts anywhere, told it's a restored copy
