@@ -100,7 +100,7 @@ import urllib.request
 #   safe mode     Landlock: commands write only in the workspace, no TCP, no signals (what the kernel allows)
 #   web           pages as text, client certificates, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
-#   agent         the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
+#   agent         the Agent: setup, limits, safe mode, break glass, context file, input, tools, jobs, files, reminders, nudges, the web, the model, compaction, the loop
 #   service       systemd user services
 #   command line  send, chat, the watch screen, list, breakglass, pack, main
 
@@ -871,6 +871,22 @@ def read(path, default=""):
         return default
 
 
+def read_json(path, default=None, exit_if_broken=False):
+    """A JSON file's contents; `default` when it's missing or empty, and when it's broken too, unless
+    exit_if_broken (for commands about to rewrite it: a broken file is reported, never silently replaced)."""
+    try:
+        data = json.loads(read(path) or "null")
+    except json.JSONDecodeError as e:
+        if exit_if_broken:
+            sys.exit(f"hobkin: {path} isn't valid JSON ({e}); fix it first")
+        data = None
+    return default if data is None else data
+
+
+def write_json(path, data):
+    write_atomic(path, json.dumps(data, indent=2) + "\n")
+
+
 def write_atomic(path, text):
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -994,7 +1010,7 @@ def find_skills(agent_dir: str, extra_dirs=()) -> dict[str, tuple[str, str]]:
 def ensure_shared():
     os.makedirs(os.path.join(SHARED, "skills"), exist_ok=True)
     if not os.path.exists(os.path.join(SHARED, "config.json")):
-        write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        write_json(os.path.join(SHARED, "config.json"), DEFAULT_CONFIG)
     if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
         write_atomic(os.path.join(SHARED, "AGENTS.md"), DEFAULT_AGENTS_MD)
 
@@ -1004,17 +1020,18 @@ def glass_log_path(agent_dir: str, g: dict) -> str:
     return os.path.join(agent_dir, "work", time.strftime("incident-%Y%m%d-%H%M.md", time.localtime(float(g["declared"]))))
 
 
+def agent_ids() -> list[str]:
+    """Every agent here: the folders in HOME (the _shared and _incidents folders aren't agents)."""
+    return [n for n in sorted(os.listdir(HOME)) if not n.startswith("_") and os.path.isdir(os.path.join(HOME, n))] \
+        if os.path.isdir(HOME) else []
+
+
 def incident_members(name: str) -> list[tuple[str, dict, str]]:
     """The agents on a shared incident whose break glass is still on: (id, break_glass entry, timeline path)."""
     found = []
-    for i in sorted(os.listdir(HOME)) if os.path.isdir(HOME) else []:
+    for i in agent_ids():
         d = os.path.join(HOME, i)
-        if i.startswith("_") or not os.path.isdir(d):
-            continue
-        try:
-            g = json.loads(read(os.path.join(d, "config.json")) or "{}").get("break_glass") or {}
-        except json.JSONDecodeError:
-            continue
+        g = read_json(os.path.join(d, "config.json"), {}).get("break_glass") or {}
         if g.get("incident") == name and float(g.get("until") or 0) > time.time():
             found.append((i, g, glass_log_path(d, g)))
     return found
@@ -1028,14 +1045,11 @@ def edit_holds(name: str, change) -> list[dict]:
     with open(os.path.join(folder, "holds.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = os.path.join(folder, "holds.json")
-        try:
-            holds = json.loads(read(path) or "[]")
-        except json.JSONDecodeError:
-            holds = []
+        holds = read_json(path, [])
         if change is None:
             return holds
         holds = change(holds)
-        write_atomic(path, json.dumps(holds, indent=2) + "\n")
+        write_json(path, holds)
         return holds
 
 
@@ -1659,6 +1673,7 @@ def is_too_long(err):
 # ---- agent: the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
 
 class Agent:
+    # --- setup: state, starting up, signals
     def __init__(self, agent_id):
         self.id = agent_id
         self.dir = os.path.join(HOME, agent_id)
@@ -1705,7 +1720,6 @@ class Agent:
         self.fifo_buf = b""
         self.fifo_last = 0.0
 
-    # --- setup
     def boot(self):
         ensure_shared()
         os.makedirs(self.work, exist_ok=True)
@@ -1771,6 +1785,168 @@ class Agent:
                  f"{self.state.get('context_tokens') or 'unknown'} ({self.state.get('context_source') or 'will learn from errors'})")
         self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
 
+    def _on_signal(self, signum, frame):
+        if self.stop:  # second signal: leave now
+            raise KeyboardInterrupt
+        self.stop = True
+
+    def load_state(self):
+        return read_json(os.path.join(HOME, self.id, "state.json"), {})
+
+    def save_state(self, status=None):
+        if status:
+            self.state["status"] = status
+        self.state["updated"] = now()
+        write_json(self.p("state.json"), self.state)
+
+    # --- the model's limits: the context window and output size, model switches
+    def discover_limits(self):
+        """Context window and output limit: config override, else ask the API (cached per model)."""
+        key = f"{self.model.api}|{self.model.base}|{self.model.model}"
+        if self.state.get("limits_for") != key:
+            for k in ("context_tokens", "context_source", "api_max_output"):
+                self.state.pop(k, None)
+            self.state["limits_for"] = key
+        if self.model.cfg.get("context_tokens"):
+            self.state["context_tokens"], self.state["context_source"] = int(self.model.cfg["context_tokens"]), "config"
+        elif not self.state.get("context_tokens"):
+            ctx, out, src = self.model.query_limits()
+            if ctx:
+                self.state["context_tokens"], self.state["context_source"] = int(ctx), src
+            if out:
+                self.state["api_max_output"] = int(out)
+
+    def use_model(self, name: str) -> None:
+        """Run on configured model `name` from now on (its limits asked for again)."""
+        self.model = Model(name, self.cfg["models"][name])
+        self.state["model"] = self.model.describe()
+        self.discover_limits()
+        self.save_state()
+
+    def switch_model(self, wanted: str) -> str:
+        """/model NAME: a configured model, else a model the current API offers (it gets a config entry
+        like the current one's). Saved in this agent's config.json, so it lasts; returns what happened."""
+        name, entry = wanted, None
+        if wanted not in self.cfg["models"]:
+            try:
+                offered = [i for i, _ in self.model.list_models()]
+            except (urllib.error.URLError, OSError, ValueError):
+                offered = None
+            if offered is not None and wanted not in offered:
+                near = difflib.get_close_matches(wanted, list(self.cfg["models"]) + offered, n=5, cutoff=0.4)
+                return (f"no model {wanted!r}: it's not in your config, and {self.model.base} doesn't offer it"
+                        + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
+            name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
+            entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
+                     "model": wanted}
+            self.cfg["models"][name] = entry
+        if name == self.model.name:
+            return f"already on {self.model.describe()}"
+        path = self.p("config.json")
+        try:
+            data = json.loads(read(path) or "{}")
+        except json.JSONDecodeError as e:
+            return f"can't switch: {path} isn't valid JSON ({e})"
+        if entry:
+            data.setdefault("models", {})[name] = entry
+        data["model"] = name
+        write_json(path, data)
+        old = self.model.describe()
+        self.use_model(name)
+        self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in self.cfg["models"] and f != name]
+        return (f"switched from {old} to {self.model.describe()}, context {self.state.get('context_tokens') or 'unknown'} "
+                f"(saved in {path})")
+
+    def refresh_limits(self, why: str) -> None:
+        """Ask the API for the limits again: windows can change (a local server restarted with another
+        size, a provider's update). A number from config stays; so does the old one if the API won't say."""
+        old = self.state.get("context_tokens")
+        if self.state.get("context_source") == "config":
+            self.log("hobkin", f"limits ({why}): context {old} is set in config, so it stays")
+            return
+        ctx, out, src = self.model.query_limits()
+        if out:
+            self.state["api_max_output"] = int(out)
+        if ctx and why != "/limits" and self.state.get("context_source") == "learned from an error" and int(ctx) >= (old or 0):
+            ctx = None          # the API overstated it before: the error's number stands until /limits
+        if ctx:
+            self.state["context_tokens"], self.state["context_source"] = int(ctx), src
+        if ctx and int(ctx) != old:
+            self.log("hobkin", f"limits ({why}): context window now {ctx} (was {old or 'unknown'}; {src})")
+        elif why == "/limits":
+            self.log("hobkin", f"limits ({why}): context {old or 'unknown'} "
+                     + (f"(unchanged; {src})" if ctx else f"(the API doesn't say; {self.state.get('context_source') or 'none'})"))
+        self.save_state()
+
+    def max_output(self):
+        want = int(self.model.cfg.get("max_output_tokens") or self.cfg.get("max_output_tokens") or 16000)
+        api = self.state.get("api_max_output")
+        return min(want, api) if api else want
+
+    # --- safe mode: the sandbox for commands, and where hobkin's own file tools may write
+    def setup_safe_mode(self) -> None:
+        """Safe mode: check the kernel can sandbox (and that it really does, here), or refuse to start."""
+        conf = self.cfg.get("safe_mode")
+        self.safe = None
+        if conf and self.glass:                    # break glass lifts it, until it ends
+            self.log("hobkin", "safe mode lifted for break-glass mode")
+            self.state.pop("safe_mode", None)
+            return
+        if not conf:
+            self.state.pop("safe_mode", None)
+            return
+        network = isinstance(conf, dict) and bool(conf.get("network"))
+        abi = landlock_abi()
+        if not abi:
+            msg = ("safe mode needs Landlock (Linux 5.13 or later, with landlock among the kernel's security "
+                   "modules), and it isn't available here, so this agent won't start. Run it on a system that has "
+                   "it, as a separate low-privilege user, or turn safe_mode off.")
+            self.log("hobkin", msg)
+            sys.exit(f"hobkin: {msg}")
+        shell_dir = self.p("shell")
+        os.makedirs(os.path.join(self.work, ".tmp"), exist_ok=True)
+        os.makedirs(shell_dir, exist_ok=True)
+        os.makedirs(self.p("jobs"), exist_ok=True)
+        self.safe = {"dirs": [self.work, shell_dir, self.p("jobs")],
+                     "files": [self.p("MEMORY.md"), self.p("BLOOPERS.md"), self.p("in"),
+                               "/dev/null", "/dev/zero", "/dev/full"],
+                     "network": network}
+        # Prove it here: inside the workspace works, the agent's own config doesn't
+        probe = self.p(".safe-probe")
+        r = subprocess.run(self.sandboxed(["bash", "-c", f'echo ok > {shlex.quote(os.path.join(self.work, ".tmp", "probe"))} '
+                                           f'&& ! (echo x > {shlex.quote(probe)}) 2>/dev/null && echo sandboxed']),
+                           env={**os.environ, "HOBKIN_SANDBOX": json.dumps(self.safe)}, capture_output=True, text=True)
+        if os.path.exists(probe):
+            os.remove(probe)
+        if r.stdout.strip() != "sandboxed":
+            msg = (f"safe mode: the sandbox didn't hold on this system ({(r.stderr or r.stdout).strip()[:300]}), so "
+                   "this agent won't start. (In a container, its security profile may block Landlock.)")
+            self.log("hobkin", msg)
+            sys.exit(f"hobkin: {msg}")
+        self.state["safe_mode"] = safe_coverage(abi, network)
+        self.log("hobkin", f"safe mode: {self.state['safe_mode']}")
+
+    def sandboxed(self, argv: list[str]) -> list[str]:
+        """A command line that runs `argv` inside the safe-mode sandbox (or as it is, without safe mode)."""
+        return [sys.executable, os.path.abspath(__file__), "__sandbox"] + argv if self.safe else argv
+
+    def safe_env(self, env: dict) -> dict:
+        """The sandbox's spec for the helper, and a private temp folder (/tmp is shared with the system)."""
+        if self.safe:
+            env["HOBKIN_SANDBOX"] = json.dumps(self.safe)
+            env["TMPDIR"] = os.path.join(self.work, ".tmp")
+        return env
+
+    def writable(self, full: str) -> bool:
+        """Can hobkin's own file tools write here? Anywhere, except in safe mode: the workspace and memory."""
+        if not self.safe:
+            return True
+        real = os.path.realpath(full)
+        work = os.path.realpath(self.work)
+        return real == work or real.startswith(work + os.sep) or \
+            real in (os.path.realpath(self.p("MEMORY.md")), os.path.realpath(self.p("BLOOPERS.md")))
+
+    # --- break glass: an incident's start, timeline and end
     def setup_glass(self) -> None:
         """Break-glass mode, if a person has declared one that hasn't expired: start its timeline and say so.
         Every extension is put on the record and alerted, whoever made it (the command or an edit of the
@@ -1820,6 +1996,20 @@ class Agent:
         if self.glass:
             with open(self.glass_log, "a", encoding="utf-8") as f:
                 f.write(f"- {time.strftime('%H:%M:%S')} {line}\n")
+
+    def end_glass(self) -> None:
+        """Break-glass time is up: back to normal (re-sandboxed, if it was in safe mode), and asked for a summary."""
+        log = self.glass_log
+        self.release_holds(self.glass.get("incident"))
+        self.timeline("break-glass mode ended")
+        self.glass = None
+        self.state.pop("break_glass", None)
+        self.log("hobkin", "break-glass mode ended")
+        self.state.pop("glass_seen", None)
+        self.alert(f"hobkin {self.id}: break-glass mode OFF (time's up); back to normal. Timeline: {log}")
+        self.setup_safe_mode()
+        self.add_user(GLASS_ENDED.format(stamp=self.stamp(), how=" (time's up)", log=log,
+                                         safe=" (safe mode)" if self.safe else ""))
 
     # --- a shared incident: teammates, their news, holds
     def incident_team(self) -> list[tuple[str, dict, str]]:
@@ -1900,182 +2090,6 @@ class Agent:
     def release_holds(self, name) -> None:
         if name:
             edit_holds(name, lambda hs: [h for h in hs if h["by"] != self.id])
-
-    def end_glass(self) -> None:
-        """Break-glass time is up: back to normal (re-sandboxed, if it was in safe mode), and asked for a summary."""
-        log = self.glass_log
-        self.release_holds(self.glass.get("incident"))
-        self.timeline("break-glass mode ended")
-        self.glass = None
-        self.state.pop("break_glass", None)
-        self.log("hobkin", "break-glass mode ended")
-        self.state.pop("glass_seen", None)
-        self.alert(f"hobkin {self.id}: break-glass mode OFF (time's up); back to normal. Timeline: {log}")
-        self.setup_safe_mode()
-        self.add_user(GLASS_ENDED.format(stamp=self.stamp(), how=" (time's up)", log=log,
-                                         safe=" (safe mode)" if self.safe else ""))
-
-    def setup_safe_mode(self) -> None:
-        """Safe mode: check the kernel can sandbox (and that it really does, here), or refuse to start."""
-        conf = self.cfg.get("safe_mode")
-        self.safe = None
-        if conf and self.glass:                    # break glass lifts it, until it ends
-            self.log("hobkin", "safe mode lifted for break-glass mode")
-            self.state.pop("safe_mode", None)
-            return
-        if not conf:
-            self.state.pop("safe_mode", None)
-            return
-        network = isinstance(conf, dict) and bool(conf.get("network"))
-        abi = landlock_abi()
-        if not abi:
-            msg = ("safe mode needs Landlock (Linux 5.13 or later, with landlock among the kernel's security "
-                   "modules), and it isn't available here, so this agent won't start. Run it on a system that has "
-                   "it, as a separate low-privilege user, or turn safe_mode off.")
-            self.log("hobkin", msg)
-            sys.exit(f"hobkin: {msg}")
-        shell_dir = self.p("shell")
-        os.makedirs(os.path.join(self.work, ".tmp"), exist_ok=True)
-        os.makedirs(shell_dir, exist_ok=True)
-        os.makedirs(self.p("jobs"), exist_ok=True)
-        self.safe = {"dirs": [self.work, shell_dir, self.p("jobs")],
-                     "files": [self.p("MEMORY.md"), self.p("BLOOPERS.md"), self.p("in"),
-                               "/dev/null", "/dev/zero", "/dev/full"],
-                     "network": network}
-        # Prove it here: inside the workspace works, the agent's own config doesn't
-        probe = self.p(".safe-probe")
-        r = subprocess.run(self.sandboxed(["bash", "-c", f'echo ok > {shlex.quote(os.path.join(self.work, ".tmp", "probe"))} '
-                                           f'&& ! (echo x > {shlex.quote(probe)}) 2>/dev/null && echo sandboxed']),
-                           env={**os.environ, "HOBKIN_SANDBOX": json.dumps(self.safe)}, capture_output=True, text=True)
-        if os.path.exists(probe):
-            os.remove(probe)
-        if r.stdout.strip() != "sandboxed":
-            msg = (f"safe mode: the sandbox didn't hold on this system ({(r.stderr or r.stdout).strip()[:300]}), so "
-                   "this agent won't start. (In a container, its security profile may block Landlock.)")
-            self.log("hobkin", msg)
-            sys.exit(f"hobkin: {msg}")
-        self.state["safe_mode"] = safe_coverage(abi, network)
-        self.log("hobkin", f"safe mode: {self.state['safe_mode']}")
-
-    def sandboxed(self, argv: list[str]) -> list[str]:
-        """A command line that runs `argv` inside the safe-mode sandbox (or as it is, without safe mode)."""
-        return [sys.executable, os.path.abspath(__file__), "__sandbox"] + argv if self.safe else argv
-
-    def safe_env(self, env: dict) -> dict:
-        """The sandbox's spec for the helper, and a private temp folder (/tmp is shared with the system)."""
-        if self.safe:
-            env["HOBKIN_SANDBOX"] = json.dumps(self.safe)
-            env["TMPDIR"] = os.path.join(self.work, ".tmp")
-        return env
-
-    def writable(self, full: str) -> bool:
-        """Can hobkin's own file tools write here? Anywhere, except in safe mode: the workspace and memory."""
-        if not self.safe:
-            return True
-        real = os.path.realpath(full)
-        work = os.path.realpath(self.work)
-        return real == work or real.startswith(work + os.sep) or \
-            real in (os.path.realpath(self.p("MEMORY.md")), os.path.realpath(self.p("BLOOPERS.md")))
-
-    def _on_signal(self, signum, frame):
-        if self.stop:  # second signal: leave now
-            raise KeyboardInterrupt
-        self.stop = True
-
-    def load_state(self):
-        try:
-            return json.loads(read(os.path.join(HOME, self.id, "state.json"), "{}"))
-        except json.JSONDecodeError:
-            return {}
-
-    def save_state(self, status=None):
-        if status:
-            self.state["status"] = status
-        self.state["updated"] = now()
-        write_atomic(self.p("state.json"), json.dumps(self.state, indent=2) + "\n")
-
-    def discover_limits(self):
-        """Context window and output limit: config override, else ask the API (cached per model)."""
-        key = f"{self.model.api}|{self.model.base}|{self.model.model}"
-        if self.state.get("limits_for") != key:
-            for k in ("context_tokens", "context_source", "api_max_output"):
-                self.state.pop(k, None)
-            self.state["limits_for"] = key
-        if self.model.cfg.get("context_tokens"):
-            self.state["context_tokens"], self.state["context_source"] = int(self.model.cfg["context_tokens"]), "config"
-        elif not self.state.get("context_tokens"):
-            ctx, out, src = self.model.query_limits()
-            if ctx:
-                self.state["context_tokens"], self.state["context_source"] = int(ctx), src
-            if out:
-                self.state["api_max_output"] = int(out)
-
-    def use_model(self, name: str) -> None:
-        """Run on configured model `name` from now on (its limits asked for again)."""
-        self.model = Model(name, self.cfg["models"][name])
-        self.state["model"] = self.model.describe()
-        self.discover_limits()
-        self.save_state()
-
-    def switch_model(self, wanted: str) -> str:
-        """/model NAME: a configured model, else a model the current API offers (it gets a config entry
-        like the current one's). Saved in this agent's config.json, so it lasts; returns what happened."""
-        name, entry = wanted, None
-        if wanted not in self.cfg["models"]:
-            try:
-                offered = [i for i, _ in self.model.list_models()]
-            except (urllib.error.URLError, OSError, ValueError):
-                offered = None
-            if offered is not None and wanted not in offered:
-                near = difflib.get_close_matches(wanted, list(self.cfg["models"]) + offered, n=5, cutoff=0.4)
-                return (f"no model {wanted!r}: it's not in your config, and {self.model.base} doesn't offer it"
-                        + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
-            name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
-            entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
-                     "model": wanted}
-            self.cfg["models"][name] = entry
-        if name == self.model.name:
-            return f"already on {self.model.describe()}"
-        path = self.p("config.json")
-        try:
-            data = json.loads(read(path) or "{}")
-        except json.JSONDecodeError as e:
-            return f"can't switch: {path} isn't valid JSON ({e})"
-        if entry:
-            data.setdefault("models", {})[name] = entry
-        data["model"] = name
-        write_atomic(path, json.dumps(data, indent=2) + "\n")
-        old = self.model.describe()
-        self.use_model(name)
-        self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in self.cfg["models"] and f != name]
-        return (f"switched from {old} to {self.model.describe()}, context {self.state.get('context_tokens') or 'unknown'} "
-                f"(saved in {path})")
-
-    def refresh_limits(self, why: str) -> None:
-        """Ask the API for the limits again: windows can change (a local server restarted with another
-        size, a provider's update). A number from config stays; so does the old one if the API won't say."""
-        old = self.state.get("context_tokens")
-        if self.state.get("context_source") == "config":
-            self.log("hobkin", f"limits ({why}): context {old} is set in config, so it stays")
-            return
-        ctx, out, src = self.model.query_limits()
-        if out:
-            self.state["api_max_output"] = int(out)
-        if ctx and why != "/limits" and self.state.get("context_source") == "learned from an error" and int(ctx) >= (old or 0):
-            ctx = None          # the API overstated it before: the error's number stands until /limits
-        if ctx:
-            self.state["context_tokens"], self.state["context_source"] = int(ctx), src
-        if ctx and int(ctx) != old:
-            self.log("hobkin", f"limits ({why}): context window now {ctx} (was {old or 'unknown'}; {src})")
-        elif why == "/limits":
-            self.log("hobkin", f"limits ({why}): context {old or 'unknown'} "
-                     + (f"(unchanged; {src})" if ctx else f"(the API doesn't say; {self.state.get('context_source') or 'none'})"))
-        self.save_state()
-
-    def max_output(self):
-        want = int(self.model.cfg.get("max_output_tokens") or self.cfg.get("max_output_tokens") or 16000)
-        api = self.state.get("api_max_output")
-        return min(want, api) if api else want
 
     # --- context file: line 1 is the system prompt, then one message per line
     def system_prompt(self):
@@ -2299,590 +2313,7 @@ class Agent:
             self.log("hobkin", json.dumps({k: self.state.get(k) for k in
                                            ("status", "model", "context_tokens", "last_input_tokens", "compactions")}))
 
-    # --- tools
-    def own_tools(self) -> tuple[list[dict], dict[str, str], list[str]]:
-        """The tools the agent made itself (OWN_TOOLS): their definitions, {name: run path}, and what's wrong with
-        any that can't be offered, read fresh each time so a new one is there from the next reply."""
-        defs, runs, problems = [], {}, []
-        root = os.path.join(self.work, "tools")
-        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL]}     # hold too: it's offered on a shared incident
-        for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-            d = os.path.join(root, name)
-            if not os.path.isdir(d):
-                continue
-            run = os.path.join(d, "run")
-            try:
-                spec = json.loads(read(os.path.join(d, "tool.json")) or "null")
-            except json.JSONDecodeError as e:
-                spec, why = None, f"tool.json isn't valid JSON ({e})"
-            else:
-                why = "it has no tool.json" if spec is None else ""
-            if not OWN_TOOL_NAME.match(name):
-                why = "its name must be lowercase letters, digits and _ (starting with a letter)"
-            elif name in builtin:
-                why = "that's the name of a built-in tool"
-            elif not why and not (isinstance(spec, dict) and isinstance(spec.get("description"), str)
-                                  and isinstance(spec.get("input_schema"), dict)):
-                why = "tool.json needs a \"description\" (text) and an \"input_schema\" (an object)"
-            elif not why and not os.access(run, os.X_OK):
-                why = "it has no executable `run` (chmod +x it)"
-            if why:
-                problems.append(f"tools/{name}: not offered: {why}")
-                continue
-            defs.append({"name": name, "description": spec["description"], "input_schema": spec["input_schema"]})
-            runs[name] = run
-        return defs, runs, problems
-
-    def tools(self) -> list[dict]:
-        """What the model is offered: the built-in tools, then the agent's own."""
-        team = [HOLD_TOOL] if getattr(self, "glass", None) and self.glass.get("incident") else []
-        return TOOLS + team + self.own_tools()[0]
-
-    def run_own_tool(self, run: str, inp: dict) -> ToolResult:
-        """One of the agent's own tools: its `run`, with the input as JSON on stdin, run as a bash command
-        (the same shell, sandbox, limits, timeline and log)."""
-        end = "HOBKIN_INPUT_" + secrets.token_hex(6)
-        return self.run_bash(f"{shlex.quote(run)} <<'{end}'\n{json.dumps(inp)}\n{end}")
-
-    def secret_names(self):
-        return list(load_env_file(os.path.join(SHARED, "secrets.env"))) + list(load_env_file(self.p("secrets.env")))
-
-    def tool_env(self):
-        env = dict(os.environ)
-        env.pop(self.model.cfg.get("key_env") or "", None)   # the model key isn't the agent's to use
-        env.update(load_env_file(os.path.join(SHARED, "secrets.env")))
-        env.update(load_env_file(self.p("secrets.env")))
-        env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work,
-                    "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"),
-                    "HOBKIN_SELF": os.path.abspath(__file__)})
-        return env
-
-    # --- background jobs: started by bash with background: true; a message arrives when each finishes
-    def start_job(self, command: str) -> ToolResult:
-        """Run a command detached (it outlives hobkin if need be), in the shell's current state, with its
-        output and exit code in jobs/N/. The exit file appearing is how we know it finished."""
-        n = self.state["next_job"] = self.state.get("next_job", 0) + 1
-        jdir = self.p(f"jobs/{n}")
-        os.makedirs(jdir, exist_ok=True)
-        state_file = os.path.join(self.p("shell") if self.safe else self.dir, "shell.sh")
-        script = (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if os.path.exists(state_file) else "") + command
-        env = self.safe_env(self.tool_env())
-        env.update({"HOBKIN_JOB": script, "HOBKIN_JOB_OUT": os.path.join(jdir, "out.log"),
-                    "HOBKIN_JOB_EXIT": os.path.join(jdir, "exit")})
-        proc = subprocess.Popen(self.sandboxed(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"']),
-                                cwd=self.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, start_new_session=True)
-        self.job_procs[n] = proc            # kept so it's reaped; the exit file is what counts
-        self.state.setdefault("jobs", {})[str(n)] = {"command": command[:500], "started": time.time(), "dir": jdir,
-                                                    "pid": proc.pid}
-        self.save_state()
-        self.log("$", f"(background job #{n}) {command}")
-        return (f"Started background job #{n} (pid {proc.pid}); its output goes to {jdir}/out.log. You'll get a "
-                "message when it finishes: do other work meanwhile, or end your turn."), False
-
-    def finished_jobs(self) -> list[str]:
-        """Messages for background jobs that have finished since we last looked."""
-        out = []
-        for n, job in list((self.state.get("jobs") or {}).items()):
-            exit_file = os.path.join(job["dir"], "exit")
-            if not os.path.exists(exit_file):
-                if not self.job_alive(job):
-                    write_atomic(exit_file, "?\n")      # gone without an exit code (killed, or its folder cleared)
-                else:
-                    continue
-            code = read(exit_file).strip() or "?"
-            ended = os.path.getmtime(exit_file)
-            tail = clip(read(os.path.join(job["dir"], "out.log")), 0, 2000).lstrip("\n")
-            text = (f"[Background job #{n} finished: exit {code} after {span_text(max(0, ended - job['started']))}, "
-                    f"at {when_text(ended)}. "
-                    f"Command: {job['command']}\nLast of its output ({job['dir']}/out.log):]\n{tail.strip() or '(no output)'}")
-            del self.state["jobs"][n]
-            self.job_procs.pop(int(n), None)
-            self.save_state()
-            self.log("job", text)
-            out.append(text)
-        return out
-
-    def goal_checklist(self, g: dict) -> str:
-        return (f"# Goal\n\n{g['goal']}\n\n## How it works\n\n{g['how_it_works'] or '-'}\n\n## Why it doesn't\n\n"
-                f"{g['why_it_doesnt'] or '-'}\n\n## What would\n\n{g['what_would']}\n\n## Steps\n\n"
-                + "".join(f"- [{'x' if i + 1 in g['done'] else ' '}] {i + 1}. {t}\n" for i, t in enumerate(g["steps"])))
-
-    def tool_goal(self, inp: dict) -> ToolResult:
-        """Set the task's goal (writes CHECKLIST.md, shows the thinking, opens file changes) or tick steps."""
-        g = self.state.get("goal") or {}
-        if inp.get("done") is not None and not inp.get("goal"):
-            if not g.get("open"):
-                return "No goal is set. Set one first (goal, what_would, steps).", True
-            done = inp["done"] if isinstance(inp["done"], list) else [inp["done"]]
-            bad = [n for n in done if not isinstance(n, int) or not 1 <= n <= len(g["steps"])]
-            if bad:
-                return f"No step {bad[0]}: the steps are 1 to {len(g['steps'])}.", True
-            g["done"] = sorted(set(g["done"]) | set(done))
-            write_atomic(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g))
-            self.step_done = True                      # a good moment to compact, if it's due
-            self.log("goal", "ticked " + ", ".join(f"{n}. {g['steps'][n - 1]}" for n in done))
-            left = [i + 1 for i in range(len(g["steps"])) if i + 1 not in g["done"]]
-            if not left:
-                g["open"] = False
-                self.save_state()
-                return f"All {len(g['steps'])} steps done: the goal is closed. Report what you did.", False
-            self.save_state()
-            return f"Ticked. Next: {left[0]}. {g['steps'][left[0] - 1]}", False
-        missing = [k for k in ("goal", "what_would", "steps") if not inp.get(k)]
-        if missing:
-            return f"A goal needs {', '.join(missing)} (and how_it_works, why_it_doesnt).", True
-        folder = self.cwd()
-        if os.path.realpath(folder) == os.path.realpath(self.work):   # not in a task folder yet: make one
-            slug = re.sub(r"[^a-z0-9]+", "-", str(inp["goal"]).lower()).strip("-")[:40] or "task"
-            folder = os.path.join(self.work, slug)
-            os.makedirs(folder, exist_ok=True)
-        keep = g.get("done", []) if g.get("open") and g.get("folder") == folder else []
-        g = {"goal": str(inp["goal"]), "how_it_works": str(inp.get("how_it_works") or ""),
-             "why_it_doesnt": str(inp.get("why_it_doesnt") or ""), "what_would": str(inp["what_would"]),
-             "steps": [str(t) for t in inp["steps"]], "done": [n for n in keep if n <= len(inp["steps"])],
-             "folder": folder, "open": True, "set": time.time()}
-        self.state["goal"] = g
-        path = os.path.join(folder, "CHECKLIST.md")
-        write_atomic(path, self.goal_checklist(g))
-        self.save_state()
-        self.log("goal", f"Goal: {g['goal']}\nHow it works: {g['how_it_works'] or '-'}\nWhy it doesn't: "
-                         f"{g['why_it_doesnt'] or '-'}\nWhat would: {g['what_would']}\n"
-                 + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(g["steps"])))
-        return (f"Goal set: {path} written ({len(g['steps'])} steps). " +
-                (f"Your task folder is {folder}: work from there. " if folder != self.cwd() else "") +
-                "Now make it do the thing, one step at a time; after each, call goal with {\"done\": [N]}."), False
-
-    @staticmethod
-    def job_alive(job: dict) -> bool:
-        """Is a background job's process still there? (A minute's grace, for a job that's just starting.)"""
-        if time.time() - job.get("started", 0) < 60:
-            return True
-        try:
-            os.kill(int(job.get("pid") or 0), 0)
-            return True
-        except (ProcessLookupError, ValueError):
-            return False
-        except PermissionError:
-            return True
-
-    def due_events(self) -> list[str]:
-        """What's come due on its own: reminders, finished background jobs, and a hello when someone's
-        just opened a chat."""
-        greet = []
-        if self.greet_wanted:
-            self.greet_wanted = False
-            greet = [GREET.format(who=self.who, stamp=self.stamp(), name=self.id)]
-        return greet + self.take_due_reminders() + self.finished_jobs()
-
-    def scheduled(self) -> bool:
-        """True when the agent has set up its own next wake-up: a reminder, or a job still running.
-        Then it's managing itself, and the hot-take, wrap-up and idle nudges stay quiet."""
-        return bool(self.state.get("jobs")) or self.next_reminder_in() is not None
-
-    def cwd(self):
-        cwd = self.state.get("cwd") or self.work
-        return cwd if os.path.isdir(cwd) else self.work
-
-    def where(self, cwd):
-        rel = os.path.relpath(cwd, self.work)
-        return "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
-
-    def announce_check(self, command: str, announced: str | None) -> ToolResult | None:
-        """Outward-facing commands are announced first and run after announce_delay unless vetoed.
-        None: go ahead. Otherwise the (not-run) result to give the agent."""
-        if self.glass:                               # break glass: fully autonomous
-            return None
-        label = next((name for name, rx in (self.cfg.get("announce_first") or {}).items()
-                      if re.search(rx, command)), None)
-        if not label:
-            return None
-        key = hashlib.sha256(command.strip().encode()).hexdigest()[:16]
-        pending, delay = self.state.setdefault("announced", {}), float(self.cfg.get("announce_delay") or 0)
-        if key in self.state.get("vetoed", []):
-            return (f"Not run: {self.who} vetoed this ({label}). Don't run it; ask what they'd prefer, or find "
-                    "another way."), True
-        if not announced:
-            return (f"Not run yet: this looks outward-facing ({label}), so announce it first. Post where people will "
-                    f"see it (your work system's chat) what you're about to do and why, then run exactly the same "
-                    f"command again with `announced` set to where you posted. It can run {span_text(delay)} after "
-                    "that, if nobody objects."), True
-        when = pending.get(key, {}).get("at")
-        if when is None:
-            pending[key] = {"at": time.time(), "where": announced, "label": label, "command": command[:200]}
-            self.save_state()
-            self.log("hobkin", f"announced ({label}, in {announced}); can run from "
-                     f"{time.strftime('%H:%M:%S', time.localtime(time.time() + delay))} unless {self.who} sends /veto")
-            return (f"Announced. It can run from {time.strftime('%H:%M:%S', time.localtime(time.time() + delay))}: until "
-                    f"then, check where you posted for objections (a reminder works), then run exactly the same "
-                    "command again with `announced` set."), True
-        if time.time() < when + delay:
-            return f"Not yet: it can run from {time.strftime('%H:%M:%S', time.localtime(when + delay))}.", True
-        del pending[key]
-        self.log("hobkin", f"announced in {announced} and nobody objected: running it")
-        return None
-
-    def run_bash(self, command: str, timeout: int | None = None, reset: bool = False,
-                 background: bool = False, announced: str | None = None) -> ToolResult:
-        """Each command is its own bash process, so a hung or crashed one can't take the shell
-        with it. The shell still behaves like one that persists: the first runs as a login shell,
-        and every command starts from the state the last one left (shell.sh)."""
-        refused = self.hold_check(command) or self.announce_check(command, announced)
-        if refused:
-            self.log("$", f"(not run) {command}")
-            return refused
-        if background:
-            return self.start_job(command)
-        timeout = max(1, int(timeout or self.cfg["bash_timeout"]))   # the agent can ask for any length
-        state_dir = self.p("shell") if self.safe else self.dir      # safe mode: a folder its commands may write
-        state_file, cwd_file = os.path.join(state_dir, "shell.sh"), os.path.join(state_dir, ".cwd")
-        if reset:
-            for f in (state_file, cwd_file):
-                if os.path.exists(f):
-                    os.remove(f)
-            self.state["cwd"] = self.work
-        cwd = self.cwd()
-        self.log("$", ("(fresh shell) " if reset else "") + command)
-        self.interrupt = False
-        env = self.safe_env(self.tool_env())
-        env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
-                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_SELF", "HOBKIN_NOSAVE",
-                                                              "HOBKIN_SANDBOX", "TMPDIR"])
-        restore = os.path.exists(state_file)
-        script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
-                  + (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if restore else "")
-                  + SHELL_SAVE + command)
-        argv = self.sandboxed(["bash", "-c", script] if restore else ["bash", "--login", "-c", script])
-        with tempfile.TemporaryFile() as outf:
-            proc = subprocess.Popen(argv, cwd=cwd, env=env,
-                                    stdin=subprocess.DEVNULL, stdout=outf, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-            start, reason = time.time(), None
-            while proc.poll() is None:
-                self.poll_input(0.5)                 # keep reading the FIFO (commands work mid-run)
-                if self.pending and self.cfg.get("front_desk", True):
-                    self.front_desk()                # answer now; the command keeps running
-                inbox = self.cfg.get("inbox")
-                if inbox and self.cfg.get("front_desk", True) and \
-                        time.time() - self.inbox_checked >= float(inbox.get("every") or 15):
-                    self.check_inbox()
-                if self.stop:
-                    reason = "interrupted: hobkin is stopping"
-                elif self.interrupt:
-                    reason = "interrupted by the operator"
-                elif time.time() - start > timeout:
-                    reason = f"timed out after {timeout}s"
-                if reason:
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                        proc.wait(5)
-                    except (ProcessLookupError, subprocess.TimeoutExpired):
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    proc.wait()
-                    break
-            size = outf.seek(0, os.SEEK_END)
-            keep = int(self.cfg["output_limit"])
-            outf.seek(0)
-            if size <= keep:
-                out = outf.read().decode(errors="replace")
-            else:
-                head = outf.read(keep // 2).decode(errors="replace")
-                outf.seek(size - keep // 2)
-                tail = outf.read().decode(errors="replace")
-                full = self.p("last-output.log")             # all of it, for the part that was cut
-                outf.seek(0)
-                with open(full, "wb") as f:
-                    shutil.copyfileobj(outf, f)
-                out = (f"{head}\n... [{size - keep} bytes cut: the whole output is in {full} until your next long "
-                       f"command; grep it] ...\n{tail}")
-        new_cwd = read(cwd_file).strip()
-        if new_cwd and os.path.isdir(new_cwd):
-            cwd = new_cwd
-        self.state["cwd"] = cwd
-        status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)}"
-        self.timeline(f"`{clip(command.strip(), 300, 100)}` ({reason or f'exit code {proc.returncode}'})")
-        shown = clip(out, 1000, 800)
-        self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
-        return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
-
-    def resolve(self, path):
-        """A tool path: $HOBKIN_* and ~ expanded, relative to the shell's current folder."""
-        names = {"HOBKIN_WORK": self.work, "HOBKIN_DIR": self.dir, "HOBKIN_MEMORY": self.p("MEMORY.md"),
-                 "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"), "HOME": os.path.expanduser("~")}
-        path = re.sub(r"\$\{?(HOBKIN_WORK|HOBKIN_DIR|HOBKIN_MEMORY|HOBKIN_BLOOPERS|HOME)\}?",
-                      lambda m: names[m.group(1)], path.strip())
-        return os.path.normpath(os.path.join(self.cwd(), os.path.expanduser(path)))
-
-    def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
-        full = self.resolve(path)
-        if os.path.isdir(full):
-            entries = sorted(os.listdir(full))
-            shown = [e + ("/" if os.path.isdir(os.path.join(full, e)) else "") for e in entries[:500]]
-            return f"{full} (folder, {len(entries)} entries):\n" + "\n".join(shown), False
-        if not os.path.isfile(full):
-            return f"No such file: {full}", True
-        data = open(full, "rb").read()
-        if b"\0" in data[:8000]:
-            return f"{full} is a binary file ({len(data)} bytes); not shown.", True
-        lines = data.decode(errors="replace").splitlines()
-        start = max(1, int(offset or 1))
-        count = max(1, int(limit or 400))
-        chunk = lines[start - 1:start - 1 + count]
-        body = "\n".join(f"{n:>5}| {l[:2000]}" for n, l in enumerate(chunk, start))
-        end = start + len(chunk) - 1
-        if not lines:
-            return f"{full} is empty.", False
-        more = f" (showing lines {start}-{end} of {len(lines)}; use offset={end + 1} for more)" if end < len(lines) or start > 1 else ""
-        unread = f"\n[hobkin: {len(lines) - end} more lines unread (offset={end + 1}). Read them before saying " \
-            "anything about the rest.]" if end < len(lines) else ""
-        return f"{full}{more}:\n{body}{unread}", False
-
-    def write_file(self, path: str, content: str) -> ToolResult:
-        full = self.resolve(path)
-        if not self.writable(full):
-            return SAFE_REFUSED.format(path=full), True
-        existed = os.path.exists(full)
-        if os.path.isdir(full):
-            return f"{full} is a folder.", True
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(content)
-        n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
-        note = ""
-        if "\n" not in content and "\\n" in content and len(content) > 80:
-            note = ("\nNote: the file has no line breaks but contains the characters \\n. "
-                    "If you meant new lines, write real line breaks in content.")
-        return f"{'Replaced' if existed else 'Created'} {full} ({n} lines){note}", False
-
-    def edit_file(self, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
-        full = self.resolve(path)
-        if not self.writable(full):
-            return SAFE_REFUSED.format(path=full), True
-        if not os.path.isfile(full):
-            return f"No such file: {full}. Use write_file to create it.", True
-        text = open(full, encoding="utf-8", errors="replace").read()
-        if not old:
-            return "old_text is empty. To write a whole file use write_file.", True
-        note = ""
-        if old not in text:
-            # Common slips: line numbers copied from read_file, or Windows line endings
-            stripped = re.sub(r"(?m)^\s*\d+\| ?", "", old)
-            if stripped != old and stripped in text:
-                old, new, note = stripped, re.sub(r"(?m)^\s*\d+\| ?", "", new), " (line numbers from read_file removed)"
-            elif "\r\n" in text and old.replace("\n", "\r\n") in text:
-                old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
-        count = text.count(old)
-        if count == 0:
-            return "old_text isn't in the file (it must match exactly, including spaces and indentation)." \
-                + self.closest(text, old), True
-        if count > 1 and not replace_all:
-            lines = [text.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old), text)]
-            return (f"old_text appears {count} times (lines {', '.join(map(str, lines[:20]))}). Include more of the "
-                    "surrounding lines so it matches once, or set replace_all."), True
-        first = text.index(old)
-        text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(text)
-        # Show the result around the (first) change, so it can be checked
-        lines = text.splitlines()
-        at = text.count("\n", 0, first)
-        lo, hi = max(0, at - 3), min(len(lines), at + new.count("\n") + 4)
-        shown = "\n".join(f"{n:>5}| {l}" for n, l in enumerate(lines[lo:hi], lo + 1))
-        return f"Edited {full}{' (' + str(count) + ' places)' if replace_all and count > 1 else ''}{note}. Now:\n{shown}", False
-
-    @staticmethod
-    def closest(text, old):
-        """Where the file has text most like old_text, to show in an error."""
-        lines, want = text.splitlines(), old.strip("\n").splitlines()
-        if not lines:
-            return " The file is empty: use write_file to give it content."
-        if not want or len(lines) > 20000:
-            return ""
-        n, target, best = len(want), "\n".join(want), (0.0, 0)
-        for i in range(max(1, len(lines) - n + 1)):
-            m = difflib.SequenceMatcher(None, "\n".join(lines[i:i + n]), target)
-            if m.real_quick_ratio() > best[0] and m.quick_ratio() > best[0]:
-                r = m.ratio()
-                if r > best[0]:
-                    best = (r, i)
-        if best[0] < 0.5:
-            return " Nothing similar found: read_file it again and copy the text exactly."
-        i = best[1]
-        shown = "\n".join(f"{k:>5}| {l}" for k, l in enumerate(lines[i:i + n], i + 1))
-        return f" The closest text in the file is lines {i + 1}-{i + n}:\n{shown}"
-
-    def open_skill(self, name: str) -> ToolResult:
-        skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
-        key = name.strip().lower()
-        match = next((n for n in skills if n.lower() == key), None)
-        if not match:
-            return f"No skill named {name!r}. Skills: {', '.join(sorted(skills)) or 'none'}.", True
-        desc, path = skills[match]
-        folder = os.path.dirname(path)
-        files = []
-        for root, dirs, names in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            files += [os.path.relpath(os.path.join(root, f), folder) for f in names if not f.startswith(".")]
-        files = sorted(files)
-        return (f"Skill: {match}\nFolder: {folder}\nFiles: {', '.join(files[:100])}\n"
-                f"Paths in these instructions are relative to that folder: use {folder}/<path>.\n\n{read(path)}"), False
-
-    # --- reminders: reminders.json in the agent's folder (you can read and edit it)
-    def warn_once(self, key, text):
-        """Log a problem with a hand-edited file once per version of that file, not on every check."""
-        if getattr(self, "_warned", {}).get(key) != text:
-            self._warned = {**getattr(self, "_warned", {}), key: text}
-            self.log("hobkin", text)
-
-    def load_reminders(self):
-        try:
-            data = json.loads(read(self.p("reminders.json"), "{}") or "{}")
-        except json.JSONDecodeError as e:
-            self.warn_once("reminders", f"reminders.json isn't valid JSON ({e}); ignoring it until it's fixed")
-            return {"next_id": 1, "items": []}, False
-        items = []
-        for r in data.get("items", []):
-            try:
-                r["_due"] = datetime.strptime(r["due"], TIME_FMT).timestamp()
-                r["_every"] = parse_duration(r["every"]) if r.get("every") else None
-                items.append(r)
-            except (KeyError, ValueError) as e:
-                self.warn_once(f"reminder {r}", f"skipping a reminder in reminders.json I can't read ({e}): {r}")
-        return {"next_id": data.get("next_id", 1 + max([r.get("id", 0) for r in items] or [0])), "items": items}, True
-
-    def save_reminders(self, data):
-        items = sorted(({k: v for k, v in r.items() if not k.startswith("_")} for r in data["items"]), key=lambda r: r["due"])
-        write_atomic(self.p("reminders.json"), json.dumps({"next_id": data["next_id"], "items": items}, indent=2) + "\n")
-
-    def reminder_lines(self, items):
-        now_t = time.time()
-        return [f"#{r['id']}: {when_text(r['_due'])} (in {span_text(max(0, r['_due'] - now_t))})"
-                + (f", repeats every {r['every']}" if r.get("every") else "") + f": {r['message']}"
-                for r in sorted(items, key=lambda r: r["_due"])]
-
-    def tool_remind(self, inp: dict) -> ToolResult:
-        message = str(inp.get("message") or "").strip()
-        if not message:
-            return "A reminder needs a message: what to check or do when it fires.", True
-        now_t = time.time()
-        data, ok = self.load_reminders()
-        if not ok:
-            return "reminders.json is broken; ask the operator to fix it.", True
-        try:
-            every = parse_duration(inp["every"]) if inp.get("every") else None
-            if every is not None and every <= 0:
-                return "`every` has to be longer than zero.", True
-            if inp.get("in") and inp.get("at"):
-                return "Give either `in` or `at`, not both.", True
-            if inp.get("in"):
-                due = now_t + parse_duration(inp["in"])
-            elif inp.get("at"):
-                due = parse_at(inp["at"], now_t)
-            elif every:
-                due = now_t + every
-            else:
-                return "Say when: `in` (e.g. \"20m\") or `at` (e.g. \"tomorrow 09:00\"), and/or `every`.", True
-        except ValueError as e:
-            return f"{e}. It's now {when_text(now_t)}.", True
-        if due < now_t - 1:
-            return f"That's in the past: it's now {when_text(now_t)}.", True
-        rid = data["next_id"]
-        data["next_id"] += 1
-        data["items"].append({"id": rid, "message": message, "due": time.strftime(TIME_FMT, time.localtime(due)),
-                              "every": inp.get("every") or None, "set": time.strftime(TIME_FMT, time.localtime(now_t)),
-                              "_due": due})
-        self.save_reminders(data)
-        hint = ""
-        if every and not inp.get("in") and not inp.get("at"):
-            hint = (f" It repeats every {inp['every']} until you cancel it. If you meant once, cancel this one "
-                    f"(reminders, cancel: {rid}) and use \"in\": \"{inp['every']}\" instead. Otherwise, enjoy the doorbell!")
-        return (f"Reminder #{rid} set for {when_text(due)} (in {span_text(max(0, due - now_t))})"
-                + (f", then every {inp['every']}" if every else "") + f". It's now {when_text(now_t)}.{hint}"), False
-
-    def tool_reminders(self, inp: dict) -> ToolResult:
-        data, ok = self.load_reminders()
-        note = ""
-        if inp.get("cancel") is not None:
-            rid = int(inp["cancel"])
-            kept = [r for r in data["items"] if r["id"] != rid]
-            if len(kept) == len(data["items"]):
-                return f"There's no reminder #{rid}.\n" + ("\n".join(self.reminder_lines(data["items"])) or "You have no reminders."), True
-            data["items"] = kept
-            self.save_reminders(data)
-            note = f"Cancelled reminder #{rid}.\n"
-        lines = self.reminder_lines(data["items"])
-        return note + (("Your reminders:\n" + "\n".join(lines)) if lines else "You have no reminders.") \
-            + f"\nIt's now {when_text(time.time())}.", False
-
-    def take_due_reminders(self) -> list[str]:
-        """Messages for reminders that are due; repeating ones move to their next time."""
-        if not os.path.exists(self.p("reminders.json")):
-            return []
-        now_t = time.time()
-        data, ok = self.load_reminders()
-        due = [r for r in data["items"] if r["_due"] <= now_t] if ok else []
-        if not due:
-            return []
-        out = []
-        for r in due:
-            late = now_t - r["_due"]
-            text = f"[Reminder #{r['id']}, set {r.get('set', '?')[:16]} for {when_text(r['_due'])}"
-            text += f"; {span_text(late)} late (hobkin wasn't running then)" if late > 90 else ""
-            if r["_every"]:
-                missed, nxt = 0, r["_due"]
-                while nxt <= now_t:
-                    nxt += r["_every"]
-                    missed += 1
-                r["_due"], r["due"] = nxt, time.strftime(TIME_FMT, time.localtime(nxt))
-                text += (f"; {missed - 1} earlier times were missed" if missed > 1 else "") + f"; repeats, next {when_text(nxt)}"
-            else:
-                data["items"].remove(r)
-            text += f". It's now {when_text(now_t)}.]\n{r['message']}"
-            out.append(text)
-        self.save_reminders(data)          # the file first, then say so
-        for text in out:
-            self.log("reminder", text)
-        return out
-
-    def next_reminder_in(self):
-        if not os.path.exists(self.p("reminders.json")):
-            return None
-        data, ok = self.load_reminders()
-        return max(0.0, min(r["_due"] for r in data["items"]) - time.time()) if ok and data["items"] else None
-
-    # --- nudges: where the [hobkin: ...] hints (texts and detectors: the "nudges" section) get attached.
-    # Small models skim long instructions but follow a hint at the moment it applies.
-    def from_operator(self, text: str, busy: bool = False) -> str:
-        """A message from the operator as the model sees it: who sent it, and the hot-take hint, unless
-        the agent is busy (mid-task) or managing itself (a reminder or job of its own coming)."""
-        self.owe_reply, self.reply_nudged = True, False
-        if busy:
-            return (f"[message from {self.who}, {self.stamp()}, while you were working: answer it in your next "
-                    f"reply, then carry on]\n{text}")
-        hint = "" if self.scheduled() else f"\n{HOT_TAKE if self.has_work_system() else HOT_TAKE_CHAT}"
-        return f"[message from {self.who}, {self.stamp()}: they're talking with you now. Answer them in your reply]\n{text}{hint}"
-
-    def has_work_system(self) -> bool:
-        """Any skills at all: somewhere work comes from besides the people talking to it here."""
-        return bool(find_skills(self.dir, self.cfg.get("skill_dirs") or []))
-
-    def count_cost(self) -> None:
-        """Add the last call's cost (where the API reports it) to today's and all-time spend."""
-        if self.model.last_cost:
-            cost, today = float(self.model.last_cost), time.strftime("%Y-%m-%d")
-            self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + cost, 6)
-            if self.state.get("spend_day") != today:
-                self.state.update({"spend_day": today, "spend_today": 0.0})
-            self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
-            if self.glass:                             # the incident's own spend: its budget, not the day's
-                if self.state.get("glass_spend_day") != today:
-                    self.state.update({"glass_spend_day": today, "glass_spend": 0.0})
-                self.state["glass_spend"] = round(self.state["glass_spend"] + cost, 6)
-            self.model.last_cost = None
-
+    # --- the front desk and wake-ups: answering mid-command, the board's inbox, the waker
     def front_desk_reply(self, who: str, text: str, where: str = "") -> str | None:
         """One front-desk answer: the worker's own conversation up to now (so a local server's KV cache is
         reused), stand-in results for the commands still running, and the message. Called only from the
@@ -3011,6 +2442,645 @@ class Agent:
             seen.append(key)
             del seen[:-300]
             self.save_state()
+
+    # --- tools: dispatch, the agent's own tools, the shell's environment and folder
+    def run_tool(self, name: str, inp: dict) -> ToolResult:
+        """(result text, is_error) for one tool call. Each tool is one line here; bash logs its
+        own command and output, the rest log the first line of their result."""
+        s = lambda key: str(inp[key])            # a required argument (KeyError if missing)
+        if name in ("write_file", "edit_file") and not self.plan_said() and not self.plan_checked \
+                and os.path.basename(str(inp.get("path", ""))).lower() not in PLANNING_FILES \
+                and not str(inp.get("path", "")).startswith(("$HOBKIN_MEMORY", "$HOBKIN_BLOOPERS")):
+            self.plan_checked = True               # once per turn: a second try goes through
+            self.log(name, f"(not run: no plan said yet) {inp.get('path', '')}")
+            said = [label for pattern, label in ((r"\bhow it works", "How it works"), (r"\bwhy it doesn", "Why it doesn't"))
+                    if re.search(pattern, self.turn_said, re.I)]
+            missing = f" You've said {' and '.join(said)}; what's missing is **What would:**." if said else ""
+            return PLAN_FIRST.format(missing=missing), True
+        tools = {
+            "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")),
+                                          bool(inp.get("background")), inp.get("announced")),
+            "read_file": lambda: self.read_file(s("path"), inp.get("offset"), inp.get("limit")),
+            "write_file": lambda: self.write_file(s("path"), s("content")),
+            "edit_file": lambda: self.edit_file(s("path"), s("old_text"), s("new_text"), bool(inp.get("replace_all"))),
+            "remind": lambda: self.tool_remind(inp),
+            "reminders": lambda: self.tool_reminders(inp),
+            "skill": lambda: self.open_skill(s("name")),
+            "goal": lambda: self.tool_goal(inp),
+            "view_image": lambda: self.view_image(s("path")),
+            "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
+            "web_search": lambda: self.web_search(s("query")),
+            **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
+        }
+        if name not in tools:
+            runs = self.own_tools()[1]
+            if name in runs:
+                return self.run_own_tool(runs[name], inp)
+            return f"Unknown tool {name!r}. Tools: {', '.join(list(tools) + list(runs))}.", True
+        try:
+            result = tools[name]()
+        except KeyError as e:
+            result = (f"Missing argument {e} for {name}.", True)
+        except (OSError, ValueError, TypeError) as e:
+            result = (f"{name} failed: {e}", True)
+        if name != "bash":
+            self.log(name, (result_text(result[0]).splitlines() or [""])[0])
+        return result
+
+    def tools(self) -> list[dict]:
+        """What the model is offered: the built-in tools, then the agent's own."""
+        team = [HOLD_TOOL] if getattr(self, "glass", None) and self.glass.get("incident") else []
+        return TOOLS + team + self.own_tools()[0]
+
+    def own_tools(self) -> tuple[list[dict], dict[str, str], list[str]]:
+        """The tools the agent made itself (OWN_TOOLS): their definitions, {name: run path}, and what's wrong with
+        any that can't be offered, read fresh each time so a new one is there from the next reply."""
+        defs, runs, problems = [], {}, []
+        root = os.path.join(self.work, "tools")
+        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL]}     # hold too: it's offered on a shared incident
+        for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            run = os.path.join(d, "run")
+            try:
+                spec = json.loads(read(os.path.join(d, "tool.json")) or "null")
+            except json.JSONDecodeError as e:
+                spec, why = None, f"tool.json isn't valid JSON ({e})"
+            else:
+                why = "it has no tool.json" if spec is None else ""
+            if not OWN_TOOL_NAME.match(name):
+                why = "its name must be lowercase letters, digits and _ (starting with a letter)"
+            elif name in builtin:
+                why = "that's the name of a built-in tool"
+            elif not why and not (isinstance(spec, dict) and isinstance(spec.get("description"), str)
+                                  and isinstance(spec.get("input_schema"), dict)):
+                why = "tool.json needs a \"description\" (text) and an \"input_schema\" (an object)"
+            elif not why and not os.access(run, os.X_OK):
+                why = "it has no executable `run` (chmod +x it)"
+            if why:
+                problems.append(f"tools/{name}: not offered: {why}")
+                continue
+            defs.append({"name": name, "description": spec["description"], "input_schema": spec["input_schema"]})
+            runs[name] = run
+        return defs, runs, problems
+
+    def run_own_tool(self, run: str, inp: dict) -> ToolResult:
+        """One of the agent's own tools: its `run`, with the input as JSON on stdin, run as a bash command
+        (the same shell, sandbox, limits, timeline and log)."""
+        end = "HOBKIN_INPUT_" + secrets.token_hex(6)
+        return self.run_bash(f"{shlex.quote(run)} <<'{end}'\n{json.dumps(inp)}\n{end}")
+
+    def secret_names(self):
+        return list(load_env_file(os.path.join(SHARED, "secrets.env"))) + list(load_env_file(self.p("secrets.env")))
+
+    def tool_env(self):
+        env = dict(os.environ)
+        env.pop(self.model.cfg.get("key_env") or "", None)   # the model key isn't the agent's to use
+        env.update(load_env_file(os.path.join(SHARED, "secrets.env")))
+        env.update(load_env_file(self.p("secrets.env")))
+        env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work,
+                    "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"),
+                    "HOBKIN_SELF": os.path.abspath(__file__)})
+        return env
+
+    def cwd(self):
+        cwd = self.state.get("cwd") or self.work
+        return cwd if os.path.isdir(cwd) else self.work
+
+    def where(self, cwd):
+        rel = os.path.relpath(cwd, self.work)
+        return "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
+
+    def resolve(self, path):
+        """A tool path: $HOBKIN_* and ~ expanded, relative to the shell's current folder."""
+        names = {"HOBKIN_WORK": self.work, "HOBKIN_DIR": self.dir, "HOBKIN_MEMORY": self.p("MEMORY.md"),
+                 "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"), "HOME": os.path.expanduser("~")}
+        path = re.sub(r"\$\{?(HOBKIN_WORK|HOBKIN_DIR|HOBKIN_MEMORY|HOBKIN_BLOOPERS|HOME)\}?",
+                      lambda m: names[m.group(1)], path.strip())
+        return os.path.normpath(os.path.join(self.cwd(), os.path.expanduser(path)))
+
+    # --- bash and background jobs: announcing first, running a command, jobs that report back when they finish
+    def announce_check(self, command: str, announced: str | None) -> ToolResult | None:
+        """Outward-facing commands are announced first and run after announce_delay unless vetoed.
+        None: go ahead. Otherwise the (not-run) result to give the agent."""
+        if self.glass:                               # break glass: fully autonomous
+            return None
+        label = next((name for name, rx in (self.cfg.get("announce_first") or {}).items()
+                      if re.search(rx, command)), None)
+        if not label:
+            return None
+        key = hashlib.sha256(command.strip().encode()).hexdigest()[:16]
+        pending, delay = self.state.setdefault("announced", {}), float(self.cfg.get("announce_delay") or 0)
+        if key in self.state.get("vetoed", []):
+            return (f"Not run: {self.who} vetoed this ({label}). Don't run it; ask what they'd prefer, or find "
+                    "another way."), True
+        if not announced:
+            return (f"Not run yet: this looks outward-facing ({label}), so announce it first. Post where people will "
+                    f"see it (your work system's chat) what you're about to do and why, then run exactly the same "
+                    f"command again with `announced` set to where you posted. It can run {span_text(delay)} after "
+                    "that, if nobody objects."), True
+        when = pending.get(key, {}).get("at")
+        if when is None:
+            pending[key] = {"at": time.time(), "where": announced, "label": label, "command": command[:200]}
+            self.save_state()
+            self.log("hobkin", f"announced ({label}, in {announced}); can run from "
+                     f"{time.strftime('%H:%M:%S', time.localtime(time.time() + delay))} unless {self.who} sends /veto")
+            return (f"Announced. It can run from {time.strftime('%H:%M:%S', time.localtime(time.time() + delay))}: until "
+                    f"then, check where you posted for objections (a reminder works), then run exactly the same "
+                    "command again with `announced` set."), True
+        if time.time() < when + delay:
+            return f"Not yet: it can run from {time.strftime('%H:%M:%S', time.localtime(when + delay))}.", True
+        del pending[key]
+        self.log("hobkin", f"announced in {announced} and nobody objected: running it")
+        return None
+
+    def run_bash(self, command: str, timeout: int | None = None, reset: bool = False,
+                 background: bool = False, announced: str | None = None) -> ToolResult:
+        """Each command is its own bash process, so a hung or crashed one can't take the shell
+        with it. The shell still behaves like one that persists: the first runs as a login shell,
+        and every command starts from the state the last one left (shell.sh)."""
+        refused = self.hold_check(command) or self.announce_check(command, announced)
+        if refused:
+            self.log("$", f"(not run) {command}")
+            return refused
+        if background:
+            return self.start_job(command)
+        timeout = max(1, int(timeout or self.cfg["bash_timeout"]))   # the agent can ask for any length
+        state_dir = self.p("shell") if self.safe else self.dir      # safe mode: a folder its commands may write
+        state_file, cwd_file = os.path.join(state_dir, "shell.sh"), os.path.join(state_dir, ".cwd")
+        if reset:
+            for f in (state_file, cwd_file):
+                if os.path.exists(f):
+                    os.remove(f)
+            self.state["cwd"] = self.work
+        cwd = self.cwd()
+        self.log("$", ("(fresh shell) " if reset else "") + command)
+        self.interrupt = False
+        env = self.safe_env(self.tool_env())
+        env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
+                                                              "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_SELF", "HOBKIN_NOSAVE",
+                                                              "HOBKIN_SANDBOX", "TMPDIR"])
+        restore = os.path.exists(state_file)
+        script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
+                  + (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if restore else "")
+                  + SHELL_SAVE + command)
+        argv = self.sandboxed(["bash", "-c", script] if restore else ["bash", "--login", "-c", script])
+        with tempfile.TemporaryFile() as outf:
+            proc = subprocess.Popen(argv, cwd=cwd, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=outf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+            start, reason = time.time(), None
+            while proc.poll() is None:
+                self.poll_input(0.5)                 # keep reading the FIFO (commands work mid-run)
+                if self.pending and self.cfg.get("front_desk", True):
+                    self.front_desk()                # answer now; the command keeps running
+                inbox = self.cfg.get("inbox")
+                if inbox and self.cfg.get("front_desk", True) and \
+                        time.time() - self.inbox_checked >= float(inbox.get("every") or 15):
+                    self.check_inbox()
+                if self.stop:
+                    reason = "interrupted: hobkin is stopping"
+                elif self.interrupt:
+                    reason = "interrupted by the operator"
+                elif time.time() - start > timeout:
+                    reason = f"timed out after {timeout}s"
+                if reason:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        proc.wait(5)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    proc.wait()
+                    break
+            size = outf.seek(0, os.SEEK_END)
+            keep = int(self.cfg["output_limit"])
+            outf.seek(0)
+            if size <= keep:
+                out = outf.read().decode(errors="replace")
+            else:
+                head = outf.read(keep // 2).decode(errors="replace")
+                outf.seek(size - keep // 2)
+                tail = outf.read().decode(errors="replace")
+                full = self.p("last-output.log")             # all of it, for the part that was cut
+                outf.seek(0)
+                with open(full, "wb") as f:
+                    shutil.copyfileobj(outf, f)
+                out = (f"{head}\n... [{size - keep} bytes cut: the whole output is in {full} until your next long "
+                       f"command; grep it] ...\n{tail}")
+        new_cwd = read(cwd_file).strip()
+        if new_cwd and os.path.isdir(new_cwd):
+            cwd = new_cwd
+        self.state["cwd"] = cwd
+        status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)}"
+        self.timeline(f"`{clip(command.strip(), 300, 100)}` ({reason or f'exit code {proc.returncode}'})")
+        shown = clip(out, 1000, 800)
+        self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
+        return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
+
+    def start_job(self, command: str) -> ToolResult:
+        """Run a command detached (it outlives hobkin if need be), in the shell's current state, with its
+        output and exit code in jobs/N/. The exit file appearing is how we know it finished."""
+        n = self.state["next_job"] = self.state.get("next_job", 0) + 1
+        jdir = self.p(f"jobs/{n}")
+        os.makedirs(jdir, exist_ok=True)
+        state_file = os.path.join(self.p("shell") if self.safe else self.dir, "shell.sh")
+        script = (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if os.path.exists(state_file) else "") + command
+        env = self.safe_env(self.tool_env())
+        env.update({"HOBKIN_JOB": script, "HOBKIN_JOB_OUT": os.path.join(jdir, "out.log"),
+                    "HOBKIN_JOB_EXIT": os.path.join(jdir, "exit")})
+        proc = subprocess.Popen(self.sandboxed(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"']),
+                                cwd=self.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        self.job_procs[n] = proc            # kept so it's reaped; the exit file is what counts
+        self.state.setdefault("jobs", {})[str(n)] = {"command": command[:500], "started": time.time(), "dir": jdir,
+                                                    "pid": proc.pid}
+        self.save_state()
+        self.log("$", f"(background job #{n}) {command}")
+        return (f"Started background job #{n} (pid {proc.pid}); its output goes to {jdir}/out.log. You'll get a "
+                "message when it finishes: do other work meanwhile, or end your turn."), False
+
+    def finished_jobs(self) -> list[str]:
+        """Messages for background jobs that have finished since we last looked."""
+        out = []
+        for n, job in list((self.state.get("jobs") or {}).items()):
+            exit_file = os.path.join(job["dir"], "exit")
+            if not os.path.exists(exit_file):
+                if not self.job_alive(job):
+                    write_atomic(exit_file, "?\n")      # gone without an exit code (killed, or its folder cleared)
+                else:
+                    continue
+            code = read(exit_file).strip() or "?"
+            ended = os.path.getmtime(exit_file)
+            tail = clip(read(os.path.join(job["dir"], "out.log")), 0, 2000).lstrip("\n")
+            text = (f"[Background job #{n} finished: exit {code} after {span_text(max(0, ended - job['started']))}, "
+                    f"at {when_text(ended)}. "
+                    f"Command: {job['command']}\nLast of its output ({job['dir']}/out.log):]\n{tail.strip() or '(no output)'}")
+            del self.state["jobs"][n]
+            self.job_procs.pop(int(n), None)
+            self.save_state()
+            self.log("job", text)
+            out.append(text)
+        return out
+
+    @staticmethod
+    def job_alive(job: dict) -> bool:
+        """Is a background job's process still there? (A minute's grace, for a job that's just starting.)"""
+        if time.time() - job.get("started", 0) < 60:
+            return True
+        try:
+            os.kill(int(job.get("pid") or 0), 0)
+            return True
+        except (ProcessLookupError, ValueError):
+            return False
+        except PermissionError:
+            return True
+
+    # --- files, skills, images
+    def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
+        full = self.resolve(path)
+        if os.path.isdir(full):
+            entries = sorted(os.listdir(full))
+            shown = [e + ("/" if os.path.isdir(os.path.join(full, e)) else "") for e in entries[:500]]
+            return f"{full} (folder, {len(entries)} entries):\n" + "\n".join(shown), False
+        if not os.path.isfile(full):
+            return f"No such file: {full}", True
+        data = open(full, "rb").read()
+        if b"\0" in data[:8000]:
+            return f"{full} is a binary file ({len(data)} bytes); not shown.", True
+        lines = data.decode(errors="replace").splitlines()
+        start = max(1, int(offset or 1))
+        count = max(1, int(limit or 400))
+        chunk = lines[start - 1:start - 1 + count]
+        body = "\n".join(f"{n:>5}| {l[:2000]}" for n, l in enumerate(chunk, start))
+        end = start + len(chunk) - 1
+        if not lines:
+            return f"{full} is empty.", False
+        more = f" (showing lines {start}-{end} of {len(lines)}; use offset={end + 1} for more)" if end < len(lines) or start > 1 else ""
+        unread = f"\n[hobkin: {len(lines) - end} more lines unread (offset={end + 1}). Read them before saying " \
+            "anything about the rest.]" if end < len(lines) else ""
+        return f"{full}{more}:\n{body}{unread}", False
+
+    def write_file(self, path: str, content: str) -> ToolResult:
+        full = self.resolve(path)
+        if not self.writable(full):
+            return SAFE_REFUSED.format(path=full), True
+        existed = os.path.exists(full)
+        if os.path.isdir(full):
+            return f"{full} is a folder.", True
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+        n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+        note = ""
+        if "\n" not in content and "\\n" in content and len(content) > 80:
+            note = ("\nNote: the file has no line breaks but contains the characters \\n. "
+                    "If you meant new lines, write real line breaks in content.")
+        return f"{'Replaced' if existed else 'Created'} {full} ({n} lines){note}", False
+
+    def edit_file(self, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
+        full = self.resolve(path)
+        if not self.writable(full):
+            return SAFE_REFUSED.format(path=full), True
+        if not os.path.isfile(full):
+            return f"No such file: {full}. Use write_file to create it.", True
+        text = open(full, encoding="utf-8", errors="replace").read()
+        if not old:
+            return "old_text is empty. To write a whole file use write_file.", True
+        note = ""
+        if old not in text:
+            # Common slips: line numbers copied from read_file, or Windows line endings
+            stripped = re.sub(r"(?m)^\s*\d+\| ?", "", old)
+            if stripped != old and stripped in text:
+                old, new, note = stripped, re.sub(r"(?m)^\s*\d+\| ?", "", new), " (line numbers from read_file removed)"
+            elif "\r\n" in text and old.replace("\n", "\r\n") in text:
+                old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+        count = text.count(old)
+        if count == 0:
+            return "old_text isn't in the file (it must match exactly, including spaces and indentation)." \
+                + self.closest(text, old), True
+        if count > 1 and not replace_all:
+            lines = [text.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old), text)]
+            return (f"old_text appears {count} times (lines {', '.join(map(str, lines[:20]))}). Include more of the "
+                    "surrounding lines so it matches once, or set replace_all."), True
+        first = text.index(old)
+        text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(text)
+        # Show the result around the (first) change, so it can be checked
+        lines = text.splitlines()
+        at = text.count("\n", 0, first)
+        lo, hi = max(0, at - 3), min(len(lines), at + new.count("\n") + 4)
+        shown = "\n".join(f"{n:>5}| {l}" for n, l in enumerate(lines[lo:hi], lo + 1))
+        return f"Edited {full}{' (' + str(count) + ' places)' if replace_all and count > 1 else ''}{note}. Now:\n{shown}", False
+
+    @staticmethod
+    def closest(text, old):
+        """Where the file has text most like old_text, to show in an error."""
+        lines, want = text.splitlines(), old.strip("\n").splitlines()
+        if not lines:
+            return " The file is empty: use write_file to give it content."
+        if not want or len(lines) > 20000:
+            return ""
+        n, target, best = len(want), "\n".join(want), (0.0, 0)
+        for i in range(max(1, len(lines) - n + 1)):
+            m = difflib.SequenceMatcher(None, "\n".join(lines[i:i + n]), target)
+            if m.real_quick_ratio() > best[0] and m.quick_ratio() > best[0]:
+                r = m.ratio()
+                if r > best[0]:
+                    best = (r, i)
+        if best[0] < 0.5:
+            return " Nothing similar found: read_file it again and copy the text exactly."
+        i = best[1]
+        shown = "\n".join(f"{k:>5}| {l}" for k, l in enumerate(lines[i:i + n], i + 1))
+        return f" The closest text in the file is lines {i + 1}-{i + n}:\n{shown}"
+
+    def open_skill(self, name: str) -> ToolResult:
+        skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
+        key = name.strip().lower()
+        match = next((n for n in skills if n.lower() == key), None)
+        if not match:
+            return f"No skill named {name!r}. Skills: {', '.join(sorted(skills)) or 'none'}.", True
+        desc, path = skills[match]
+        folder = os.path.dirname(path)
+        files = []
+        for root, dirs, names in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            files += [os.path.relpath(os.path.join(root, f), folder) for f in names if not f.startswith(".")]
+        files = sorted(files)
+        return (f"Skill: {match}\nFolder: {folder}\nFiles: {', '.join(files[:100])}\n"
+                f"Paths in these instructions are relative to that folder: use {folder}/<path>.\n\n{read(path)}"), False
+
+    def view_image(self, path: str) -> ToolResult:
+        full = self.resolve(path)
+        if not os.path.isfile(full):
+            return f"No such file: {full}", True
+        data = open(full, "rb").read()
+        kinds = {b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"GIF8": "image/gif"}
+        media = next((t for magic, t in kinds.items() if data.startswith(magic)), None)
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            media = "image/webp"
+        if not media:
+            return f"{full} isn't a PNG, JPEG, GIF or WebP image.", True
+        if len(data) > 5 * 1024 * 1024:
+            return (f"{full} is {len(data) // 1024} KB; images must be under 5 MB. Make a smaller copy first, e.g. "
+                    f"`convert {full} -resize 1600x1600 small.png` (ImageMagick), and look at that."), True
+        return [{"type": "text", "text": f"{full} ({len(data) // 1024} KB):"},
+                {"type": "image", "source": {"type": "base64", "media_type": media,
+                                             "data": base64.b64encode(data).decode()}}], False
+
+    # --- the goal: CHECKLIST.md, and the plan said out loud before a file change
+    def goal_checklist(self, g: dict) -> str:
+        return (f"# Goal\n\n{g['goal']}\n\n## How it works\n\n{g['how_it_works'] or '-'}\n\n## Why it doesn't\n\n"
+                f"{g['why_it_doesnt'] or '-'}\n\n## What would\n\n{g['what_would']}\n\n## Steps\n\n"
+                + "".join(f"- [{'x' if i + 1 in g['done'] else ' '}] {i + 1}. {t}\n" for i, t in enumerate(g["steps"])))
+
+    def tool_goal(self, inp: dict) -> ToolResult:
+        """Set the task's goal (writes CHECKLIST.md, shows the thinking, opens file changes) or tick steps."""
+        g = self.state.get("goal") or {}
+        if inp.get("done") is not None and not inp.get("goal"):
+            if not g.get("open"):
+                return "No goal is set. Set one first (goal, what_would, steps).", True
+            done = inp["done"] if isinstance(inp["done"], list) else [inp["done"]]
+            bad = [n for n in done if not isinstance(n, int) or not 1 <= n <= len(g["steps"])]
+            if bad:
+                return f"No step {bad[0]}: the steps are 1 to {len(g['steps'])}.", True
+            g["done"] = sorted(set(g["done"]) | set(done))
+            write_atomic(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g))
+            self.step_done = True                      # a good moment to compact, if it's due
+            self.log("goal", "ticked " + ", ".join(f"{n}. {g['steps'][n - 1]}" for n in done))
+            left = [i + 1 for i in range(len(g["steps"])) if i + 1 not in g["done"]]
+            if not left:
+                g["open"] = False
+                self.save_state()
+                return f"All {len(g['steps'])} steps done: the goal is closed. Report what you did.", False
+            self.save_state()
+            return f"Ticked. Next: {left[0]}. {g['steps'][left[0] - 1]}", False
+        missing = [k for k in ("goal", "what_would", "steps") if not inp.get(k)]
+        if missing:
+            return f"A goal needs {', '.join(missing)} (and how_it_works, why_it_doesnt).", True
+        folder = self.cwd()
+        if os.path.realpath(folder) == os.path.realpath(self.work):   # not in a task folder yet: make one
+            slug = re.sub(r"[^a-z0-9]+", "-", str(inp["goal"]).lower()).strip("-")[:40] or "task"
+            folder = os.path.join(self.work, slug)
+            os.makedirs(folder, exist_ok=True)
+        keep = g.get("done", []) if g.get("open") and g.get("folder") == folder else []
+        g = {"goal": str(inp["goal"]), "how_it_works": str(inp.get("how_it_works") or ""),
+             "why_it_doesnt": str(inp.get("why_it_doesnt") or ""), "what_would": str(inp["what_would"]),
+             "steps": [str(t) for t in inp["steps"]], "done": [n for n in keep if n <= len(inp["steps"])],
+             "folder": folder, "open": True, "set": time.time()}
+        self.state["goal"] = g
+        path = os.path.join(folder, "CHECKLIST.md")
+        write_atomic(path, self.goal_checklist(g))
+        self.save_state()
+        self.log("goal", f"Goal: {g['goal']}\nHow it works: {g['how_it_works'] or '-'}\nWhy it doesn't: "
+                         f"{g['why_it_doesnt'] or '-'}\nWhat would: {g['what_would']}\n"
+                 + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(g["steps"])))
+        return (f"Goal set: {path} written ({len(g['steps'])} steps). " +
+                (f"Your task folder is {folder}: work from there. " if folder != self.cwd() else "") +
+                "Now make it do the thing, one step at a time; after each, call goal with {\"done\": [N]}."), False
+
+    def plan_said(self) -> bool:
+        """Has the agent said **What would:** (its plan) out loud in this turn?"""
+        if (self.state.get("goal") or {}).get("open"):
+            return True
+        return self.plan_carried or re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
+
+    # --- reminders: reminders.json in the agent's folder (you can read and edit it); what's come due
+    def warn_once(self, key, text):
+        """Log a problem with a hand-edited file once per version of that file, not on every check."""
+        if getattr(self, "_warned", {}).get(key) != text:
+            self._warned = {**getattr(self, "_warned", {}), key: text}
+            self.log("hobkin", text)
+
+    def load_reminders(self):
+        try:
+            data = json.loads(read(self.p("reminders.json"), "{}") or "{}")
+        except json.JSONDecodeError as e:
+            self.warn_once("reminders", f"reminders.json isn't valid JSON ({e}); ignoring it until it's fixed")
+            return {"next_id": 1, "items": []}, False
+        items = []
+        for r in data.get("items", []):
+            try:
+                r["_due"] = datetime.strptime(r["due"], TIME_FMT).timestamp()
+                r["_every"] = parse_duration(r["every"]) if r.get("every") else None
+                items.append(r)
+            except (KeyError, ValueError) as e:
+                self.warn_once(f"reminder {r}", f"skipping a reminder in reminders.json I can't read ({e}): {r}")
+        return {"next_id": data.get("next_id", 1 + max([r.get("id", 0) for r in items] or [0])), "items": items}, True
+
+    def save_reminders(self, data):
+        items = sorted(({k: v for k, v in r.items() if not k.startswith("_")} for r in data["items"]), key=lambda r: r["due"])
+        write_json(self.p("reminders.json"), {"next_id": data["next_id"], "items": items})
+
+    def reminder_lines(self, items):
+        now_t = time.time()
+        return [f"#{r['id']}: {when_text(r['_due'])} (in {span_text(max(0, r['_due'] - now_t))})"
+                + (f", repeats every {r['every']}" if r.get("every") else "") + f": {r['message']}"
+                for r in sorted(items, key=lambda r: r["_due"])]
+
+    def tool_remind(self, inp: dict) -> ToolResult:
+        message = str(inp.get("message") or "").strip()
+        if not message:
+            return "A reminder needs a message: what to check or do when it fires.", True
+        now_t = time.time()
+        data, ok = self.load_reminders()
+        if not ok:
+            return "reminders.json is broken; ask the operator to fix it.", True
+        try:
+            every = parse_duration(inp["every"]) if inp.get("every") else None
+            if every is not None and every <= 0:
+                return "`every` has to be longer than zero.", True
+            if inp.get("in") and inp.get("at"):
+                return "Give either `in` or `at`, not both.", True
+            if inp.get("in"):
+                due = now_t + parse_duration(inp["in"])
+            elif inp.get("at"):
+                due = parse_at(inp["at"], now_t)
+            elif every:
+                due = now_t + every
+            else:
+                return "Say when: `in` (e.g. \"20m\") or `at` (e.g. \"tomorrow 09:00\"), and/or `every`.", True
+        except ValueError as e:
+            return f"{e}. It's now {when_text(now_t)}.", True
+        if due < now_t - 1:
+            return f"That's in the past: it's now {when_text(now_t)}.", True
+        rid = data["next_id"]
+        data["next_id"] += 1
+        data["items"].append({"id": rid, "message": message, "due": time.strftime(TIME_FMT, time.localtime(due)),
+                              "every": inp.get("every") or None, "set": time.strftime(TIME_FMT, time.localtime(now_t)),
+                              "_due": due})
+        self.save_reminders(data)
+        hint = ""
+        if every and not inp.get("in") and not inp.get("at"):
+            hint = (f" It repeats every {inp['every']} until you cancel it. If you meant once, cancel this one "
+                    f"(reminders, cancel: {rid}) and use \"in\": \"{inp['every']}\" instead. Otherwise, enjoy the doorbell!")
+        return (f"Reminder #{rid} set for {when_text(due)} (in {span_text(max(0, due - now_t))})"
+                + (f", then every {inp['every']}" if every else "") + f". It's now {when_text(now_t)}.{hint}"), False
+
+    def tool_reminders(self, inp: dict) -> ToolResult:
+        data, ok = self.load_reminders()
+        note = ""
+        if inp.get("cancel") is not None:
+            rid = int(inp["cancel"])
+            kept = [r for r in data["items"] if r["id"] != rid]
+            if len(kept) == len(data["items"]):
+                return f"There's no reminder #{rid}.\n" + ("\n".join(self.reminder_lines(data["items"])) or "You have no reminders."), True
+            data["items"] = kept
+            self.save_reminders(data)
+            note = f"Cancelled reminder #{rid}.\n"
+        lines = self.reminder_lines(data["items"])
+        return note + (("Your reminders:\n" + "\n".join(lines)) if lines else "You have no reminders.") \
+            + f"\nIt's now {when_text(time.time())}.", False
+
+    def take_due_reminders(self) -> list[str]:
+        """Messages for reminders that are due; repeating ones move to their next time."""
+        if not os.path.exists(self.p("reminders.json")):
+            return []
+        now_t = time.time()
+        data, ok = self.load_reminders()
+        due = [r for r in data["items"] if r["_due"] <= now_t] if ok else []
+        if not due:
+            return []
+        out = []
+        for r in due:
+            late = now_t - r["_due"]
+            text = f"[Reminder #{r['id']}, set {r.get('set', '?')[:16]} for {when_text(r['_due'])}"
+            text += f"; {span_text(late)} late (hobkin wasn't running then)" if late > 90 else ""
+            if r["_every"]:
+                missed, nxt = 0, r["_due"]
+                while nxt <= now_t:
+                    nxt += r["_every"]
+                    missed += 1
+                r["_due"], r["due"] = nxt, time.strftime(TIME_FMT, time.localtime(nxt))
+                text += (f"; {missed - 1} earlier times were missed" if missed > 1 else "") + f"; repeats, next {when_text(nxt)}"
+            else:
+                data["items"].remove(r)
+            text += f". It's now {when_text(now_t)}.]\n{r['message']}"
+            out.append(text)
+        self.save_reminders(data)          # the file first, then say so
+        for text in out:
+            self.log("reminder", text)
+        return out
+
+    def next_reminder_in(self):
+        if not os.path.exists(self.p("reminders.json")):
+            return None
+        data, ok = self.load_reminders()
+        return max(0.0, min(r["_due"] for r in data["items"]) - time.time()) if ok and data["items"] else None
+
+    def due_events(self) -> list[str]:
+        """What's come due on its own: reminders, finished background jobs, and a hello when someone's
+        just opened a chat."""
+        greet = []
+        if self.greet_wanted:
+            self.greet_wanted = False
+            greet = [GREET.format(who=self.who, stamp=self.stamp(), name=self.id)]
+        return greet + self.take_due_reminders() + self.finished_jobs()
+
+    def scheduled(self) -> bool:
+        """True when the agent has set up its own next wake-up: a reminder, or a job still running.
+        Then it's managing itself, and the hot-take, wrap-up and idle nudges stay quiet."""
+        return bool(self.state.get("jobs")) or self.next_reminder_in() is not None
+
+    # --- nudges: where the [hobkin: ...] hints (texts and detectors: the "nudges" section) get attached
+    # Small models skim long instructions but follow a hint at the moment it applies.
+    def from_operator(self, text: str, busy: bool = False) -> str:
+        """A message from the operator as the model sees it: who sent it, and the hot-take hint, unless
+        the agent is busy (mid-task) or managing itself (a reminder or job of its own coming)."""
+        self.owe_reply, self.reply_nudged = True, False
+        if busy:
+            return (f"[message from {self.who}, {self.stamp()}, while you were working: answer it in your next "
+                    f"reply, then carry on]\n{text}")
+        hint = "" if self.scheduled() else f"\n{HOT_TAKE if self.has_work_system() else HOT_TAKE_CHAT}"
+        return f"[message from {self.who}, {self.stamp()}: they're talking with you now. Answer them in your reply]\n{text}{hint}"
+
+    def has_work_system(self) -> bool:
+        """Any skills at all: somewhere work comes from besides the people talking to it here."""
+        return bool(find_skills(self.dir, self.cfg.get("skill_dirs") or []))
 
     def stamp(self) -> str:
         """The time now, for anything that wakes the agent, plus how long it's been when that's a while."""
@@ -3185,68 +3255,7 @@ class Agent:
             return f"No results for {query!r}.", False
         return "\n".join(f"{i}. {t}\n   {u}\n   {sn}" for i, (t, u, sn) in enumerate(hits, 1)), False
 
-    def view_image(self, path: str) -> ToolResult:
-        full = self.resolve(path)
-        if not os.path.isfile(full):
-            return f"No such file: {full}", True
-        data = open(full, "rb").read()
-        kinds = {b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"GIF8": "image/gif"}
-        media = next((t for magic, t in kinds.items() if data.startswith(magic)), None)
-        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            media = "image/webp"
-        if not media:
-            return f"{full} isn't a PNG, JPEG, GIF or WebP image.", True
-        if len(data) > 5 * 1024 * 1024:
-            return (f"{full} is {len(data) // 1024} KB; images must be under 5 MB. Make a smaller copy first, e.g. "
-                    f"`convert {full} -resize 1600x1600 small.png` (ImageMagick), and look at that."), True
-        return [{"type": "text", "text": f"{full} ({len(data) // 1024} KB):"},
-                {"type": "image", "source": {"type": "base64", "media_type": media,
-                                             "data": base64.b64encode(data).decode()}}], False
-
-    def run_tool(self, name: str, inp: dict) -> ToolResult:
-        """(result text, is_error) for one tool call. Each tool is one line here; bash logs its
-        own command and output, the rest log the first line of their result."""
-        s = lambda key: str(inp[key])            # a required argument (KeyError if missing)
-        if name in ("write_file", "edit_file") and not self.plan_said() and not self.plan_checked \
-                and os.path.basename(str(inp.get("path", ""))).lower() not in PLANNING_FILES \
-                and not str(inp.get("path", "")).startswith(("$HOBKIN_MEMORY", "$HOBKIN_BLOOPERS")):
-            self.plan_checked = True               # once per turn: a second try goes through
-            self.log(name, f"(not run: no plan said yet) {inp.get('path', '')}")
-            said = [label for pattern, label in ((r"\bhow it works", "How it works"), (r"\bwhy it doesn", "Why it doesn't"))
-                    if re.search(pattern, self.turn_said, re.I)]
-            missing = f" You've said {' and '.join(said)}; what's missing is **What would:**." if said else ""
-            return PLAN_FIRST.format(missing=missing), True
-        tools = {
-            "bash": lambda: self.run_bash(str(inp.get("command", "")), inp.get("timeout"), bool(inp.get("reset")),
-                                          bool(inp.get("background")), inp.get("announced")),
-            "read_file": lambda: self.read_file(s("path"), inp.get("offset"), inp.get("limit")),
-            "write_file": lambda: self.write_file(s("path"), s("content")),
-            "edit_file": lambda: self.edit_file(s("path"), s("old_text"), s("new_text"), bool(inp.get("replace_all"))),
-            "remind": lambda: self.tool_remind(inp),
-            "reminders": lambda: self.tool_reminders(inp),
-            "skill": lambda: self.open_skill(s("name")),
-            "goal": lambda: self.tool_goal(inp),
-            "view_image": lambda: self.view_image(s("path")),
-            "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
-            "web_search": lambda: self.web_search(s("query")),
-            **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
-        }
-        if name not in tools:
-            runs = self.own_tools()[1]
-            if name in runs:
-                return self.run_own_tool(runs[name], inp)
-            return f"Unknown tool {name!r}. Tools: {', '.join(list(tools) + list(runs))}.", True
-        try:
-            result = tools[name]()
-        except KeyError as e:
-            result = (f"Missing argument {e} for {name}.", True)
-        except (OSError, ValueError, TypeError) as e:
-            result = (f"{name} failed: {e}", True)
-        if name != "bash":
-            self.log(name, (result_text(result[0]).splitlines() or [""])[0])
-        return result
-
-    # --- the model: one call (with rate limits and retries)
+    # --- the model: one call (with rate limits and retries), cost and budgets
     def ask(self, messages: list[dict], tool_choice: str | None = None) -> tuple[list[dict], str | None]:
         """Call the model, retrying transient failures. Raises ApiError for real ones."""
         delay, limited = 2, 15          # backoff for errors, and for 429s with no reset hint
@@ -3305,6 +3314,40 @@ class Agent:
             raise ApiError(0, "stopping")
         self.save_state("working")
 
+    def count_cost(self) -> None:
+        """Add the last call's cost (where the API reports it) to today's and all-time spend."""
+        if self.model.last_cost:
+            cost, today = float(self.model.last_cost), time.strftime("%Y-%m-%d")
+            self.state["spend_usd"] = round(self.state.get("spend_usd", 0) + cost, 6)
+            if self.state.get("spend_day") != today:
+                self.state.update({"spend_day": today, "spend_today": 0.0})
+            self.state["spend_today"] = round(self.state["spend_today"] + cost, 6)
+            if self.glass:                             # the incident's own spend: its budget, not the day's
+                if self.state.get("glass_spend_day") != today:
+                    self.state.update({"glass_spend_day": today, "glass_spend": 0.0})
+                self.state["glass_spend"] = round(self.state["glass_spend"] + cost, 6)
+            self.model.last_cost = None
+
+    def over_budget(self) -> bool:
+        budget, spent = self.budget_now()
+        return bool(budget) and spent >= float(budget)
+
+    def budget_now(self) -> tuple:
+        """(the budget that applies now, what's been spent against it today). An incident counts against its own
+        budget (--budget); outside one, the day's budget counts only what wasn't spent on an incident, so a
+        costly incident doesn't pause the agent after it."""
+        today = time.strftime("%Y-%m-%d")
+        if self.state.get("spend_day") != today:
+            return None, 0.0
+        incident = self.state.get("glass_spend", 0) if self.state.get("glass_spend_day") == today else 0
+        if self.glass:
+            budget = self.glass["budget"] if "budget" in self.glass else self.cfg.get("daily_budget_usd")
+            spent = incident if "budget" in self.glass else self.state.get("spend_today", 0)
+        else:
+            budget, spent = self.cfg.get("daily_budget_usd"), self.state.get("spend_today", 0) - incident
+        return budget, spent
+
+    # --- compaction: the conversation, summarised into a handoff note when it gets too big
     def window(self) -> int | None:
         """The context the agent works within: the model's window, capped at context_budget."""
         ctx = self.state.get("context_tokens")
@@ -3341,7 +3384,6 @@ class Agent:
             return False
         return True
 
-    # --- compaction: the conversation, summarised into a handoff note when it gets too big
     @staticmethod
     def shrink_history(history: list, attempt: int) -> list:
         """A history too long even to summarise, made shorter: always clip old command output; from the
@@ -3462,25 +3504,20 @@ class Agent:
             if jdir not in running and os.path.exists(exit_file) and os.path.getmtime(exit_file) < cutoff:
                 shutil.rmtree(jdir, ignore_errors=True)
 
-    # --- the loop: one step at a time; the heartbeat; run()
-    def over_budget(self) -> bool:
-        budget, spent = self.budget_now()
-        return bool(budget) and spent >= float(budget)
-
-    def budget_now(self) -> tuple:
-        """(the budget that applies now, what's been spent against it today). An incident counts against its own
-        budget (--budget); outside one, the day's budget counts only what wasn't spent on an incident, so a
-        costly incident doesn't pause the agent after it."""
-        today = time.strftime("%Y-%m-%d")
-        if self.state.get("spend_day") != today:
-            return None, 0.0
-        incident = self.state.get("glass_spend", 0) if self.state.get("glass_spend_day") == today else 0
-        if self.glass:
-            budget = self.glass["budget"] if "budget" in self.glass else self.cfg.get("daily_budget_usd")
-            spent = incident if "budget" in self.glass else self.state.get("spend_today", 0)
+    # --- the loop: a new turn, one step at a time; alerts; the heartbeat; run()
+    def add_user(self, text: str, record: bool = True) -> None:
+        if record:                         # people's messages and hobkin's notices, in an incident's timeline
+            self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
+        self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
+        self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
+        self.plan_carried = False
+        block = {"type": "text", "text": text}
+        if self.messages and self.messages[-1]["role"] == "user":
+            self.messages[-1]["content"].append(block)
         else:
-            budget, spent = self.cfg.get("daily_budget_usd"), self.state.get("spend_today", 0) - incident
-        return budget, spent
+            self.messages.append({"role": "user", "content": [block]})
+        self.working = True
+        self.save_context()
 
     def step(self) -> None:
         """One model call, then run any commands it asked for."""
@@ -3751,26 +3788,6 @@ class Agent:
                 self.state["pid"] = None
                 self.save_state("stopped")
                 self.log("hobkin", "stopped")
-
-    def plan_said(self) -> bool:
-        """Has the agent said **What would:** (its plan) out loud in this turn?"""
-        if (self.state.get("goal") or {}).get("open"):
-            return True
-        return self.plan_carried or re.search(r"\b(what would|plan)\b\**\s*:", self.turn_said, re.I) is not None
-
-    def add_user(self, text: str, record: bool = True) -> None:
-        if record:                         # people's messages and hobkin's notices, in an incident's timeline
-            self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
-        self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
-        self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
-        self.plan_carried = False
-        block = {"type": "text", "text": text}
-        if self.messages and self.messages[-1]["role"] == "user":
-            self.messages[-1]["content"].append(block)
-        else:
-            self.messages.append({"role": "user", "content": [block]})
-        self.working = True
-        self.save_context()
 
 
 # ---- service: systemd user services
@@ -4048,7 +4065,7 @@ def cmd_chat(agent_id, full=False):
             if eof:
                 # Piped: leave once the agent has gone idle again after our message
                 time.sleep(0.5)
-                st = json.loads(read(state_path, "{}") or "{}")
+                st = read_json(state_path, {})
                 if (time.time() - sent_at > 2 and st.get("status") in ("idle", "paused", "error", "stopped")) \
                         or not is_running(d):
                     for line in new_lines():
@@ -4116,14 +4133,11 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
 def cmd_list():
     if not os.path.isdir(HOME):
         return print("no agents yet")
-    names = [n for n in sorted(os.listdir(HOME)) if not n.startswith("_") and os.path.isdir(os.path.join(HOME, n))]
+    names = agent_ids()
     services = service_states(names)
     for name in names:
         d = os.path.join(HOME, name)
-        try:
-            st = json.loads(read(os.path.join(d, "state.json"), "{}"))
-        except json.JSONDecodeError:
-            st = {}
+        st = read_json(os.path.join(d, "state.json"), {})
         status = (st.get("status") or "?") if is_running(d) else "stopped"
         last = [l for l in read(os.path.join(d, "out")).splitlines() if l and not l.startswith("    ")][-1:]
         print(f"{name:10} {status:8} {services.get(name, ''):18} {st.get('model', '')[:40]:40} {last[0][:60] if last else ''}")
@@ -4153,13 +4167,9 @@ def risky(command: str) -> list[str]:
 def watch_agents(ids: list[str], incident: str | None) -> tuple[list[str], set[str]]:
     """Who the watch screen shows: the agents named, everyone on their incidents (or on --incident), and with
     no one named, every agent in break-glass mode (else every agent). Also the incidents involved."""
-    names = [n for n in sorted(os.listdir(HOME)) if not n.startswith("_") and os.path.isdir(os.path.join(HOME, n))] \
-        if os.path.isdir(HOME) else []
+    names = agent_ids()
     def glass(n):
-        try:
-            g = json.loads(read(os.path.join(HOME, n, "config.json")) or "{}").get("break_glass") or {}
-        except json.JSONDecodeError:
-            return {}
+        g = read_json(os.path.join(HOME, n, "config.json"), {}).get("break_glass") or {}
         return g if float(g.get("until") or 0) > time.time() else {}
     chosen = list(ids) or ([] if incident else [n for n in names if glass(n)] or names)
     incidents = ({incident} if incident else set()) | {glass(n).get("incident") for n in chosen} - {None}
@@ -4177,9 +4187,10 @@ def watch_screen(ids: list[str], incident: str | None, width: int, height: int, 
     def paint_(text, *codes):
         return f"\x1b[{';'.join(map(str, codes))}m{text}\x1b[0m" if color and codes else text
     hue = {a: WATCH_COLORS[i % len(WATCH_COLORS)] for i, a in enumerate(agents)}
-    tag = lambda a: paint_(f"{a:<{min(12, max(map(len, agents or ['']))) }}", 1, 38, 5, hue[a])
-    def fit(line, plain_len):                           # clip to the width, counting only what shows (colours kept)
-        if plain_len <= width:
+    wide = min(12, max(map(len, agents), default=0))
+    tag = lambda a: paint_(f"{a:<{wide}}", 1, 38, 5, hue[a])
+    def fit(line):                                      # clip to the width, counting only what shows (colours kept)
+        if len(re.sub(r"\x1b\[[0-9;]*m", "", line)) <= width:
             return line
         out, shown = [], 0
         for part in re.split(r"(\x1b\[[0-9;]*m)", line):
@@ -4195,18 +4206,13 @@ def watch_screen(ids: list[str], incident: str | None, width: int, height: int, 
     lines, feed = [], []
     title = "hobkin watch" + (f" · incident {', '.join(sorted(incidents))}" if incidents else "") + \
         f" · {time.strftime('%H:%M:%S')}"
-    lines.append(fit(paint_(f" {title} ".ljust(width), 1, 38, 5, 16, 48, 5, 214), width))
+    lines.append(paint_(f" {title} ".ljust(width), 1, 38, 5, 16, 48, 5, 214))
     totals = {"commands": 0, "file changes": 0, "outside the workspace": 0, "flagged": 0, "stopped by a hold": 0,
               "holds overridden": 0}
     for a in agents:
         d = os.path.join(HOME, a)
-        try:
-            shared = json.loads(read(os.path.join(SHARED, "config.json")) or "{}")
-            own = json.loads(read(os.path.join(d, "config.json")) or "{}")
-            st = json.loads(read(os.path.join(d, "state.json")) or "{}")
-        except json.JSONDecodeError:
-            shared, own, st = {}, {}, {}
-        cfg = {**shared, **own}
+        cfg = {**read_json(os.path.join(SHARED, "config.json"), {}), **read_json(os.path.join(d, "config.json"), {})}
+        st = read_json(os.path.join(d, "state.json"), {})
         g = cfg.get("break_glass") or {}
         g = g if float(g.get("until") or 0) > now else {}
         running = is_running(d)
@@ -4227,14 +4233,12 @@ def watch_screen(ids: list[str], incident: str | None, width: int, height: int, 
                      f"ends in {left // 3600}:{left // 60 % 60:02}:{left % 60:02}",
                      f"${st.get('glass_spend', 0) if st.get('glass_spend_day') == time.strftime('%Y-%m-%d') else 0:.2f}"
                      + (f" of ${g['budget']}" if g.get("budget") else "")]
-            plain = f" {a}  {' SALVAGE ' if g.get('salvage') else ' BREAK GLASS '} " + " · ".join(flags)
-            lines.append(fit(f" {tag(a)} {badge} " + paint_(" · ".join(flags), 1, 91), len(plain)))
+            lines.append(f" {tag(a)} {badge} " + paint_(" · ".join(flags), 1, 91))
             sub = f"   {g['reason']}  ·  {doing}"
         else:
-            plain = f" {a}  normal · safe mode {'on' if cfg.get('safe_mode') else 'off'} · as {user}"
-            lines.append(fit(f" {tag(a)} " + paint_(plain[len(a) + 3:], 2), len(plain)))
+            lines.append(f" {tag(a)} " + paint_(f"normal · safe mode {'on' if cfg.get('safe_mode') else 'off'} · as {user}", 2))
             sub = f"   {doing}"
-        lines.append(fit(paint_(sub, 2), len(sub)))
+        lines.append(paint_(sub, 2))
         log = glass_log_path(d, g) if g else None
         if log and os.path.exists(log):
             for l in read(log).splitlines():
@@ -4247,9 +4251,7 @@ def watch_screen(ids: list[str], incident: str | None, width: int, height: int, 
     holds = [h for name in sorted(incidents) for h in edit_holds(name, None)]
     if holds:
         lines.append(paint_(" holds", 1, 93))
-        for h in holds:
-            t = f"   #{h['n']} {h['by']}: {h['what']}  /{h['match']}/"
-            lines.append(fit(paint_(t, 93), len(t)))
+        lines += [paint_(f"   #{h['n']} {h['by']}: {h['what']}  /{h['match']}/", 93) for h in holds]
     lines.append(paint_("─" * width, 2))
     shown = []
     for t, a, text in sorted(feed, key=lambda x: x[0]):
@@ -4275,14 +4277,13 @@ def watch_screen(ids: list[str], incident: str | None, width: int, height: int, 
             style = (93,)
         elif text.startswith(("told", "said:")):
             style = (2,) if text.startswith("told") else ()
-        plain = f" {t} {a:<{min(12, max(map(len, agents)))}} {text}{note}"
-        shown.append(fit(f" {paint_(t, 2)} {tag(a)} {paint_(text + note, *style)}", len(plain)))
+        shown.append(f" {paint_(t, 2)} {tag(a)} {paint_(text + note, *style)}")
     totals_line = " " + " · ".join(f"{v} {k}" for k, v in totals.items())
     controls = [f" end it: hobkin breakglass {agents[0] if len(agents) == 1 else 'ID'} --off   stop now: hobkin send "
                 f"{agents[0] if len(agents) == 1 else 'ID'} /stop   Ctrl-C leaves this screen"] if agents else []
     room = max(3, height - len(lines) - 3 - len(controls))
-    return "\n".join(lines + shown[-room:] + [paint_("─" * width, 2), fit(paint_(totals_line, 1), len(totals_line))]
-                     + [fit(paint_(c, 2), len(c)) for c in controls]) + "\n"
+    return "\n".join(map(fit, lines + shown[-room:] + [paint_("─" * width, 2), paint_(totals_line, 1)]
+                         + [paint_(c, 2) for c in controls])) + "\n"
 
 
 def cmd_watch(argv):
@@ -4404,10 +4405,7 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
         f.write("\n".join(kept + [f"{k}={v}" for k, v in env.items()]) + "\n")
     os.chmod(path, 0o600)
     cfg_path = os.path.join(d, "config.json")
-    try:
-        cfg = json.loads(read(cfg_path) or "{}")
-    except json.JSONDecodeError:
-        cfg = {}
+    cfg = read_json(cfg_path, {}, exit_if_broken=True)
     cfg.update({"idle_prompt": None,
                 # hobkin waits on the board while the agent's idle, and wakes it with what the board says
                 "wake": {"url": f"{url}/api/wait?timeout=50", "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"},
@@ -4415,7 +4413,7 @@ def join_hearthboard(d: str, url: str, token: str) -> None:
                 # The board's chat, for the front desk: answered while the agent's busy running a command
                 "inbox": {"url": f"{url}/api/chat/inbox?flat=1", "reply": f"{url}/api/chat/{{thread}}/messages",
                           "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"}, "every": 15}})
-    write_atomic(cfg_path, json.dumps(cfg, indent=2) + "\n")
+    write_json(cfg_path, cfg)
 
 
 def cmd_setup(argv):
@@ -4498,13 +4496,10 @@ def configure_model(pos, opts, agent_id):
         os.chmod(key_path, 0o600)
         entry["key_file"] = key_path
     target = path if fresh else os.path.join(d, "config.json")
-    try:
-        data = json.loads(read(target) or "{}")
-    except json.JSONDecodeError as e:
-        sys.exit(f"hobkin: {target}: {e}")
+    data = read_json(target, {}, exit_if_broken=True)
     data.setdefault("models", {})[m.name] = entry
     data["model"] = m.name
-    write_atomic(target, json.dumps(data, indent=2) + "\n")
+    write_json(target, data)
     print(f"model {m.name!r}: {model_id} via {m.base}, "
           + ("the default for every agent here" if fresh else f"for {agent_id} only (your other agents and settings are unchanged)")
           + f"\n  in {target}" + (f"; key in {entry['key_file']}" if key else ""))
@@ -4551,9 +4546,9 @@ def prepare_agent(agent_id, opts, board=None, board_user=None):
     os.makedirs(d, exist_ok=True)
     if opts.get("--safe"):                  # in the agent's own config, which safe mode won't let it change
         path = os.path.join(d, "config.json")
-        cfg = json.loads(read(path) or "{}")
+        cfg = read_json(path, {}, exit_if_broken=True)
         cfg["safe_mode"] = True
-        write_atomic(path, json.dumps(cfg, indent=2) + "\n")
+        write_json(path, cfg)
     if board:
         join_hearthboard(d, *board)
         print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (the board's skill is in "
@@ -4640,7 +4635,7 @@ def cmd_pack(argv):
     left = ["secrets.env and API keys", "shell state"]
 
     def clean_cfg(path):
-        cfg = json.loads(read(path) or "{}")
+        cfg = read_json(path, {}, exit_if_broken=True)
         cfg.pop("break_glass", None)
         for m in (cfg.get("models") or {}).values():
             if isinstance(m, dict):
@@ -4676,7 +4671,7 @@ def cmd_pack(argv):
                      json.dumps(clean_cfg(os.path.join(SHARED, "config.json")), indent=2) + "\n")
         add_tree(tar, d, f"{name}/home/{aid}", ("config.json", "state.json", "queue"))
         add_text(tar, f"{name}/home/{aid}/config.json", json.dumps(clean_cfg(os.path.join(d, "config.json")), indent=2) + "\n")
-        state = json.loads(read(os.path.join(d, "state.json")) or "{}")
+        state = read_json(os.path.join(d, "state.json"), {})
         for k in ("break_glass", "glass_seen", "glass_log", "pid", "status"):
             state.pop(k, None)
         add_text(tar, f"{name}/home/{aid}/state.json", json.dumps(state, indent=2) + "\n")
@@ -4703,9 +4698,9 @@ def cmd_breakglass(argv):
         if not os.path.isdir(os.path.join(HOME, t)):
             sys.exit(f"hobkin: no agent {t}")
     path = lambda t: os.path.join(HOME, t, "config.json")
-    config = lambda t: json.loads(read(path(t)) or "{}")
+    config = lambda t: read_json(path(t), {}, exit_if_broken=True)
     def save(t, cfg):
-        write_atomic(path(t), json.dumps(cfg, indent=2) + "\n")
+        write_json(path(t), cfg)
         if is_running(os.path.join(HOME, t)):
             restart_running(t)          # picks it up (conversation kept)
         else:

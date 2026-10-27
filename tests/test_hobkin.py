@@ -998,6 +998,13 @@ try:
         time.sleep(0.2)
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # a command that rewrites an agent's config.json stops on a broken one, and leaves it as it was
+    os.makedirs(h + "/broken"); open(h + "/broken/config.json", "w").write('{"safe_mode": true,')
+    r = subprocess.run([sys.executable, HOB, "breakglass", "broken", "db down"], env=genv, capture_output=True, text=True, timeout=30)
+    check("[config] a broken config.json stops breakglass with a clear message, untouched",
+          r.returncode != 0 and "isn't valid JSON" in r.stderr and "Traceback" not in r.stderr
+          and open(h + "/broken/config.json").read() == '{"safe_mode": true,', r.stderr)
+
     # break glass has its own budget: an incident's spending doesn't pause the agent afterwards
     h = home("glassbudget", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake-costly", "key_env": "TESTKEY"},
              {"daily_budget_usd": 1.0, "idle_prompt": None})
