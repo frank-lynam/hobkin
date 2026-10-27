@@ -691,9 +691,11 @@ PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: 
 PLANNING_FILES = {"checklist.md", "notes.md", "memory.md", "bloopers.md"}
 
 # What the agent gets when someone opens `hobkin chat` in a terminal
-GREET = ("[from hobkin: {who} just opened a chat with you, {stamp}. Say hello: introduce yourself by name "
+GREET = ("[from hobkin: {who} just opened a chat with you, {stamp}{where}. Say hello: introduce yourself by name "
          "(you're {name}) and say in a line what you're up to. Then wait for them; if you were in the middle "
          "of something, carry on with it.]")
+GREET_WHERE = (", from {cwd} (their terminal's folder: when they say \"here\" or \"this folder\", that's where they "
+               "mean; it isn't your workspace)")
 
 SAFE_REFUSED = ("Not written: safe mode lets you write only in your workspace ($HOBKIN_WORK) and your memory "
                 "files, not {path}. If that file needs changing, write a script in $HOBKIN_WORK/for-review/ that "
@@ -1703,6 +1705,7 @@ class Agent:
         self.plan_checked = False
         self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
+        self.operator_cwd = None           # ...from this folder (their terminal's, not the agent's)
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.glass = None                  # break-glass mode, while it's on: the config entry
         self.held = set()                  # teammates' holds this agent's been stopped by once (hold_check)
@@ -2260,7 +2263,10 @@ class Agent:
             cmd = line.strip().split(" ", 1)[0].lower()
             if cmd in COMMANDS and line.strip().lower() == cmd:
                 self.command(cmd)
-            elif cmd == "/model":                      # the one command with an argument: /model NAME
+            elif cmd == "/hello":                      # `hobkin chat` opening, with the folder it was opened in
+                self.operator_cwd = line.strip().split(" ", 1)[1].strip() if " " in line.strip() else None
+                self.command(cmd)
+            elif cmd == "/model":                      # the other command with an argument: /model NAME
                 self.model_wanted = line.strip().split(" ", 1)[1].strip()   # switched between steps
                 self.log("hobkin", f"command /model {self.model_wanted}")
             else:
@@ -3058,7 +3064,8 @@ class Agent:
         greet = []
         if self.greet_wanted:
             self.greet_wanted = False
-            greet = [GREET.format(who=self.who, stamp=self.stamp(), name=self.id)]
+            where = GREET_WHERE.format(cwd=self.operator_cwd) if self.operator_cwd else ""
+            greet = [GREET.format(who=self.who, stamp=self.stamp(), name=self.id, where=where)]
         return greet + self.take_due_reminders() + self.finished_jobs()
 
     def scheduled(self) -> bool:
@@ -3970,8 +3977,8 @@ def paint(text: str) -> str:
     return "".join(out)
 
 
-def paint_header(line: str, who: str, text: str, own: str) -> str:
-    """A log entry's first line ("HH:MM:SS who> text"), coloured by who it's from."""
+def paint_header(line: str, who: str, text: str, own: str, name: str | None = None) -> str:
+    """A log entry's first line ("HH:MM:SS who> text"), coloured by who it's from (the agent's shown as `name`)."""
     a, clock = ANSI, line[:8]
     if who == "=":
         failed = not text.startswith("(exit code 0;")
@@ -3980,14 +3987,14 @@ def paint_header(line: str, who: str, text: str, own: str) -> str:
         return f'{a["dim"]}{clock} {who}> {text}{a["off"]}'
     label = (a["magenta"] + a["bold"]) if who == "agent" else a["yellow"] if who == "hobkin" else (a["blue"] + a["bold"])
     body = paint(text) if who != "hobkin" else a["dim"] + text + a["off"]
-    return f'{a["dim"]}{clock}{a["off"]} {label}{who}>{a["off"]} {body}'
+    return f'{a["dim"]}{clock}{a["off"]} {label}{name if who == "agent" and name else who}>{a["off"]} {body}'
 
 
-def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False) -> list[str]:
-    """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's
-    and hobkin's in full, and each tool call as one line, its output hidden (a failed command's
-    status stays). `full` shows everything; `color` adds terminal colours. `st` carries the
-    current entry between calls."""
+def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False, name: str | None = None) -> list[str]:
+    """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's (under its
+    `name`, so you know which hobkin it is) and hobkin's in full, and each tool call as one line, its output
+    hidden (a failed command's status stays). `full` shows everything; `color` adds terminal colours. `st`
+    carries the current entry between calls."""
     shown = []
     for line in lines:
         if not line.startswith("    "):
@@ -4007,7 +4014,9 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = Fa
                 line = line[:109] + "…"
             if color:
                 who_, _, text_ = line[9:].partition("> ")
-                line = paint_header(line, who_, text_, own)
+                line = paint_header(line, who_, text_, own, name)
+            elif who == "agent" and name:
+                line = line[:9] + name + line[14:]
             shown.append(line)
         elif not st.get("mine") and st.get("keep") == "all":
             if color:
@@ -4033,7 +4042,7 @@ def cmd_chat(agent_id, full=False):
         raw = f.read().decode(errors="replace").splitlines()
         pos = f.tell()
     color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-    recent = chat_view(raw[-400:], "\0", full, {}, color)[-12:]     # the recent past, your own lines included
+    recent = chat_view(raw[-400:], "\0", full, {}, color, agent_id)[-12:]     # the recent past, your own lines included
     st = {}
     short = lambda line: line                                  # chat_view has already shaped the lines
 
@@ -4046,7 +4055,7 @@ def cmd_chat(agent_id, full=False):
             chunk = f.read()
         cut = chunk.rfind(b"\n") + 1   # whole lines only
         pos += cut
-        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st, color)
+        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st, color, agent_id)
 
     if sys.stdin.isatty():
         return chat_terminal(agent_id, d, fifo, recent, new_lines, short)
@@ -4095,7 +4104,7 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
     print("\n".join(short(line) for line in recent))
     print(f"-- chatting with {agent_id}: type and press Enter to send (up arrow for history); "
           "/stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
-    os.write(fifo, b"/hello\n")                 # the agent says hi first
+    os.write(fifo, f"/hello {os.getcwd()}\n".encode())      # the agent says hi first (and knows where you are)
 
     def printer():
         while not done.is_set():

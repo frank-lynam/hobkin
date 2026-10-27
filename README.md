@@ -110,8 +110,15 @@ Then, from another terminal, chat with it:
 hobkin chat bodkin
 ```
 
+Its replies come under its name (`bodkin> ...`), so with several chats open
+you know which hobkin is talking. (The `out` file says `agent>`, for scripts.)
+When a chat opens, the agent says hello first, and it's told which folder you
+opened the chat in. When you say "here" or "this folder", it knows what you
+mean. It's told that folder isn't its workspace, and in safe mode it can read
+there but not write.
+
 In a terminal it's in colour, so things are easy to find when you scroll back:
-the agent's name in magenta, file names, paths and `code` in green, **bold** in
+its name in magenta, file names, paths and `code` in green, **bold** in
 bold, links underlined, tool calls dimmed and failed commands in red (agents are
 asked to put names of things in backticks for this). Piped, or with `NO_COLOR`
 set, it's plain text. Its replies appear as they come, and each tool call as one line (a command, a file

@@ -117,13 +117,15 @@ try:
         # chat, piped: sends, prints the reply, exits
         r = subprocess.run([sys.executable, HOB, "chat", aid], input="hi from a pipe\n", env={**os.environ, "HOBKIN_HOME": h},
                            capture_output=True, text=True, timeout=30)
-        check(f"[{api}] chat (piped) prints the reply", "agent> echo: hi from a pipe" in r.stdout and "operator>" not in r.stdout, r.stdout + r.stderr)
+        check(f"[{api}] chat (piped) prints the reply, under the agent's name", f"{aid}> echo: hi from a pipe" in r.stdout
+              and "agent>" not in r.stdout and "operator>" not in r.stdout, r.stdout + r.stderr)
         # chat, interactive: in a pseudo-terminal (readline: history, input kept on screen)
         import pty
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["HOBKIN_HOME"] = h
             os.environ["TERM"] = "xterm"
+            os.chdir(HERE)                                   # the folder chat tells the agent about
             os.execv(sys.executable, [sys.executable, HOB, "chat", aid])
         buf = b""
         def pump(until, t=20):
@@ -150,6 +152,8 @@ try:
         os.write(fd, b"\x04")   # Ctrl-D leaves
         _, status = os.waitpid(pid, 0)
         check(f"[{api}] chat (terminal) round trip and Ctrl-D", b"echo: typed in a terminal" in buf and status == 0, buf[-400:])
+        check(f"[{api}] chat (terminal) tells the agent the folder it was opened in", "from " + HERE + " (their terminal's folder"
+              in open(d + "/context.jsonl").read(), open(d + "/context.jsonl").read()[-600:])
         check(f"[{api}] chat history saved",     # libedit (macOS, some builds) writes spaces as \040
               "typed in a terminal" in open(d + "/.chat_history").read().replace("\\040", " "))
         p.send_signal(signal.SIGTERM); p.wait(10)
@@ -188,12 +192,13 @@ try:
         for _ in range(100):                                   # let the last turn finish first
             if json.load(open(d + "/state.json")).get("status") == "idle": break
             time.sleep(0.2)
-        say(d, "still there?"); wait_for(d, "operator> still there?")
-        for _ in range(100):                                   # (an idle compaction right after may archive the answer)
+        say(d, "still there?")
+        for _ in range(100):                   # (an idle compaction right after may archive the message and the answer)
             logs = "".join(open(f"{d}/archive/{n}").read() for n in sorted(os.listdir(d + "/archive")) if n.startswith("out-"))
-            tail = (logs + open(d + "/out").read()).split("operator> still there?")[-1]
-            if "agent> echo:" in tail: break
+            tail = (logs + open(d + "/out").read()).split("operator> still there?")
+            if len(tail) > 1 and "agent> echo:" in tail[-1]: break
             time.sleep(0.2)
+        tail = tail[-1] if len(tail) > 1 else ""
         seen = "".join(open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive") if n.startswith("context-")) + open(d + "/context.jsonl").read()
         check(f"[{api}] answers after compaction, with the message in its context", "agent> echo:" in tail and "still there?" in seen, tail[-300:])
         p.send_signal(signal.SIGTERM); p.wait(10)
@@ -749,33 +754,35 @@ try:
           cfg["model"] == "fake" and cfg["models"]["fake"]["base_url"] == "http://127.0.0.1:48702/v1"
           and open(key_file).read().strip() == "sk-secret" and oct(os.stat(key_file).st_mode & 0o777) == "0o600"
           and "sk-secret" not in open(hs + "/_shared/config.json").read(), cfg)
-    check("[setup] starts the agent and --chat talks to it", r.returncode == 0 and "agent> echo: hello setup" in r.stdout,
+    check("[setup] starts the agent and --chat talks to it", r.returncode == 0 and "s1> echo: hello setup" in r.stdout,
           r.stdout + r.stderr)
     r = run("chat", "s1", input="/models\n")
     check("[setup] /models lists them in a chat, the one in use starred", re.search(r"\* fake +100k context", r.stdout), r.stdout)
     r = run("chat", "s1", input="run: echo hidden-out-$((40+2))\n")
     check("[chat] tool calls show as one line, their output hidden", "$> echo hidden-out-$((40+2))" in r.stdout
-          and "    hidden-out-42" not in r.stdout and "agent> Done. Output was: hidden-out-42" in r.stdout, r.stdout)
+          and "    hidden-out-42" not in r.stdout and "s1> Done. Output was: hidden-out-42" in r.stdout, r.stdout)
     check("[chat] piped chat stays plain text (no colour codes)", "\x1b[" not in r.stdout, repr(r.stdout[:200]))
     sys.path.insert(0, os.path.join(HERE, ".."))
     import hobkin as hb
     painted = "\n".join(hb.chat_view(["2026-10-24 10:00:00 agent> **Done.** Fixed `parse()` in tests/a.py, see https://x.io/y.",
-                                       "2026-10-24 10:00:01 => (exit code 1; now in ~/w)"], "frank> ", False, {}, True))
+                                       "2026-10-24 10:00:01 => (exit code 1; now in ~/w)"], "frank> ", False, {}, True, "s1"))
     check("[chat] colour on a terminal: code and file paths green, bold, links underlined, failures red",
           "\x1b[32mparse()\x1b[0m" in painted and "\x1b[32mtests/a.py\x1b[0m" in painted and "\x1b[1mDone.\x1b[0m" in painted
-          and "\x1b[4mhttps://x.io/y\x1b[0m." in painted and "\x1b[31m=> (exit code 1" in painted, repr(painted))
+          and "\x1b[4mhttps://x.io/y\x1b[0m." in painted and "\x1b[31m=> (exit code 1" in painted
+          and "s1>" in painted and "agent>" not in painted, repr(painted))
     r = run("chat", "s1", "--full", input="run: echo shown-out-$((40+3))\n")
     check("[chat] --full shows tool output too", "    shown-out-43" in r.stdout, r.stdout)
     ctx_s1 = open(hs + "/s1/context.jsonl").read()
     check("[chat] agents are asked to backtick file names and paths", "put file names, paths, commands, ids" in ctx_s1)
     # Opening a chat asks the agent to say hello first
-    run("send", "s1", "/hello")
+    run("send", "s1", "/hello /home/frank/projects/site")
     for _ in range(50):
         if "just opened a chat with you" in open(hs + "/s1/context.jsonl").read(): break
         time.sleep(0.2)
     c1 = open(hs + "/s1/context.jsonl").read()
     check("[chat] opening a chat asks the agent to introduce itself by name", "just opened a chat with you" in c1
-          and "(you're s1)" in c1 and "command /hello" not in open(hs + "/s1/out").read(), c1[-400:])
+          and "(you're s1)" in c1 and "command /hello" not in open(hs + "/s1/out").read()
+          and "from /home/frank/projects/site (their terminal's folder" in c1, c1[-400:])
     # Four steps out loud: a file change before a plan's been said isn't run (once); planning files always are
     r = run("chat", "s1", input='noplan-call: write_file {"path": "fix.txt", "content": "x"}\n')
     check("[steps] a file change before **What would:** is said isn't run, and says why", "not run: no plan said yet" in r.stdout
