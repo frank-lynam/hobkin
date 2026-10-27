@@ -927,6 +927,142 @@ try:
     check("[heartbeat] silent when paused", len(beats()) == n, beats()[-3:])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # break glass: lifted brakes, the timeline, extensions (by command and by config edit) alerted, --off ends properly
+    alerts_file = os.path.join(BASE, "glass-alerts.txt")
+    h = home("glass", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "alert_command": f'echo "$HOBKIN_ALERT" >> {alerts_file}',
+              "announce_first": {"push to main": r"git push origin main"}})
+    os.makedirs(h + "/ops"); json.dump({"safe_mode": True} if abi else {}, open(h + "/ops/config.json", "w"))
+    p, aid, d = start(h, "ops")
+    genv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
+    def glass(*a): return subprocess.run([sys.executable, HOB, "breakglass", "ops", *a], env=genv, capture_output=True, text=True, timeout=150)
+    def alerts(): return read_or_empty(alerts_file)
+    def timeline(): return read_or_empty(next((os.path.join(d, "work", f) for f in os.listdir(d + "/work") if f.startswith("incident-")), ""))
+    def ups(): return open(d + "/out").read().count("break-glass mode: on until")
+    r = glass("db down", "--for", "1h"); wait_for(d, "break-glass mode: on until")
+    check("[glass] on: alerted, and the prompt says it's an incident", "break-glass mode ON until" in alerts()
+          and "Break glass: an incident" in ctx(d)[0]["content"], r.stdout + r.stderr + alerts())
+    if abi:
+        outside = os.path.join(BASE, "glass-outside.txt")
+        say(d, f"run: echo fix > {outside}; echo wrote-outside"); wait_for(d, "Done. Output was: wrote-outside")
+        check("[glass] safe mode lifted: writes outside the workspace", os.path.exists(outside))
+    say(d, "run: echo git push origin main"); wait_for(d, "Done. Output was: git push origin main")
+    check("[glass] nothing waits to be announced", "outward-facing" not in open(d + "/context.jsonl").read())
+    check("[glass] hobkin's timeline: commands, what it said, what it was told",
+          "echo git push origin main" in timeline() and "said:" in timeline() and "told: [message from" in timeline(), timeline()[-800:])
+    glass("db down", "--for", "2h")
+    for _ in range(50):
+        if "(extension 1)" in alerts(): break
+        time.sleep(0.2)
+    g = json.load(open(d + "/config.json"))["break_glass"]
+    check("[glass] an extension is counted, attributed and alerted", g.get("extensions") == 1 and g.get("extended_by")
+          and "(extension 1)" in alerts(), (g, alerts()))
+    g["until"] += 3600; json.dump({**json.load(open(d + "/config.json")), "break_glass": g}, open(d + "/config.json", "w"))
+    n = ups(); say(d, "/restart")
+    for _ in range(100):
+        if ups() > n and "outside `hobkin breakglass`" in alerts(): break
+        time.sleep(0.2)
+    check("[glass] an edit of config.json's end time is alerted too", "outside `hobkin breakglass`" in alerts(), alerts())
+    r = glass("--off"); wait_for(d, "break-glass mode has ended", 20, file="context.jsonl")
+    for _ in range(50):
+        if "break_glass" not in json.load(open(d + "/state.json")): break
+        time.sleep(0.1)
+    check("[glass] --off: timeline line, alert, summary asked (with MEMORY.md), state cleared",
+          "ended (switched off)" in timeline() and "OFF (switched off)" in alerts()
+          and "MEMORY.md" in json.dumps([m for m in ctx(d) if "break-glass mode has ended" in json.dumps(m)][0])
+          and "break_glass" not in json.load(open(d + "/state.json")), (timeline()[-400:], alerts()))
+    if abi:
+        os.remove(outside)
+        say(d, f"run: echo again > {outside}; echo tried-again"); wait_for(d, "\n    tried-again"); time.sleep(0.5)
+        check("[glass] back in safe mode afterwards", not os.path.exists(outside))
+    # time's up: it ends on its own
+    glass("still flaky", "--for", "6s"); wait_for(d, "break-glass mode ended", 30)
+    wait_for(d, "time's up", 20, file="context.jsonl")
+    check("[glass] it ends when time's up, and asks for the summary", "OFF (time's up)" in alerts(), alerts())
+    # salvage: nothing said (and the incident that ran out is over, not extended); an extension keeps it;
+    # a reason makes it an ordinary incident
+    r = glass("--for", "1h"); wait_for(d, "salvage what can't be replaced", 20)
+    g = json.load(open(d + "/config.json"))["break_glass"]
+    check("[salvage] no reason: a new salvage, with its brief (and packing itself) in the prompt", g.get("salvage") is True
+          and not g.get("extensions")
+          and "No guidance given: salvage" in ctx(d)[0]["content"] and "$HOBKIN_SELF pack" in ctx(d)[0]["content"], r.stdout + r.stderr)
+    glass("--for", "2h"); g = json.load(open(d + "/config.json"))["break_glass"]
+    check("[salvage] an extension with nothing said stays a salvage", g.get("salvage") is True and g.get("extensions") == 1, g)
+    glass("disk full", "--for", "2h"); g = json.load(open(d + "/config.json"))["break_glass"]
+    check("[salvage] a reason given makes it an ordinary incident", g["reason"] == "disk full" and "salvage" not in g, g)
+    n = alerts().count("OFF (switched off)"); glass("--off")
+    for _ in range(100):
+        if alerts().count("OFF (switched off)") > n: break
+        time.sleep(0.2)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # break glass has its own budget: an incident's spending doesn't pause the agent afterwards
+    h = home("glassbudget", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake-costly", "key_env": "TESTKEY"},
+             {"daily_budget_usd": 1.0, "idle_prompt": None})
+    p, aid, d = start(h)
+    genv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
+    subprocess.run([sys.executable, HOB, "breakglass", aid, "outage", "--for", "1h", "--budget", "none"], env=genv, capture_output=True, timeout=150)
+    for word in ("one", "two", "three", "four", "five"):
+        say(d, word); wait_for(d, f"echo: {word}")
+    check("[glass budget] the incident's spending isn't the daily budget's", "budget" not in json.load(open(d + "/state.json")).get("status", ""))
+    subprocess.run([sys.executable, HOB, "breakglass", aid, "--off"], env=genv, capture_output=True, timeout=150)
+    say(d, "after"); wait_for(d, "echo: after", 20)
+    check("[glass budget] and afterwards it isn't paused for it", "daily budget used up" not in open(d + "/out").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # its own tools: work/tools/NAME/ with tool.json and an executable run; offered (here in the OpenAI shape), called, broken ones explained
+    h = home("owntools", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}, {"idle_prompt": None})
+    p, aid, d = start(h)
+    t = d + "/work/tools"
+    os.makedirs(t + "/strum"); os.makedirs(t + "/broken"); os.makedirs(t + "/bash"); os.makedirs(t + "/noexec")
+    spec = {"description": "Strum a chord on the synth", "input_schema": {"type": "object", "properties": {"chord": {"type": "string"}}}}
+    json.dump(spec, open(t + "/strum/tool.json", "w"))
+    open(t + "/strum/run", "w").write("#!/usr/bin/env python3\nimport json, os, sys\nprint('strummed', json.load(sys.stdin)['chord'], 'in', os.path.basename(os.getcwd()))\n")
+    os.chmod(t + "/strum/run", 0o755)
+    open(t + "/broken/tool.json", "w").write("{")
+    json.dump(spec, open(t + "/bash/tool.json", "w")); json.dump(spec, open(t + "/noexec/tool.json", "w")); open(t + "/noexec/run", "w").write("echo hi\n")
+    say(d, "run: mkdir -p songs && cd songs"); wait_for(d, "now in songs/")
+    say(d, 'call: strum {"chord": "E minor"}'); wait_for(d, "Done. Output was: strummed E minor in songs")
+    body = [json.loads(l)["body"] for l in open(LOG) if '"path"' in l and '"strum"' in l][-1]
+    check("[own tools] offered in the API's shape, run with its input in the shell's folder",
+          any(x.get("function", {}).get("name") == "strum" for x in body["tools"]), [x.get("function", {}).get("name") for x in body["tools"]])
+    sysp = ctx(d)[0]["content"]
+    check("[own tools] the ones that can't be offered are listed with why", "tools/broken: not offered: tool.json isn't valid JSON" in sysp
+          and "tools/bash: not offered: that's the name of a built-in tool" in sysp and "tools/noexec: not offered: it has no executable `run`" in sysp, sysp[-900:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # hobkin pack: a bundle without secrets that starts anywhere, told it's a restored copy
+    h = home("pack", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
+                      "headers": {"X-Auth": "header-secret"}}, {"idle_prompt": None})
+    p, aid, d = start(h)
+    open(d + "/secrets.env", "w").write("AWS_SECRET=very-secret\n")
+    open(d + "/MEMORY.md", "w").write("Found: the orders db, dumped to s3://acme-backups/salvage/\n")
+    open(d + "/work/salvaged.bin", "wb").write(b"x" * (3 * 1024 * 1024))
+    say(d, "run: python3 $HOBKIN_SELF pack $HOBKIN_ID --to $HOBKIN_WORK/out && ls $HOBKIN_WORK/out")
+    wait_for(d, "Done. Output was")
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    import tarfile
+    bundles = os.listdir(d + "/work/out")
+    check("[pack] an agent packs itself with $HOBKIN_SELF", len(bundles) == 1 and bundles[0].startswith(f"hobkin-{aid}-"), bundles)
+    tar = tarfile.open(os.path.join(d, "work/out", bundles[0])); names = tar.getnames()
+    blob = b"".join(tar.extractfile(m).read() for m in tar.getmembers() if m.isfile() and not m.name.endswith("/hobkin.py"))
+    check("[pack] no secrets, keys or model headers; each file once; big workspace files left out",
+          b"very-secret" not in blob and b"header-secret" not in blob and len(names) == len(set(names))
+          and not any(n.endswith(("secrets.env", "salvaged.bin", "/in", "/lock")) for n in names), names)
+    top = os.path.join(BASE, "restored"); tar.extractall(top); top = os.path.join(top, bundles[0][:-7])
+    check("[pack] RESTORE.md says how to start it and what was left out", "--id " + aid in open(top + "/RESTORE.md").read()
+          and "salvaged.bin" in open(top + "/RESTORE.md").read())
+    r = subprocess.run([sys.executable, top + "/hobkin.py", "http://127.0.0.1:48701", "fake", "test-key", "--id", aid, "--no-service",
+                        "--api", "anthropic"], env={**os.environ, "HOBKIN_HOME": top + "/home"}, capture_output=True, text=True, timeout=60)
+    rd = top + "/home/" + aid
+    try:
+        wait_for(rd, "started from a bundle of yourself"); wait_for(rd, "agent> echo:")
+        c = ctx(rd)
+        check("[pack] the restored copy starts with its memory, told it's a copy of the one in its old folder",
+              "the orders db" in c[0]["content"] and any(d in json.dumps(m) and "started from a bundle" in json.dumps(m) for m in c[1:]), r.stdout + r.stderr)
+    finally:
+        subprocess.run([sys.executable, top + "/hobkin.py", "send", aid, "/stop"], env={**os.environ, "HOBKIN_HOME": top + "/home"})
+
     # systemd user services (only where a user session exists; skipped on CI runners)
     if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0:
         h = home("svc", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake",

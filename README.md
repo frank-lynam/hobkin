@@ -601,7 +601,7 @@ Until it expires the agent works fully on its own:
 The switch is a command you run, recorded in the agent's own `config.json`. A
 safe-mode agent can't write there, so it can't break the glass itself. (An agent
 not in safe mode can already do anything your account can.) Running it again
-extends it; a running agent picks it up by restarting in place, keeping its
+while it's on extends it (once it's run out, it starts a new incident); a running agent picks it up by restarting in place, keeping its
 conversation. Every extension is counted and attributed in the config, and
 alerted and put in the timeline, including one made by editing `config.json`
 directly, which a non-safe-mode agent could do to itself. The agent sees its

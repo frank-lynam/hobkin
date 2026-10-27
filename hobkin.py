@@ -54,7 +54,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 import email.utils
 import base64
@@ -4369,6 +4369,8 @@ def cmd_breakglass(argv):
         now = time.time()
         who = os.environ.get("USER") or os.environ.get("LOGNAME") or "someone"
         old = cfg.get("break_glass") or {}
+        if float(old.get("until") or 0) <= now:     # one that's run out is over: this is a new incident
+            old = {}
         if len(pos) == 2:
             reason, salvage = pos[1], False
         elif old:                                   # an extension that says nothing new: as it was
