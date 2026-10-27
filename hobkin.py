@@ -14,6 +14,7 @@ line, or as a worker on hearthboard.
     hobkin list            list agents
     hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
     hobkin breakglass ID "what's wrong" [--for 2h]   an incident: the agent acts fully on its own (--off ends it)
+    hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
     hobkin --version
 
 Set up and go in one line (no config editing):
@@ -52,7 +53,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 import email.utils
 import base64
@@ -87,7 +88,7 @@ import urllib.request
 
 # ---- map: `grep -n '^# ----' hobkin.py` lists these sections; the Agent's own parts are marked '    # --- '.
 #   settings      defaults, the config.json types, and the default AGENTS.md
-#   tools         what the model can call (TOOLS), the saved-shell script, operator commands
+#   tools         what the model can call (TOOLS, and the agent's own), the saved-shell script, operator commands
 #   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
 #   helpers       time and text helpers, files
 #   config        config.json, warnings, secrets, skills, the shared folder, the lock
@@ -465,7 +466,7 @@ reply here. Then go and grab the next piece of work.
 """
 
 
-# ---- tools: what the model can call (TOOLS), the saved-shell script, operator commands
+# ---- tools: what the model can call (TOOLS, and the agent's own), the saved-shell script, operator commands
 
 ToolResult = tuple[str, bool]  # (text for the model, is_error): what every tool returns
 
@@ -559,6 +560,15 @@ TOOLS = [
          "steps": {"type": "array", "items": {"type": "string"}, "description": "Small steps you can check, in order."},
          "done": {"type": "array", "items": {"type": "integer"}, "description": "Step numbers just finished, e.g. [2]."}}}},
 ]
+
+# The agent's own tools: $HOBKIN_WORK/tools/NAME/ holds tool.json and an executable `run` (see Agent.own_tools)
+OWN_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+OWN_TOOLS = ("# Your own tools\n\nYou can make yourself tools, for a command you'd otherwise keep retyping: a folder "
+             "$HOBKIN_WORK/tools/NAME/ (NAME in lowercase letters, digits and _) holding `tool.json`, "
+             "{{\"description\": \"what it does and when to use it\", \"input_schema\": {{\"type\": \"object\", "
+             "\"properties\": {{...}}, \"required\": [...]}}}}, and an executable `run` (any language) that reads the "
+             "call's arguments as one JSON object on stdin and prints its result. It runs like a bash command: your "
+             "current folder, environment and limits. A new or changed tool is there from your next reply.{mine}")
 
 
 # Saved after every command, restored before the next: the shell's folder, variables,
@@ -702,6 +712,25 @@ BREAK_GLASS = ("# Break glass: an incident\n\n{by} declared an incident at {decl
                "- **When it's over** (or the time runs out), write a summary: what happened, what you changed (and how "
                "to undo it), what's still open.\n\n"
                "hobkin keeps a timeline of every command, change and message in {log}.")
+SALVAGE = ("## No guidance given: salvage\n\n"
+           "Nobody said what's wrong, so assume this system is failing and may be gone soon, and save what can't be "
+           "replaced while it's still up. Don't try to fix it: copy, don't change.\n"
+           "1. **Find out what it is, fast:** what runs here (services, containers, cron, listening ports), what it's "
+           "for, where its data lives (databases, upload folders, queues, state files) and where its logs go. Give "
+           "it 10 minutes, not an hour; post what you found.\n"
+           "2. **Find where copies can go:** places this system already sends things (S3 or other buckets in its "
+           "config or environment, backup targets, a NAS or other host it mounts or syncs to), with the credentials "
+           "already here. Only those: never somewhere it doesn't already use. None? Copy to the sturdiest place "
+           "there is (another disk, another mounted host), and failing that, keep it in your workspace and say so.\n"
+           "3. **Copy, most precious first:** data no one else has (database dumps made the database's own way, "
+           "e.g. pg_dump or sqlite3 .backup, not live files copied mid-write; recent uploads and state), then "
+           "logs (the journal, app logs, dmesg), then config, then a snapshot of how things stand (processes, "
+           "ports, disk, memory, recent errors). Small and sure first, big later; `nice`/`ionice` it so you're not "
+           "what knocks it over.\n"
+           "4. **Keep a manifest** in your workspace: each thing saved, where it went, its size and checksum, and "
+           "what you couldn't save and why. Upload it with the copies.\n"
+           "- Delete nothing of the system's, not even to free space (only your own temporary copies).\n"
+           "- Post a status after each step, and tell whoever turns up exactly where everything is.")
 GLASS_IDLE = ("[from hobkin: the incident is still open ({reason}), {stamp}. Check the state of things, post a short "
               "status where the people are, and carry on.]")
 GLASS_ENDED = ("[from hobkin: break-glass mode has ended, {stamp}{how}; you're back to normal{safe}. Write your summary "
@@ -1910,6 +1939,11 @@ class Agent:
                 parts.append(text.strip())
         parts.append(FORMATTING)
         parts.append(BATCHING)
+        if hasattr(self, "work"):
+            defs, _, problems = self.own_tools()
+            mine = "".join(f"\n- **{t['name']}**: yours, in $HOBKIN_WORK/tools/{t['name']}/" for t in defs) + \
+                "".join(f"\n- {p}" for p in problems)
+            parts.append(OWN_TOOLS.format(mine=("\n\nYou have:" + mine) if mine else ""))
         if self.cfg.get("wake") if hasattr(self, "cfg") else None:
             parts.append(WAKE_NOTE)
         if getattr(self, "safe", None):
@@ -1919,6 +1953,8 @@ class Agent:
             parts.append(BREAK_GLASS.format(by=g.get("by", "someone"), declared=when_text(float(g["declared"])),
                                             reason=g["reason"], until=when_text(float(g["until"])), log=self.glass_log,
                                             lifted=" (and safe mode is lifted)" if self.cfg.get("safe_mode") else ""))
+            if g.get("salvage"):
+                parts.append(SALVAGE)
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
         if not skills and not getattr(self, "glass", None):
             parts.append(NO_WORK_SYSTEM)
@@ -2100,6 +2136,49 @@ class Agent:
                                            ("status", "model", "context_tokens", "last_input_tokens", "compactions")}))
 
     # --- tools
+    def own_tools(self) -> tuple[list[dict], dict[str, str], list[str]]:
+        """The tools the agent made itself (OWN_TOOLS): their definitions, {name: run path}, and what's wrong with
+        any that can't be offered, read fresh each time so a new one is there from the next reply."""
+        defs, runs, problems = [], {}, []
+        root = os.path.join(self.work, "tools")
+        builtin = {t["name"] for t in TOOLS}
+        for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            d = os.path.join(root, name)
+            if not os.path.isdir(d):
+                continue
+            run = os.path.join(d, "run")
+            try:
+                spec = json.loads(read(os.path.join(d, "tool.json")) or "null")
+            except json.JSONDecodeError as e:
+                spec, why = None, f"tool.json isn't valid JSON ({e})"
+            else:
+                why = "it has no tool.json" if spec is None else ""
+            if not OWN_TOOL_NAME.match(name):
+                why = "its name must be lowercase letters, digits and _ (starting with a letter)"
+            elif name in builtin:
+                why = "that's the name of a built-in tool"
+            elif not why and not (isinstance(spec, dict) and isinstance(spec.get("description"), str)
+                                  and isinstance(spec.get("input_schema"), dict)):
+                why = "tool.json needs a \"description\" (text) and an \"input_schema\" (an object)"
+            elif not why and not os.access(run, os.X_OK):
+                why = "it has no executable `run` (chmod +x it)"
+            if why:
+                problems.append(f"tools/{name}: not offered: {why}")
+                continue
+            defs.append({"name": name, "description": spec["description"], "input_schema": spec["input_schema"]})
+            runs[name] = run
+        return defs, runs, problems
+
+    def tools(self) -> list[dict]:
+        """What the model is offered: the built-in tools, then the agent's own."""
+        return TOOLS + self.own_tools()[0]
+
+    def run_own_tool(self, run: str, inp: dict) -> ToolResult:
+        """One of the agent's own tools: its `run`, with the input as JSON on stdin, run as a bash command
+        (the same shell, sandbox, limits, timeline and log)."""
+        end = "HOBKIN_INPUT_" + secrets.token_hex(6)
+        return self.run_bash(f"{shlex.quote(run)} <<'{end}'\n{json.dumps(inp)}\n{end}")
+
     def secret_names(self):
         return list(load_env_file(os.path.join(SHARED, "secrets.env"))) + list(load_env_file(self.p("secrets.env")))
 
@@ -2652,7 +2731,7 @@ class Agent:
         ask.append({"type": "text", "text": FRONT_DESK.format(who=who, where=where, stamp=self.stamp(), text=text)})
         try:
             blocks, _, _ = self.model.call(self.system_prompt(), self.messages + [{"role": "user", "content": ask}],
-                                           min(self.max_output(), 1000), tool_choice="none")
+                                           min(self.max_output(), 1000), tools=self.tools(), tool_choice="none")
         except (ApiError, urllib.error.URLError, OSError, ValueError) as e:
             self.log("hobkin", f"front desk couldn't answer ({e}); the message waits for this step to finish")
             return None
@@ -2986,7 +3065,10 @@ class Agent:
             "web_search": lambda: self.web_search(s("query")),
         }
         if name not in tools:
-            return f"Unknown tool {name!r}. Tools: {', '.join(tools)}.", True
+            runs = self.own_tools()[1]
+            if name in runs:
+                return self.run_own_tool(runs[name], inp)
+            return f"Unknown tool {name!r}. Tools: {', '.join(list(tools) + list(runs))}.", True
         try:
             result = tools[name]()
         except KeyError as e:
@@ -3014,7 +3096,7 @@ class Agent:
                     continue
             try:
                 blocks, stop_reason, used = self.model.call(self.system_prompt(), messages, self.max_output(),
-                                                            tool_choice=tool_choice)
+                                                            tools=self.tools(), tool_choice=tool_choice)
                 self.state["last_step"] = time.time()
                 if used:
                     self.state["last_input_tokens"] = used
@@ -4166,10 +4248,11 @@ def start_agent(agent_id, opts):
 
 
 def cmd_breakglass(argv):
-    """hobkin breakglass ID "what's wrong" [--for 2h] [--budget DOLLARS|none] [--off]"""
+    """hobkin breakglass ID ["what's wrong"] [--for 2h] [--budget DOLLARS|none] [--off]
+    With nothing said about what's wrong, it's a salvage: save what can't be replaced (SALVAGE)."""
     pos, opts = split_args(argv, {"--off"}, {"--for", "--budget"})
-    if len(pos) != (1 if opts.get("--off") else 2):
-        sys.exit('usage: hobkin breakglass ID "what\'s wrong" [--for 2h] [--budget DOLLARS|none]\n'
+    if not (len(pos) == 1 if opts.get("--off") else len(pos) in (1, 2)):
+        sys.exit('usage: hobkin breakglass ID ["what\'s wrong"] [--for 2h] [--budget DOLLARS|none]\n'
                  '       hobkin breakglass ID --off')
     agent_id = valid_id(pos[0])
     d = os.path.join(HOME, agent_id)
@@ -4190,7 +4273,15 @@ def cmd_breakglass(argv):
         now = time.time()
         who = os.environ.get("USER") or os.environ.get("LOGNAME") or "someone"
         old = cfg.get("break_glass") or {}
-        g = {"reason": pos[1], "by": old.get("by", who), "declared": old.get("declared", now), "until": now + seconds}
+        if len(pos) == 2:
+            reason, salvage = pos[1], False
+        elif old:                                   # an extension that says nothing new: as it was
+            reason, salvage = old["reason"], bool(old.get("salvage"))
+        else:
+            reason, salvage = "no guidance given: salvage what can't be replaced", True
+        g = {"reason": reason, "by": old.get("by", who), "declared": old.get("declared", now), "until": now + seconds}
+        if salvage:
+            g["salvage"] = True
         if old:                                     # an extension: counted and attributed (and alerted at restart)
             g.update({"extensions": int(old.get("extensions", 0)) + 1, "extended_by": who})
         if opts.get("--budget"):

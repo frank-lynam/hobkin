@@ -411,6 +411,16 @@ default; the agent can ask for any longer timeout on a command),
   `save_as` downloads anything else (a PDF, an image) into the workspace.
 - **`web_search`** searches DuckDuckGo and returns the top ten results: title,
   URL, snippet.
+- **Its own tools:** the agent can make itself tools, for a command it would
+  otherwise keep retyping (calls to a synthesizer's API, say). Each is a folder
+  `work/tools/NAME/` holding `tool.json` (`{"description": ..., "input_schema":
+  {...}}`, a JSON Schema object like the built-ins') and an executable `run`, in
+  any language, which gets the call's arguments as one JSON object on stdin and
+  prints its result. The model is offered them alongside the built-ins from its
+  next reply. `run` runs as a bash command does (the same shell folder,
+  environment, sandbox, timeout, output limit and timeline). Ones that can't be
+  offered (bad JSON, a built-in's name, `run` not executable) are listed in its
+  instructions with the reason, so it can fix them. You can write them for it too.
 
 ### The web
 
@@ -525,7 +535,21 @@ For an incident, when you want the agent working it as one of the hands on deck:
 ```sh
 hobkin breakglass ops-1 "api returning 500s since 14:10" --for 2h [--budget 50|none]
 hobkin breakglass ops-1 --off          # end it early
+hobkin breakglass ops-1 --for 1h       # nothing said: salvage
 ```
+
+**Salvage,** when you don't say what's wrong: the agent assumes the system is
+falling over and may be gone soon, and saves what can't be replaced while it's
+still up. It copies and doesn't fix. It works out what the system is and where
+its data and logs live (in about 10 minutes, not an hour). Then it finds where
+copies can go: only places the system already sends things (S3 or other buckets
+in its config, backup targets, mounted hosts), using the credentials already
+there. It copies the most precious first: data nobody else has (dumped the
+database's own way, not live files), then logs, config, and a snapshot of how
+things stand, gently (`nice`/`ionice`). It keeps a manifest (what's saved, where,
+size and checksum, and what couldn't be saved), deletes nothing of the system's,
+and posts a status after each step. Extending it without a reason keeps it a
+salvage; giving a reason makes it an ordinary incident.
 
 Until it expires the agent works fully on its own:
 - **No brakes:** safe mode is lifted, and nothing is announced first or waits.
