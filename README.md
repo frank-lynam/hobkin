@@ -554,6 +554,60 @@ copies, early and again at the end. If the machine is lost, you can start that
 bundle anywhere and ask it what it found. Extending it without a reason keeps it
 a salvage; giving a reason makes it an ordinary incident.
 
+### Several agents on one incident
+
+Two agents on the same machine can undo each other's work: the fixer restarts
+Postgres in the middle of the salvager's dump. Put them on one incident:
+
+```sh
+hobkin breakglass ops-1 "api returning 500s" --for 2h
+hobkin breakglass ops-2 --for 2h --with ops-1      # ops-2 salvages, on ops-1's incident
+```
+
+`--with ID,ID` joins the incident those agents are on, or starts one with them.
+An agent with `--with` that isn't in break-glass mode yet is declared with the
+same reason (or as a salvage), and one that already is joins as it is. Then:
+- **Each knows the others:** its instructions list who else is on the incident,
+  what they're doing it for, and where their timelines are. How to message
+  each other is in there too (`hobkin send`).
+- **Each sees the others' work:** what they've done since its last step (from
+  their timelines, without what they were told) comes with its next tool
+  results, and with the idle nudges.
+- **Holds:** a `hold` tool, offered only on a shared incident: "dumping the
+  orders db: don't restart postgres", with a regular expression for the commands
+  that would disturb it. A teammate's matching command is stopped once and shown
+  the hold. Run again, it goes through, and that's put in both agents' records and
+  alerted. Holds live in `_incidents/NAME/holds.json` and are released when the
+  agent that set them leaves break-glass mode.
+
+### The watch screen
+
+```sh
+hobkin watch ops-1          # everyone on ops-1's incident, in one terminal
+hobkin watch                # everyone in break-glass mode (else every agent)
+hobkin watch --once         # print it once (also what you get when piped)
+```
+
+One terminal, redrawn every second, built from the files hobkin already writes
+(config, state, timelines, out logs):
+- **A banner per agent, in its own colour:** BREAK GLASS or SALVAGE; NO
+  APPROVALS; SAFE MODE LIFTED (or NO SANDBOX); the account it acts as; the
+  countdown; the incident's spend and budget; what it's doing now (with how long a
+  command has been running).
+- **The holds,** then **one feed** merged from their timelines: commands with
+  exit codes, file changes, what they said and were told, holds, stops and
+  overrides.
+- **Flags:**
+  - A file-tool write outside the workspace is flagged exactly; hobkin knows
+    the path.
+  - A bash command's effects can't be seen from here, so its flags are guesses
+    from the command line, labelled "looks like": privileged, deletes, service
+    change, leaves the machine, writes outside, changes config.
+- **Totals and the controls:** how to end it (`--off`) or stop an agent now.
+
+Agents not in break-glass mode show their out log instead of a timeline.
+`NO_COLOR` is respected.
+
 ### Packing an agent
 
 ```sh

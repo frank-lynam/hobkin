@@ -1063,6 +1063,63 @@ try:
     finally:
         subprocess.run([sys.executable, top + "/hobkin.py", "send", aid, "/stop"], env={**os.environ, "HOBKIN_HOME": top + "/home"})
 
+    # a shared incident: --with joins them; each sees the other's work; a teammate's hold stops a command once
+    alerts_file = os.path.join(BASE, "team-alerts.txt")
+    h = home("team", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "alert_command": f'echo "$HOBKIN_ALERT" >> {alerts_file}'})
+    pf, _, df = start(h, "fixer"); ps, _, ds = start(h, "saver")
+    tenv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
+    def hob_(*a): return subprocess.run([sys.executable, HOB, *a], env=tenv, capture_output=True, text=True, timeout=150)
+    hob_("breakglass", "fixer", "api returning 500s", "--for", "1h")
+    r = hob_("breakglass", "saver", "--for", "1h", "--with", "fixer")
+    gf, gs = (json.load(open(x + "/config.json"))["break_glass"] for x in (df, ds))
+    check("[team] --with: one incident; the salvager salvages, the fixer keeps its reason and joins",
+          gf.get("incident") and gf.get("incident") == gs.get("incident") and gs.get("salvage") and gf["reason"] == "api returning 500s"
+          and "joins incident" in r.stdout, r.stdout + r.stderr)
+    wait_for(df, "Others on this incident", 20, file="context.jsonl")
+    say(ds, 'call: hold {"what": "dumping the orders db: do not restart postgres", "match": "restart postgres"}')
+    wait_for(ds, "Hold #1 set", file="context.jsonl")
+    check("[team] each is told who else is on it, with their timeline", "**saver**: salvage; its timeline: " + ds in ctx(df)[0]["content"]
+          and "**fixer**: api returning 500s" in ctx(ds)[0]["content"], ctx(df)[0]["content"][-700:])
+    check("[team] the hold tool is offered only on a shared incident",
+          '"name": "hold"' in [l for l in open(LOG) if '"path"' in l][-1])
+    say(df, "run: echo restart postgres > restarted.txt"); wait_for(df, "has a hold on this", file="context.jsonl")
+    check("[team] a teammate's hold stops a matching command once, and says whose and why",
+          not os.path.exists(df + "/work/restarted.txt") and "dumping the orders db" in json.dumps(last_results(df)))
+    check("[team] the fixer hears what the salvager did since its last look",
+          "on this incident since your last look" in json.dumps(last_results(df)) and "hold #1: dumping the orders db" in json.dumps(last_results(df)),
+          json.dumps(last_results(df))[:600])
+    n = open(df + "/out").read().count("Done. Output was")
+    say(df, "run: echo restart postgres > restarted.txt")
+    for _ in range(100):
+        if open(df + "/out").read().count("Done. Output was") > n: break
+        time.sleep(0.1)
+    for _ in range(50):
+        if os.path.exists(df + "/work/restarted.txt") and "overrode saver's hold #1" in read_or_empty(alerts_file): break
+        time.sleep(0.1)
+    check("[team] the same command again goes through, alerted and on the record",
+          os.path.exists(df + "/work/restarted.txt") and "overrode saver's hold #1" in read_or_empty(alerts_file), read_or_empty(alerts_file))
+    say(df, "run: echo sudo rm -rf /var/lib/old"); wait_for(df, "Done. Output was: sudo rm", file="out")
+    r = hob_("watch", "fixer", "--once")
+    w = r.stdout
+    check("[watch] one screen: the whole incident from one id, both banners, the holds",
+          "incident " + gf["incident"] in w and " BREAK GLASS " in w and " SALVAGE " in w and "NO APPROVALS" in w
+          and "acting as" in w and "#1 saver: dumping the orders db" in w, w + r.stderr)
+    check("[watch] one feed: commands, holds, overrides; risky-looking commands flagged; totals",
+          "saver" in w and "OVERRODE saver's hold #1" in w and "looks like: privileged, deletes" in w
+          and "1 holds overridden" in w and "\x1b[" not in w, w)
+    check("[watch] risky() guesses from the command line", hbk.risky("sudo systemctl restart nginx") == ["privileged", "service change"]
+          and hbk.risky("aws s3 cp dump.sql s3://b/") == ["leaves the machine"] and hbk.risky("ls -la > /dev/null") == [])
+    hob_("breakglass", "saver", "--off")
+    for _ in range(100):
+        if json.load(open(os.path.join(h, "_incidents", gf["incident"], "holds.json"))) == []: break
+        time.sleep(0.2)
+    check("[team] its holds are released when it's over",
+          json.load(open(os.path.join(h, "_incidents", gf["incident"], "holds.json"))) == [])
+    r = hob_("watch", "--once")
+    check("[watch] with no one named: whoever is in break-glass mode", "fixer" in r.stdout and " SALVAGE " not in r.stdout, r.stdout)
+    pf.send_signal(signal.SIGTERM); ps.send_signal(signal.SIGTERM); pf.wait(10); ps.wait(10)
+
     # systemd user services (only where a user session exists; skipped on CI runners)
     if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0:
         h = home("svc", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake",

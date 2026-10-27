@@ -15,6 +15,8 @@ line, or as a worker on hearthboard.
     hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
     hobkin breakglass ID "what's wrong" [--for 2h]   an incident: the agent acts fully on its own (--off ends it)
     hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
+    hobkin breakglass ID ["what's wrong"] --with ID2,ID3   one incident, shared: they see each other's work and holds
+    hobkin watch [ID ...]   one screen for an incident: every agent on it, what they're doing, risky-looking commands
     hobkin pack ID [--to DIR]   a bundle of the agent (hobkin, memory, conversation, notes; no secrets) to restart elsewhere
     hobkin --version
 
@@ -54,7 +56,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 import email.utils
 import base64
@@ -91,16 +93,16 @@ import urllib.request
 
 # ---- map: `grep -n '^# ----' hobkin.py` lists these sections; the Agent's own parts are marked '    # --- '.
 #   settings      defaults, the config.json types, and the default AGENTS.md
-#   tools         what the model can call (TOOLS, and the agent's own), the saved-shell script, operator commands
+#   tools         what the model can call (TOOLS, the hold tool, the agent's own), the saved-shell script, operator commands
 #   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
 #   helpers       time and text helpers, files
-#   config        config.json, warnings, secrets, skills, the shared folder, the lock
+#   config        config.json, warnings, secrets, skills, the shared folder, shared incidents (holds), the lock
 #   safe mode     Landlock: commands write only in the workspace, no TCP, no signals (what the kernel allows)
 #   web           pages as text, client certificates, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
 #   agent         the Agent: setup, context file, input, tools, nudges, reminders, model calls, compaction, the loop
 #   service       systemd user services
-#   command line  send, chat, list, main
+#   command line  send, chat, the watch screen, list, breakglass, pack, main
 
 
 # ---- settings: defaults, the config.json types, and the default AGENTS.md
@@ -564,6 +566,20 @@ TOOLS = [
          "done": {"type": "array", "items": {"type": "integer"}, "description": "Step numbers just finished, e.g. [2]."}}}},
 ]
 
+# Only during a shared incident (`hobkin breakglass ... --with`): holds, so teammates don't undo each other's work
+HOLD_TOOL = {
+    "name": "hold",
+    "description": ("Set a hold while you do something your teammates on this incident mustn't disturb (a dump, a "
+                    "copy, a migration): what you're doing, and a regular expression for the commands that would "
+                    "disturb it. Their matching commands are stopped once and shown your hold. Release it when "
+                    "you're done; it's also released when your break-glass mode ends. With nothing, it lists the holds."),
+    "input_schema": {"type": "object", "properties": {
+        "what": {"type": "string", "description": "What you're doing and what not to do, e.g. \"dumping the orders db: don't restart or stop postgres\"."},
+        "match": {"type": "string", "description": "A regular expression for the commands that would disturb it, e.g. \"systemctl .*(restart|stop) .*postgres|pg_ctl\"."},
+        "release": {"type": "integer", "description": "Number of your hold to release."}}}}
+INCIDENTS = os.path.join(HOME, "_incidents")      # a shared incident's holds: _incidents/NAME/holds.json
+
+
 # The agent's own tools: $HOBKIN_WORK/tools/NAME/ holds tool.json and an executable `run` (see Agent.own_tools)
 OWN_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 OWN_TOOLS = ("# Your own tools\n\nYou can make yourself tools, for a command you'd otherwise keep retyping: a folder "
@@ -738,6 +754,18 @@ SALVAGE = ("## No guidance given: salvage\n\n"
            "the copies, early and again at the end.\n"
            "- Delete nothing of the system's, not even to free space (only your own temporary copies).\n"
            "- Post a status after each step, and tell whoever turns up exactly where everything is.")
+TEAM = ("## Others on this incident\n\nYou're not alone on it ({incident}): other hobkins are working it too, on "
+        "this machine. hobkin shows you what they've done since your last step, as it happens.\n{members}\n"
+        "- **Don't undo each other:** before you restart, stop, move or clean up something, think whether a "
+        "teammate is using it. Tell them with `python3 $HOBKIN_SELF send ID \"[from {me}] ...\"`.\n"
+        "- **Holds:** when you start something that others mustn't disturb (a dump, a copy, a migration), set a "
+        "`hold` saying what and with a pattern of the commands that would disturb it; release it when you're "
+        "done. A command of yours that matches someone else's hold is stopped once and you're shown the hold: "
+        "wait, or talk to them, and only run it again if it really can't wait.")
+TEAM_NEWS = "[from hobkin: on this incident since your last look, {stamp}:]\n{lines}"
+HELD = ("Not run: {by} has a hold on this (hold #{n}, set {when}): {what}. It matches /{match}/. Wait until they "
+        "release it, or ask them (`python3 $HOBKIN_SELF send {by} \"[from {me}] ...\"`). If it really can't wait, "
+        "run exactly the same command again: it'll go through, and that's put on the record and alerted.")
 GLASS_IDLE = ("[from hobkin: the incident is still open ({reason}), {stamp}. Check the state of things, post a short "
               "status where the people are, and carry on.]")
 GLASS_ENDED = ("[from hobkin: break-glass mode has ended, {stamp}{how}; you're back to normal{safe}. Write your summary "
@@ -857,7 +885,7 @@ def merged(base, over):
     return out
 
 
-# ---- config: config.json, warnings, secrets, skills, the shared folder, the lock
+# ---- config: config.json, warnings, secrets, skills, the shared folder, shared incidents (holds), the lock
 
 def load_config(agent_dir: str) -> dict:
     """Settings: built-in defaults, then _shared/config.json, then the agent's config.json.
@@ -969,6 +997,46 @@ def ensure_shared():
         write_atomic(os.path.join(SHARED, "config.json"), json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
     if not os.path.exists(os.path.join(SHARED, "AGENTS.md")):
         write_atomic(os.path.join(SHARED, "AGENTS.md"), DEFAULT_AGENTS_MD)
+
+
+def glass_log_path(agent_dir: str, g: dict) -> str:
+    """Where an incident's timeline goes: the agent's workspace, named for when it was declared."""
+    return os.path.join(agent_dir, "work", time.strftime("incident-%Y%m%d-%H%M.md", time.localtime(float(g["declared"]))))
+
+
+def incident_members(name: str) -> list[tuple[str, dict, str]]:
+    """The agents on a shared incident whose break glass is still on: (id, break_glass entry, timeline path)."""
+    found = []
+    for i in sorted(os.listdir(HOME)) if os.path.isdir(HOME) else []:
+        d = os.path.join(HOME, i)
+        if i.startswith("_") or not os.path.isdir(d):
+            continue
+        try:
+            g = json.loads(read(os.path.join(d, "config.json")) or "{}").get("break_glass") or {}
+        except json.JSONDecodeError:
+            continue
+        if g.get("incident") == name and float(g.get("until") or 0) > time.time():
+            found.append((i, g, glass_log_path(d, g)))
+    return found
+
+
+def edit_holds(name: str, change) -> list[dict]:
+    """A shared incident's holds (_incidents/NAME/holds.json), changed by `change(holds) -> holds` under a lock
+    (None: just read). Returns the holds after it."""
+    folder = os.path.join(INCIDENTS, re.sub(r"[^\w.-]", "_", name))
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "holds.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = os.path.join(folder, "holds.json")
+        try:
+            holds = json.loads(read(path) or "[]")
+        except json.JSONDecodeError:
+            holds = []
+        if change is None:
+            return holds
+        holds = change(holds)
+        write_atomic(path, json.dumps(holds, indent=2) + "\n")
+        return holds
 
 
 def is_running(agent_dir):
@@ -1622,6 +1690,7 @@ class Agent:
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.glass = None                  # break-glass mode, while it's on: the config entry
+        self.held = set()                  # teammates' holds this agent's been stopped by once (hold_check)
         self.glass_ended = None            # set at start-up when it ended while hobkin wasn't running
         self.glass_extension = None
         self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
@@ -1713,6 +1782,7 @@ class Agent:
             self.glass = None
             if self.state.pop("break_glass", None):          # it was on: end it properly now
                 self.glass_log = self.state.get("glass_log", "")
+                self.release_holds(self.state.get("glass_incident"))
                 how = " (switched off)" if not g else ""
                 if self.glass_log and os.path.exists(self.glass_log):
                     with open(self.glass_log, "a", encoding="utf-8") as f:
@@ -1728,7 +1798,7 @@ class Agent:
                       "end time changed outside `hobkin breakglass` (an edit of config.json)")
             self.glass_extension = f"{change}: now until {when_text(float(g['until']))}"
         self.state["glass_seen"] = {"declared": g["declared"], "until": g["until"], "extensions": g.get("extensions", 0)}
-        self.glass_log = os.path.join(self.work, time.strftime("incident-%Y%m%d-%H%M.md", time.localtime(float(g["declared"]))))
+        self.glass_log = glass_log_path(self.dir, g)
         if not os.path.exists(self.glass_log):
             os.makedirs(self.work, exist_ok=True)
             write_atomic(self.glass_log, f"# Incident: {g['reason']}\n\nDeclared by {g.get('by', '?')} at "
@@ -1736,6 +1806,7 @@ class Agent:
                                          "## Timeline (written by hobkin)\n\n")
         self.state["break_glass"] = f"on until {when_text(float(g['until']))}: {g['reason']}"
         self.state["glass_log"] = self.glass_log
+        self.state["glass_incident"] = g.get("incident")
         if getattr(self, "glass_extension", None):
             self.timeline(f"break-glass {self.glass_extension}")
             self.alert(f"hobkin {self.id}: break-glass {self.glass_extension} ({g['reason']})")
@@ -1750,9 +1821,90 @@ class Agent:
             with open(self.glass_log, "a", encoding="utf-8") as f:
                 f.write(f"- {time.strftime('%H:%M:%S')} {line}\n")
 
+    # --- a shared incident: teammates, their news, holds
+    def incident_team(self) -> list[tuple[str, dict, str]]:
+        """The other agents on this incident, still in break-glass mode: (id, their break_glass entry, timeline)."""
+        name = (self.glass or {}).get("incident")
+        if not name:
+            return []
+        return [(i, g, log) for i, g, log in incident_members(name) if i != self.id]
+
+    def team_news(self) -> list[str]:
+        """What teammates have done since this agent last looked (their timelines, less what they were told)."""
+        lines, seen = [], self.state.setdefault("team_seen", {})
+        for i, _, log in self.incident_team():
+            size = os.path.getsize(log) if os.path.exists(log) else 0
+            start = seen.get(log)
+            if start is None or start > size:                 # new teammate: the last few lines, not its history
+                start = max(0, size - 1500)
+            if size > start:
+                with open(log, encoding="utf-8", errors="replace") as f:
+                    f.seek(start)
+                    new = [l for l in f.read().splitlines() if l.startswith("- ") and " told" not in l[:20]]
+                lines += [f"- {i} {clip(l[2:], 300, 80)}" for l in new]
+            seen[log] = size
+        if not lines:
+            return []
+        more = len(lines) - 15
+        lines = lines[-15:] if more > 0 else lines
+        return [TEAM_NEWS.format(stamp=self.stamp(), lines=(f"(... {more} more in their timelines)\n" if more > 0 else "")
+                                 + "\n".join(lines))]
+
+    def tool_hold(self, inp: dict) -> ToolResult:
+        name = self.glass["incident"]
+        if inp.get("release") is not None:
+            n = int(inp["release"])
+            mine = lambda h: h["n"] == n and h["by"] == self.id
+            if not any(mine(h) for h in edit_holds(name, None)):
+                return f"You have no hold #{n}.", True
+            edit_holds(name, lambda hs: [h for h in hs if not mine(h)])
+            self.timeline(f"released hold #{n}")
+            return f"Hold #{n} released.", False
+        if not inp.get("what"):
+            holds = edit_holds(name, None)
+            return ("\n".join(f"#{h['n']} {h['by']}: {h['what']}  /{h['match']}/" for h in holds) or "No holds."), False
+        if not inp.get("match"):
+            return "Give `match`: a regular expression for the commands that would disturb it.", True
+        try:
+            re.compile(inp["match"])
+        except re.error as e:
+            return f"`match` isn't a valid regular expression: {e}", True
+        hold = {"by": self.id, "what": str(inp["what"]), "match": str(inp["match"]), "set": time.time()}
+        def add(hs):
+            hold["n"] = max([h["n"] for h in hs] + [0]) + 1
+            return hs + [hold]
+        edit_holds(name, add)
+        self.timeline(f"hold #{hold['n']}: {hold['what']} (/{hold['match']}/)")
+        return (f"Hold #{hold['n']} set. Teammates' commands matching /{hold['match']}/ are stopped once and shown it. "
+                f"Release it when you're done: hold {{\"release\": {hold['n']}}}."), False
+
+    def hold_check(self, command: str) -> ToolResult | None:
+        """A command that matches a teammate's hold: stopped once with the hold shown; the same command again goes
+        through, on the record (both timelines) and alerted. None: go ahead."""
+        name = (self.glass or {}).get("incident")
+        if not name:
+            return None
+        held = next((h for h in edit_holds(name, None) if h["by"] != self.id and re.search(h["match"], command)), None)
+        if not held:
+            return None
+        key = f"{held['by']}#{held['n']}:" + hashlib.sha256(command.strip().encode()).hexdigest()[:16]
+        if key not in self.held:
+            self.held.add(key)
+            self.timeline(f"stopped by {held['by']}'s hold #{held['n']}: `{clip(command.strip(), 200, 60)}`")
+            return HELD.format(by=held["by"], n=held["n"], when=when_text(held["set"]), what=held["what"],
+                               match=held["match"], me=self.id), True
+        self.timeline(f"OVERRODE {held['by']}'s hold #{held['n']} ({held['what']}): `{clip(command.strip(), 200, 60)}`")
+        self.alert(f"hobkin {self.id}: overrode {held['by']}'s hold #{held['n']} ({held['what']})")
+        return None
+
+    def release_holds(self, name) -> None:
+        if name:
+            edit_holds(name, lambda hs: [h for h in hs if h["by"] != self.id])
+
     def end_glass(self) -> None:
         """Break-glass time is up: back to normal (re-sandboxed, if it was in safe mode), and asked for a summary."""
         log = self.glass_log
+        self.release_holds(self.glass.get("incident"))
         self.timeline("break-glass mode ended")
         self.glass = None
         self.state.pop("break_glass", None)
@@ -1962,6 +2114,11 @@ class Agent:
                                             lifted=" (and safe mode is lifted)" if self.cfg.get("safe_mode") else ""))
             if g.get("salvage"):
                 parts.append(SALVAGE)
+            if g.get("incident"):
+                team = self.incident_team()
+                members = "\n".join(f"- **{i}**: {'salvage' if t.get('salvage') else t.get('reason')}; its timeline: "
+                                     f"{log}" for i, t, log in team) or "- (no one else right now)"
+                parts.append(TEAM.format(incident=g["incident"], members=members, me=self.id))
         skills = find_skills(self.dir, self.cfg.get("skill_dirs") or [])
         if not skills and not getattr(self, "glass", None):
             parts.append(NO_WORK_SYSTEM)
@@ -2178,7 +2335,8 @@ class Agent:
 
     def tools(self) -> list[dict]:
         """What the model is offered: the built-in tools, then the agent's own."""
-        return TOOLS + self.own_tools()[0]
+        team = [HOLD_TOOL] if getattr(self, "glass", None) and self.glass.get("incident") else []
+        return TOOLS + team + self.own_tools()[0]
 
     def run_own_tool(self, run: str, inp: dict) -> ToolResult:
         """One of the agent's own tools: its `run`, with the input as JSON on stdin, run as a bash command
@@ -2369,7 +2527,7 @@ class Agent:
         """Each command is its own bash process, so a hung or crashed one can't take the shell
         with it. The shell still behaves like one that persists: the first runs as a login shell,
         and every command starts from the state the last one left (shell.sh)."""
-        refused = self.announce_check(command, announced)
+        refused = self.hold_check(command) or self.announce_check(command, announced)
         if refused:
             self.log("$", f"(not run) {command}")
             return refused
@@ -3071,6 +3229,7 @@ class Agent:
             "view_image": lambda: self.view_image(s("path")),
             "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
             "web_search": lambda: self.web_search(s("query")),
+            **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
         }
         if name not in tools:
             runs = self.own_tools()[1]
@@ -3404,11 +3563,15 @@ class Agent:
             else:
                 content, err = self.run_tool(b.get("name"), b.get("input") or {})
                 if not err and b.get("name") in ("write_file", "edit_file"):
-                    self.timeline(f"{'wrote' if b['name'] == 'write_file' else 'edited'} {(b.get('input') or {}).get('path')}")
+                    path = str((b.get("input") or {}).get("path"))
+                    full = os.path.realpath(self.resolve(path))
+                    outside = not (full + os.sep).startswith(os.path.realpath(self.work) + os.sep)
+                    self.timeline(f"{'wrote' if b['name'] == 'write_file' else 'edited'} {path}"
+                                  + (" (outside the workspace)" if outside else ""))
                 content = self.tool_nudges(b.get("name"), b.get("input") or {}, content, err)
             results.append({"type": "tool_result", "tool_use_id": b["id"], "content": content, "is_error": err})
         # Reminders that came due and operator messages that came in meanwhile ride along
-        for text in self.due_events():
+        for text in self.due_events() + self.team_news():
             results.append({"type": "text", "text": text})
         # Count what just came back (about 4 characters a token) before the next request, so a huge output
         # is compacted around instead of sent: the API only reports the real number after the fact
@@ -3539,7 +3702,8 @@ class Agent:
                     self.poll_input(max(0.0, min(30.0, idle_since + every - time.time())))
                     if not self.pending and not self.paused and time.time() - idle_since >= every:
                         self.log("hobkin", "idle prompt (incident)")
-                        self.add_user(GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp()), record=False)
+                        self.add_user("\n\n".join([GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp())]
+                                                    + self.team_news()), record=False)
                         idle_since = time.time()
                     continue
                 if self.cfg.get("wake") and not self.paused:
@@ -3726,7 +3890,7 @@ def service_states(names):
     return out
 
 
-# ---- command line: send, chat, list, main
+# ---- command line: send, chat, the watch screen, list, breakglass, pack, main
 
 def valid_id(agent_id):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id or ""):
@@ -3757,7 +3921,7 @@ def cmd_send(agent_id, text):
 
 # Out-log entries that are tool calls (chat shows them as one line): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full.
-TOOL_WHO = ({"$", "=", "job", "reminder"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
+TOOL_WHO = ({"$", "=", "job", "reminder", "hold"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
 
 
 # Colour in chat (only on a terminal, and not with NO_COLOR set): who's talking, `code` and file
@@ -3962,6 +4126,187 @@ def cmd_list():
         status = (st.get("status") or "?") if is_running(d) else "stopped"
         last = [l for l in read(os.path.join(d, "out")).splitlines() if l and not l.startswith("    ")][-1:]
         print(f"{name:10} {status:8} {services.get(name, ''):18} {st.get('model', '')[:40]:40} {last[0][:60] if last else ''}")
+
+
+# The watch screen (hobkin watch): one terminal for every agent on an incident, each in its own hobkin colour
+# (256-colour: amber, teal, violet, rose, lime, sky, sand, orchid), with risky-looking commands flagged. Bash
+# commands' effects can't be seen from here, so their flags are guesses from the command line ("looks like").
+WATCH_COLORS = (214, 44, 141, 204, 113, 75, 222, 168)
+RISKY = (("privileged", r"\bsudo\b|\bsu\s+-|\bdoas\b"),
+         ("deletes", r"\brm\s|\btruncate\b|\bshred\b|\bdd\s|\bDROP\s|\bDELETE\s+FROM\b"),
+         ("service change", r"\bsystemctl\s+(restart|stop|start|kill|disable|enable|reload|mask)\b|\bservice\s+\S+\s+(restart|stop)\b"
+                            r"|\bp?kill(all)?\b|\bdocker\s+(restart|stop|kill|rm)\b|\bkubectl\s+(delete|scale|rollout|apply|edit|drain)\b"
+                            r"|\breboot\b|\bshutdown\b"),
+         ("leaves the machine", r"\baws\s+s3\s+(cp|sync|mv)\b|\bgsutil\s+(cp|rsync)\b|\brclone\b|\bscp\b|\bssh\b|\brsync\b.*\S:"
+                                r"|\bcurl\b.*(-X\s*(POST|PUT|DELETE|PATCH)|\s-d\s|--data|-T\s|--upload-file)|\bgit\s+push\b"),
+         ("writes outside", r"(?<![<>&0-9])>{1,2}\s*/(?!dev/null|tmp/)|\btee\s+(-a\s+)?/(?!dev/null|tmp/)"),
+         ("changes config", r"\bsed\s+-i\b|\bchmod\b|\bchown\b|\biptables\b|\bnft\b|\bufw\b|\bcrontab\b"))
+OUT_HEADER = re.compile(r"^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) ([^\s>]+)> ?(.*)$")
+
+
+def risky(command: str) -> list[str]:
+    """What a command line looks like it does that's worth a look (RISKY), for the watch screen."""
+    return [label for label, rx in RISKY if re.search(rx, command)]
+
+
+def watch_agents(ids: list[str], incident: str | None) -> tuple[list[str], set[str]]:
+    """Who the watch screen shows: the agents named, everyone on their incidents (or on --incident), and with
+    no one named, every agent in break-glass mode (else every agent). Also the incidents involved."""
+    names = [n for n in sorted(os.listdir(HOME)) if not n.startswith("_") and os.path.isdir(os.path.join(HOME, n))] \
+        if os.path.isdir(HOME) else []
+    def glass(n):
+        try:
+            g = json.loads(read(os.path.join(HOME, n, "config.json")) or "{}").get("break_glass") or {}
+        except json.JSONDecodeError:
+            return {}
+        return g if float(g.get("until") or 0) > time.time() else {}
+    chosen = list(ids) or ([] if incident else [n for n in names if glass(n)] or names)
+    incidents = ({incident} if incident else set()) | {glass(n).get("incident") for n in chosen} - {None}
+    for name in sorted(incidents):
+        chosen += [i for i, _, _ in incident_members(name) if i not in chosen]
+    return chosen, incidents
+
+
+def watch_screen(ids: list[str], incident: str | None, width: int, height: int, color: bool) -> str:
+    """The watch screen, once: a banner per agent (break glass, safe mode, who it acts as, time left, spend, what
+    it's doing), the incident's holds, one feed merged from their timelines (or out logs), totals, the controls."""
+    import pwd
+    now = time.time()
+    agents, incidents = watch_agents(ids, incident)
+    def paint_(text, *codes):
+        return f"\x1b[{';'.join(map(str, codes))}m{text}\x1b[0m" if color and codes else text
+    hue = {a: WATCH_COLORS[i % len(WATCH_COLORS)] for i, a in enumerate(agents)}
+    tag = lambda a: paint_(f"{a:<{min(12, max(map(len, agents or ['']))) }}", 1, 38, 5, hue[a])
+    def fit(line, plain_len):                           # clip to the width, counting only what shows (colours kept)
+        if plain_len <= width:
+            return line
+        out, shown = [], 0
+        for part in re.split(r"(\x1b\[[0-9;]*m)", line):
+            if part.startswith("\x1b["):
+                out.append(part)
+            elif shown + len(part) >= width:
+                out.append(part[:width - 1 - shown] + "…")
+                break
+            else:
+                out.append(part)
+                shown += len(part)
+        return "".join(out) + ("\x1b[0m" if color else "")
+    lines, feed = [], []
+    title = "hobkin watch" + (f" · incident {', '.join(sorted(incidents))}" if incidents else "") + \
+        f" · {time.strftime('%H:%M:%S')}"
+    lines.append(fit(paint_(f" {title} ".ljust(width), 1, 38, 5, 16, 48, 5, 214), width))
+    totals = {"commands": 0, "file changes": 0, "outside the workspace": 0, "flagged": 0, "stopped by a hold": 0,
+              "holds overridden": 0}
+    for a in agents:
+        d = os.path.join(HOME, a)
+        try:
+            shared = json.loads(read(os.path.join(SHARED, "config.json")) or "{}")
+            own = json.loads(read(os.path.join(d, "config.json")) or "{}")
+            st = json.loads(read(os.path.join(d, "state.json")) or "{}")
+        except json.JSONDecodeError:
+            shared, own, st = {}, {}, {}
+        cfg = {**shared, **own}
+        g = cfg.get("break_glass") or {}
+        g = g if float(g.get("until") or 0) > now else {}
+        running = is_running(d)
+        try:
+            user = pwd.getpwuid(os.stat(d).st_uid).pw_name
+        except (KeyError, OSError):
+            user = "?"
+        tail = read(os.path.join(d, "out"))[-30000:].splitlines()
+        heads = [m for m in map(OUT_HEADER.match, tail) if m]
+        doing = (st.get("status") or "?") if running else "stopped"
+        if running and heads and heads[-1].group(3) == "$":
+            started = time.mktime(time.strptime(heads[-1].group(1) + " " + heads[-1].group(2), "%Y-%m-%d %H:%M:%S"))
+            doing = f"running `{clip(heads[-1].group(4), 60, 20)}` ({span_text(now - started)})"
+        if g:
+            left = int(float(g["until"]) - now)
+            badge = paint_(" SALVAGE " if g.get("salvage") else " BREAK GLASS ", 1, 97, 41)
+            flags = ["NO APPROVALS", "SAFE MODE LIFTED" if cfg.get("safe_mode") else "NO SANDBOX", f"acting as {user}",
+                     f"ends in {left // 3600}:{left // 60 % 60:02}:{left % 60:02}",
+                     f"${st.get('glass_spend', 0) if st.get('glass_spend_day') == time.strftime('%Y-%m-%d') else 0:.2f}"
+                     + (f" of ${g['budget']}" if g.get("budget") else "")]
+            plain = f" {a}  {' SALVAGE ' if g.get('salvage') else ' BREAK GLASS '} " + " · ".join(flags)
+            lines.append(fit(f" {tag(a)} {badge} " + paint_(" · ".join(flags), 1, 91), len(plain)))
+            sub = f"   {g['reason']}  ·  {doing}"
+        else:
+            plain = f" {a}  normal · safe mode {'on' if cfg.get('safe_mode') else 'off'} · as {user}"
+            lines.append(fit(f" {tag(a)} " + paint_(plain[len(a) + 3:], 2), len(plain)))
+            sub = f"   {doing}"
+        lines.append(fit(paint_(sub, 2), len(sub)))
+        log = glass_log_path(d, g) if g else None
+        if log and os.path.exists(log):
+            for l in read(log).splitlines():
+                m = re.match(r"^- (\d\d:\d\d:\d\d) (.*)$", l)
+                if m:
+                    feed.append((m.group(1), a, m.group(2)))
+        else:
+            feed += [(m.group(2), a, ("`" + m.group(4) + "`") if m.group(3) == "$" else f"{m.group(3)}: {m.group(4)}")
+                     for m in heads if m.group(3) not in ("=",)][-200:]
+    holds = [h for name in sorted(incidents) for h in edit_holds(name, None)]
+    if holds:
+        lines.append(paint_(" holds", 1, 93))
+        for h in holds:
+            t = f"   #{h['n']} {h['by']}: {h['what']}  /{h['match']}/"
+            lines.append(fit(paint_(t, 93), len(t)))
+    lines.append(paint_("─" * width, 2))
+    shown = []
+    for t, a, text in sorted(feed, key=lambda x: x[0]):
+        style, note = (), ""
+        if text.startswith("`"):
+            totals["commands"] += 1
+            labels = risky(text)
+            if labels:
+                totals["flagged"] += 1
+                style, note = (1, 91), "  ⚑ looks like: " + ", ".join(labels)
+        elif text.startswith(("wrote ", "edited ")):
+            totals["file changes"] += 1
+            if "(outside the workspace)" in text:
+                totals["outside the workspace"] += 1
+                style, note = (1, 91), "  ⚑"
+        elif text.startswith("OVERRODE"):
+            totals["holds overridden"] += 1
+            style = (1, 97, 41)
+        elif text.startswith("stopped by"):
+            totals["stopped by a hold"] += 1
+            style = (93,)
+        elif text.startswith(("hold #", "released hold", "break-glass")):
+            style = (93,)
+        elif text.startswith(("told", "said:")):
+            style = (2,) if text.startswith("told") else ()
+        plain = f" {t} {a:<{min(12, max(map(len, agents)))}} {text}{note}"
+        shown.append(fit(f" {paint_(t, 2)} {tag(a)} {paint_(text + note, *style)}", len(plain)))
+    totals_line = " " + " · ".join(f"{v} {k}" for k, v in totals.items())
+    controls = [f" end it: hobkin breakglass {agents[0] if len(agents) == 1 else 'ID'} --off   stop now: hobkin send "
+                f"{agents[0] if len(agents) == 1 else 'ID'} /stop   Ctrl-C leaves this screen"] if agents else []
+    room = max(3, height - len(lines) - 3 - len(controls))
+    return "\n".join(lines + shown[-room:] + [paint_("─" * width, 2), fit(paint_(totals_line, 1), len(totals_line))]
+                     + [fit(paint_(c, 2), len(c)) for c in controls]) + "\n"
+
+
+def cmd_watch(argv):
+    """hobkin watch [ID ...] [--incident NAME] [--once]: the watch screen, redrawn every second (--once: print it once)."""
+    pos, opts = split_args(argv, {"--once"}, {"--incident"})
+    ids = [valid_id(i) for i in pos]
+    for i in ids:
+        if not os.path.isdir(os.path.join(HOME, i)):
+            sys.exit(f"hobkin: no agent {i}")
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    if opts.get("--once") or not sys.stdout.isatty():
+        size = shutil.get_terminal_size((120, 50))
+        return sys.stdout.write(watch_screen(ids, opts.get("--incident"), size.columns, size.lines, color))
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")               # the terminal's other screen, no cursor
+    try:
+        while True:
+            size = shutil.get_terminal_size((120, 50))
+            sys.stdout.write("\x1b[H\x1b[2J" + watch_screen(ids, opts.get("--incident"), size.columns, size.lines - 1, color))
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
 
 
 def models_text(model: Model) -> str:
@@ -4344,33 +4689,48 @@ def cmd_pack(argv):
 
 
 def cmd_breakglass(argv):
-    """hobkin breakglass ID ["what's wrong"] [--for 2h] [--budget DOLLARS|none] [--off]
-    With nothing said about what's wrong, it's a salvage: save what can't be replaced (SALVAGE)."""
-    pos, opts = split_args(argv, {"--off"}, {"--for", "--budget"})
-    if not (len(pos) == 1 if opts.get("--off") else len(pos) in (1, 2)):
-        sys.exit('usage: hobkin breakglass ID ["what\'s wrong"] [--for 2h] [--budget DOLLARS|none]\n'
+    """hobkin breakglass ID ["what's wrong"] [--for 2h] [--budget DOLLARS|none] [--with ID,ID] [--off]
+    With nothing said about what's wrong, it's a salvage: save what can't be replaced (SALVAGE). --with makes it
+    one incident shared with those agents (joining theirs if they're on one; declaring it for them if they aren't)."""
+    pos, opts = split_args(argv, {"--off"}, {"--for", "--budget", "--with"})
+    if not (len(pos) == 1 and not opts.get("--with") if opts.get("--off") else len(pos) in (1, 2)):
+        sys.exit('usage: hobkin breakglass ID ["what\'s wrong"] [--for 2h] [--budget DOLLARS|none] [--with ID,ID]\n'
                  '       hobkin breakglass ID --off')
     agent_id = valid_id(pos[0])
-    d = os.path.join(HOME, agent_id)
-    if not os.path.isdir(d):
-        sys.exit(f"hobkin: no agent {agent_id}")
-    path = os.path.join(d, "config.json")
-    cfg = json.loads(read(path) or "{}")
+    team = [valid_id(t) for t in (opts.get("--with") or "").split(",") if t.strip() and t.strip() != agent_id]
+    for t in [agent_id] + team:
+        if not os.path.isdir(os.path.join(HOME, t)):
+            sys.exit(f"hobkin: no agent {t}")
+    path = lambda t: os.path.join(HOME, t, "config.json")
+    config = lambda t: json.loads(read(path(t)) or "{}")
+    def save(t, cfg):
+        write_atomic(path(t), json.dumps(cfg, indent=2) + "\n")
+        if is_running(os.path.join(HOME, t)):
+            restart_running(t)          # picks it up (conversation kept)
+        else:
+            print(f"{t} isn't running: it applies when it starts (hobkin {t})")
     if opts.get("--off"):
+        cfg = config(agent_id)
         if not cfg.pop("break_glass", None):
             return print(f"{agent_id}: not in break-glass mode")
-        write_atomic(path, json.dumps(cfg, indent=2) + "\n")
         print(f"{agent_id}: break-glass mode off")
-    else:
-        try:
-            seconds = parse_duration(opts.get("--for") or "2h")
-        except ValueError as e:
-            sys.exit(f"hobkin: --for: {e}")
-        now = time.time()
-        who = os.environ.get("USER") or os.environ.get("LOGNAME") or "someone"
-        old = cfg.get("break_glass") or {}
-        if float(old.get("until") or 0) <= now:     # one that's run out is over: this is a new incident
-            old = {}
+        return save(agent_id, cfg)
+    try:
+        seconds = parse_duration(opts.get("--for") or "2h")
+    except ValueError as e:
+        sys.exit(f"hobkin: --for: {e}")
+    now = time.time()
+    who = os.environ.get("USER") or os.environ.get("LOGNAME") or "someone"
+    def on(t):                                      # its break glass, if it's on (one that's run out is over)
+        g = config(t).get("break_glass") or {}
+        return g if float(g.get("until") or 0) > now else {}
+    names = {on(t).get("incident") for t in [agent_id] + team} - {None}
+    if len(names) > 1:
+        sys.exit(f"hobkin: those agents are on different incidents ({', '.join(sorted(names))}); end one first")
+    incident = next(iter(names), None) or (f"{time.strftime('%Y%m%d-%H%M')}-{agent_id}" if team else None)
+
+    def declare(t):
+        cfg, old = config(t), on(t)
         if len(pos) == 2:
             reason, salvage = pos[1], False
         elif old:                                   # an extension that says nothing new: as it was
@@ -4378,19 +4738,34 @@ def cmd_breakglass(argv):
         else:
             reason, salvage = "no guidance given: salvage what can't be replaced", True
         g = {"reason": reason, "by": old.get("by", who), "declared": old.get("declared", now), "until": now + seconds}
+        for k in ("budget", "incident"):            # an extension keeps its budget and its incident
+            if k in old:
+                g[k] = old[k]
         if salvage:
             g["salvage"] = True
         if old:                                     # an extension: counted and attributed (and alerted at restart)
             g.update({"extensions": int(old.get("extensions", 0)) + 1, "extended_by": who})
         if opts.get("--budget"):
             g["budget"] = None if opts["--budget"].lower() == "none" else float(opts["--budget"])
+        if incident:
+            g["incident"] = incident
         cfg["break_glass"] = g
-        write_atomic(path, json.dumps(cfg, indent=2) + "\n")
-        print(f"{agent_id}: break-glass mode until {when_text(g['until'])}: {g['reason']}")
-    if is_running(d):
-        restart_running(agent_id)      # picks it up (conversation kept)
-    else:
-        print(f"{agent_id} isn't running: it applies when it starts (hobkin {agent_id})")
+        print(f"{t}: break-glass mode until {when_text(g['until'])}: {g['reason']}"
+              + (f" (incident {incident})" if incident else ""))
+        save(t, cfg)
+
+    declare(agent_id)
+    for t in team:
+        g = on(t)
+        if not g:
+            declare(t)
+        elif g.get("incident") != incident:         # on already, by itself: it joins, as it is
+            cfg = config(t)
+            cfg["break_glass"]["incident"] = incident
+            print(f"{t}: joins incident {incident} ({g['reason']})")
+            save(t, cfg)
+        else:
+            print(f"{t}: already on incident {incident}")
 
 
 def main(argv):
@@ -4408,6 +4783,8 @@ def main(argv):
         return cmd_breakglass(argv[1:])
     if argv[:1] == ["pack"]:
         return cmd_pack(argv[1:])
+    if argv[:1] == ["watch"]:
+        return cmd_watch(argv[1:])
     if argv[:1] == ["models"]:
         return cmd_models(argv[1:])
     if argv and (argv[0].startswith(("http://", "https://")) or "--hearthboard" in argv):
