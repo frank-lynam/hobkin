@@ -1,7 +1,7 @@
 # Working on hobkin
 
 - **Finding your way:** `grep -n '^# ----' hobkin.py` lists its sections (settings, tools,
-  nudges, helpers, config, model api, agent, service, command line), and `grep -n '    # --- '`
+  nudges, helpers, config, safe mode, web, model api, agent, service, command line), and `grep -n '    # --- '`
   the Agent's parts. Read the section you need with an offset rather than the whole file.
   New code goes in the section it belongs to; keep the map at the top in step.
 - **One file, standard library only:** `hobkin.py`. No third-party packages, no

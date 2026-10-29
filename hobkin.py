@@ -13,7 +13,7 @@ line, or as a worker on hearthboard.
     hobkin send ID TEXT    message an agent (queued if it isn't running)
     hobkin list            list agents
     hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
-    hobkin breakglass ID "what's wrong" [--for 2h]   an incident: the agent acts fully on its own (--off ends it)
+    hobkin breakglass ID "what's wrong" [--for 2h] [--budget $]   an incident: the agent acts fully on its own (--off ends it)
     hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
     hobkin breakglass ID ["what's wrong"] --with ID2,ID3   one incident, shared: they see each other's work and holds
     hobkin watch [ID ...]   one screen for an incident: every agent on it, what they're doing, risky-looking commands
@@ -44,8 +44,9 @@ Each agent lives in ~/.hobkins/ID/ (or $HOBKIN_HOME/ID/):
     out             what it says and does:     tail -F out
     context.jsonl   exactly what the model sees: the system prompt, then one message per line
     MEMORY.md       the agent's own notes; part of its instructions, kept across compaction
-    state.json      model, context size, status, pid
-    work/           its working directory
+    state.json      model, context size, status, what it's busy with, pid
+    work/           its working directory (work/tools/: tools it made itself)
+    config.json, secrets.env, reminders.json, archive/, skills/   (see README.md)
 
 Instructions are the .md files in ~/.hobkins/_shared/ and the agent's folder
 (an agent's own file replaces the shared one of the same name). Settings:

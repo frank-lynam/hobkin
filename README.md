@@ -130,7 +130,8 @@ set, it's plain text. Its replies appear as they come, and each tool call as one
 read, a failed exit status), without its output; `hobkin chat ID --full` shows the
 output too, as the `out` file has it. Each line you type (or paste) is sent;
 `/stop` and the other commands work, and Ctrl-D leaves. Output never wipes out
-what you're typing (the line is redrawn below it), and you get the usual line
+what you're typing: the line is redrawn below it, with the cursor where you left
+it, even mid-edit. You get the usual line
 editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
 ←/→, Ctrl-R to search. Piped, it sends the
 input, prints the reply and exits: `echo "status?" | hobkin chat bodkin`.
@@ -157,7 +158,7 @@ tmux, or a systemd user service.
 | `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 80 lines, it's told to prune. |
 | `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 30 lines, it's told to keep the best. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
-| `work/` | Its working directory. |
+| `work/` | Its working directory. `work/tools/` holds tools it made itself (see "Its tools"); in break-glass mode, `work/incident-*.md` is the incident's timeline. |
 | `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |
 | `shell.sh` | Its shell's saved state (folder, variables, functions, aliases), restored before each command. Secrets are never saved here. |
 | `secrets.env` | Optional `KEY=value` lines, set as environment variables in its shell (never put in its context). |
@@ -165,13 +166,17 @@ tmux, or a systemd user service.
 | `*.md` | Optional per-agent instructions; replace shared files of the same name. |
 | `archive/` | At each compaction, the old conversation (`context-*.jsonl`, messages only) and its `out` log (`out-*.log`). Deleted after 30 days, except the newest. |
 | `jobs/` | Background jobs' output and exit codes; a finished job's folder goes after 30 days. |
+| `skills/` | Its own skills (a hearthboard worker's board skill goes here). |
+| `.chat_history` | What you've typed in `hobkin chat` (↑ brings it back). |
+| `hobkin.log` | Start-up errors, when it was started in the background without systemd. |
 | `queue`, `lock` | Messages sent while it was stopped; the process lock. |
 
 `~/.hobkins/_shared/` holds what all agents share: `config.json`, `AGENTS.md` (how
 to work as a hobkin: a task routine with checklists, failure handling,
 organization, memory and tidying up; created on first run, edit freely: it's never
 overwritten, so new defaults reach it only if you delete it), an optional `SOUL.md`,
-any other `.md` instructions, and `secrets.env`.
+any other `.md` instructions, `secrets.env`, `keys/` (API keys from setup, readable
+only by you) and `skills/`. `~/.hobkins/_incidents/` holds shared incidents' holds.
 
 **The system prompt** is:
 
@@ -252,12 +257,13 @@ line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
-| `/model [NAME]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Saved in the agent's `config.json`, so it lasts; happens between steps. |
+| `/model [NAME]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
 | `/models` | List the models the agent's API offers (the one in use starred), with their context windows. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
+| `/hello [FOLDER]` | Sent by `hobkin chat` as it opens (not logged): the agent says hello, and is told the folder you opened the chat in. |
 | `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |
 
-`hobkin chat ID` puts both in one terminal (see Quick start). `hobkin list` shows all agents, their status and their last line of output.
+`hobkin chat [ID]` puts both in one terminal (see "The long way"). Commands work while the model is thinking, too: the call runs in the background. `hobkin list` shows all agents, their status and their last line of output.
 
 ## Models
 
@@ -289,7 +295,8 @@ are; if it's left out and there's only one model, that one is used.
   `key_file`. It's removed from the agent's shell environment.
 - `headers` (optional): extra HTTP headers.
 - `thinking` (optional): `"adaptive"`, a token budget (`8000`), or the API's own
-  object. Anthropic only; it must be smaller than `max_output_tokens`.
+  object. Anthropic only; a budget must be smaller than the `max_tokens` sent
+  (`max_output_tokens`, or 16,000 when that is unset).
 - `effort` (optional): `"low"` to `"max"`. It goes to Anthropic as
   `output_config.effort`, to OpenRouter as `reasoning.effort`, and to other
   OpenAI-style APIs as `reasoning_effort`.
@@ -784,8 +791,10 @@ with a `requests_per_minute` you're happy with.
 
 ## The hobkin
 
-The default AGENTS.md makes a hobkin a relentlessly cheerful, work-greedy,
-cheeky little house spirit:
+The default AGENTS.md makes a hobkin a relentlessly, gleefully cheerful,
+work-greedy, cheeky little house spirit: a new bug report is a present to
+unwrap, a fixed bug is a holiday, and a nasty problem gets "ooh, now THIS is a
+good one!"
 - **Forgiveness over permission.** It acts, then says what it did.
 - **Good enough beats better.** It ships the working version and moves on.
 - **The opposite of a yes-man.** It laughs at bad ideas, its own included, and
@@ -804,6 +813,8 @@ behaviour matters:
   reads like a committee wrote it", once per turn.
 - **A file read only partly** ends with how many lines are still unread, so the
   agent doesn't fill the rest in from imagination.
+- **A reply that stops mid-step** ("Let me check the logs." with no tool call)
+  gets "carry on", up to three times a turn (see "Empty replies and false stops").
 - **When a working turn ends,** there's one wrap-up check: did you report where
   the people are, any bloopers, more work to grab? It's sent once per turn, so
   it can't loop.
@@ -908,4 +919,19 @@ nothing and don't need a key. They cover both API styles:
 - `requests_per_minute` shared across two agents;
 - reminders (firing while idle, arriving mid-command with that command's result,
   validation, list and cancel, the prompt section, late and repeating after a
-  restart, a broken `reminders.json`).
+  restart, a broken `reminders.json`);
+- chat: names, colour, the folder it's opened in, the spinner, typing while
+  replies land, picking a hobkin when none is named;
+- model calls: `max_tokens` only where it's set or required, 429s, fallbacks,
+  commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
+- break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
+  incident budget, shared incidents and holds, the watch screen;
+- the agent's own tools, `hobkin pack` and restoring a bundle, `hobkin purge`,
+  safe mode (where the kernel has Landlock) and systemd services (where there's
+  a user session).
+
+The fake API plays real-world trouble on cue: a word in a message makes it
+rate-limit (`ratelimit:SECONDS:MODE`, or `ratelimit@PORT:…` for one server),
+reply with nothing (`empty-reply`, `always-empty`), stop mid-step
+(`falsestop:`), think slowly (`slow:N`) or hiccup (`hiccup`). A message like
+`run: CMD` or `call: TOOL {json}` makes it call a tool.
