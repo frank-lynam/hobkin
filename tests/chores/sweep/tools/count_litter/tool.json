@@ -1,0 +1,1 @@
+{"description": "Count the litter in {{folder}}.", "input_schema": {"type": "object", "properties": {}}}

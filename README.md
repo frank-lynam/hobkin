@@ -549,6 +549,11 @@ job logs, with a private temp folder instead of `/tmp`.
   With no Landlock at all (an older kernel, it's turned off, or a container's
   security profile blocks it), a safe-mode agent won't start. It never runs
   unprotected.
+- **Extra folders it may write in:** `{"safe_mode": {"write": ["~/Downloads"]}}`,
+  for a chore that tidies a folder, say. Data folders only: the agent won't start
+  if one is your home folder or above it, a dot-folder in it (shell profiles,
+  `~/.config`, `~/.ssh`: ways out of the sandbox), or in or around hobkin's own
+  folder (where its config is), or doesn't exist.
 - **Not covered:** reading. Whatever it reads goes to the model provider, so run
   it as an account that can read only what it should. On kernels below 6.12, also
   run it as a separate user, so it can't signal your services' processes. Local
@@ -789,6 +794,50 @@ job running. Set `idle_prompt` to `null` to let it rest until a message or
 reminder arrives. Each nudge is a model call, so pair a short `idle_seconds`
 with a `requests_per_minute` you're happy with.
 
+**Or let a script keep watch.** With `"wake": {"command": "spells/check.sh",
+"every": "5m"}`, hobkin runs that command while the agent is idle (in its
+workspace, sandboxed in safe mode, with `secrets.env` and the chore's settings
+in its environment) and wakes the agent only when it prints something, or
+fails. Silence means all's well, so watching costs no model calls. The agent is
+told it has a watch, and that the script is its own to improve. (`wake.url` is
+the same idea for a work system: see "As a hearthboard worker".)
+
+## Chores
+
+A chore is a standing job you give a hobkin and leave it to: keep a folder
+tidy, watch a system's health, and so on. The collection lives in
+[hobkin-chores](https://github.com/frank-lynam/hobkin-chores); point hobkin at
+it and give a new or existing agent one:
+
+```sh
+hobkin --chore tidy --set folder=~/Downloads --id tidier --safe
+hobkin URL MODEL KEY --chore health-watch --chat       # a new agent on a new model
+```
+
+A chore is found by path, or by name in `_shared/chores/` and the folders in
+`"chore_dirs"` (in config). It's a folder:
+
+| File | What it is |
+|---|---|
+| `chore.json` | `name`, `description`, `settings` (each with an `about` and maybe a `default`; one without a default must be given with `--set`), and `config`: settings merged into the agent's `config.json` (a `wake` watch, `safe_mode` write folders, an idle prompt...). |
+| `CHORE.md` | Its instructions, copied into the agent's folder, so they're part of its instructions every turn. |
+| `tools/` | Tools for it (see "Its tools"), copied to `work/tools/`. |
+| `spells/` | Starter scripts, copied to `work/spells/`. |
+
+`{{setting}}` in `CHORE.md`, the config and tool descriptions is filled in, and
+each setting reaches commands, tools and the watch as `CHORE_<NAME>` (`folder`
+→ `$CHORE_FOLDER`). Setting up records the chore and its settings in the agent's
+`config.json` (`"chore"`) and tells the agent it has a new job. Running it again
+with other settings updates it.
+
+Every chore agent also gets the same rule of thumb: be **the sorcerer's
+apprentice, only wiser**. Write spells (scripts in `work/spells/`) instead of
+doing the chore by hand, and make one its watch so the chore mostly runs itself.
+Give every spell a counter-spell: a dry run, a limit, a clean stop. Never let
+the brooms multiply (no cron jobs, daemons or loops of its own). Keep a
+`SPELLBOOK.md`. Fix the spell, not just the mess, and put the flood in the
+blooper reel.
+
 ## The hobkin
 
 The default AGENTS.md makes a hobkin a relentlessly, gleefully cheerful,
@@ -926,6 +975,8 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
+- chores (settings, setting up, the watch staying quiet until there's work) and
+  safe mode's write folders;
 - the agent's own tools, `hobkin pack` and restoring a bundle, `hobkin purge`,
   safe mode (where the kernel has Landlock) and systemd services (where there's
   a user session).

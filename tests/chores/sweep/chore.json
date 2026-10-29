@@ -1,0 +1,12 @@
+{
+  "name": "sweep",
+  "description": "A test chore: keep a folder free of *.litter files.",
+  "settings": {
+    "folder": {"about": "the folder to keep swept"},
+    "pattern": {"default": "*.litter", "about": "what counts as litter"}
+  },
+  "config": {
+    "idle_prompt": null,
+    "wake": {"command": "spells/check.sh", "every": 10}
+  }
+}

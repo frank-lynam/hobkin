@@ -1,0 +1,2 @@
+#!/bin/sh
+find "$CHORE_FOLDER" -maxdepth 1 -name "$CHORE_PATTERN" | wc -l

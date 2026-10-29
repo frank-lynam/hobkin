@@ -1242,6 +1242,69 @@ try:
     check("[purge] stops the running agents and deletes the folder", not os.path.exists(h) and "alpha: stopped" in r.stdout
           and "beta: stopped" in r.stdout and p1.returncode is not None and p2.returncode is not None, r.stdout + r.stderr)
 
+    # chores: a standing job from a folder (settings, config, CHORE.md, tools, spells); its watch wakes it only when needed
+    h = home("chores", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
+    cenv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
+    chore = os.path.join(HERE, "chores", "sweep")
+    yard = os.path.join(BASE, "yard"); os.makedirs(yard)
+    r = subprocess.run([sys.executable, HOB, "--chore", chore, "--id", "sw", "--no-service"], env=cenv, capture_output=True, text=True, timeout=60)
+    check("[chore] a setting with no default must be given", r.returncode != 0 and "--set folder=... (the folder to keep swept)" in r.stderr, r.stderr)
+    r = subprocess.run([sys.executable, HOB, "--chore", chore, "--set", "colour=red", "--id", "sw", "--no-service"], env=cenv,
+                       capture_output=True, text=True, timeout=60)
+    check("[chore] an unknown setting is refused, with the known ones", r.returncode != 0 and "settings are folder, pattern" in r.stderr, r.stderr)
+    r = subprocess.run([sys.executable, HOB, "--chore", "nope", "--id", "sw", "--no-service"], env=cenv, capture_output=True, text=True, timeout=60)
+    check("[chore] an unknown chore name says where they're looked for", r.returncode != 0 and "no chore 'nope'" in r.stderr
+          and "chore_dirs" in r.stderr, r.stderr)
+    r = subprocess.run([sys.executable, HOB, "--chore", chore, "--set", f"folder={yard}", "--id", "sw", "--no-service"], env=cenv,
+                       capture_output=True, text=True, timeout=60)
+    d = os.path.join(h, "sw")
+    cfg = json.load(open(d + "/config.json"))
+    check("[chore] set up: its config merged, its settings recorded, CHORE.md filled in, tools and spells in the workspace",
+          r.returncode == 0 and f"sw: chore sweep (folder={yard}, pattern=*.litter)" in r.stdout
+          and cfg["wake"] == {"command": "spells/check.sh", "every": 10} and cfg["chore"]["settings"] == {"folder": yard, "pattern": "*.litter"}
+          and open(d + "/CHORE.md").read().startswith(f"# Sweep {yard}") and os.access(d + "/work/spells/check.sh", os.X_OK)
+          and json.load(open(d + "/work/tools/count_litter/tool.json"))["description"] == f"Count the litter in {yard}.",
+          r.stdout + r.stderr)
+    wait_for(d, "you've been given a chore: sweep", 20, file="context.jsonl")
+    sysp = ctx(d)[0]["content"]
+    check("[chore] its instructions: CHORE.md, the apprentice's rules, its settings (and their variables), its watch",
+          f"# Sweep {yard}" in sysp and "the sorcerer's apprentice" in sysp and f"folder = {yard} ($CHORE_FOLDER)" in sysp
+          and "runs `spells/check.sh` for you every 10s" in sysp, sysp[-1500:])
+    say(d, "run: echo folder=$CHORE_FOLDER pattern=$CHORE_PATTERN"); wait_for(d, f"Done. Output was: folder={yard} pattern=*.litter")
+    say(d, 'call: count_litter {}'); wait_for(d, "Done. Output was: 0")
+    check("[chore] its settings reach its commands and its tools", True)
+    time.sleep(14)                                       # a watch round or two with nothing to say
+    check("[chore] the watch stays quiet while all's well (no model calls)", "woken by" not in open(d + "/out").read())
+    open(os.path.join(yard, "a.litter"), "w").write("x"); open(os.path.join(yard, "b.litter"), "w").write("x")
+    wait_for(d, "woken by the watch", 30)
+    check("[chore] something to do: the watch wakes it with what it printed", f"2 pieces of litter in {yard}" in open(d + "/context.jsonl").read()
+          and "woken by your watch (`spells/check.sh`)" in open(d + "/context.jsonl").read())
+    subprocess.run([sys.executable, HOB, "send", "sw", "/stop"], env=cenv, timeout=30)
+    for _ in range(50):
+        if not hbk.is_running(d): break
+        time.sleep(0.2)
+    # safe mode can let commands write in named data folders, and never in the home folder, a dot-folder or hobkin's own
+    check("[safe] write folders: data folders only", hbk.safe_write_dirs([yard]) == ([os.path.realpath(yard)], None)
+          and hbk.safe_write_dirs(["~"])[1] and hbk.safe_write_dirs(["~/.config"])[1] and hbk.safe_write_dirs(["/"])[1]
+          and hbk.safe_write_dirs([hbk.HOME])[1] and hbk.safe_write_dirs([os.path.join(BASE, "nowhere")])[1])
+    if abi:
+        h = home("safewrite", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+                 {"idle_prompt": None, "safe_mode": {"write": [yard]}})
+        p, aid, d = start(h)
+        out_of_bounds = os.path.join(BASE, "not-the-yard.txt")
+        say(d, f"run: echo hi > {yard}/swept.txt; echo hi > {out_of_bounds}; echo tried")
+        wait_for(d, "Done. Output was")
+        check("[safe] a write folder is writable, everywhere else still isn't", os.path.exists(os.path.join(yard, "swept.txt"))
+              and not os.path.exists(out_of_bounds) and "Also writable: " + os.path.realpath(yard) in open(d + "/out").read(),
+              open(d + "/out").read()[-600:])
+        p.send_signal(signal.SIGTERM); p.wait(10)
+        h = home("safebad", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+                 {"idle_prompt": None, "safe_mode": {"write": ["~/.config"]}})
+        r = subprocess.run([sys.executable, HOB, "bad"], env={**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"},
+                           capture_output=True, text=True, timeout=30)
+        check("[safe] a write folder that's a way out (a dot-folder) stops the agent from starting", r.returncode != 0
+              and "won't let commands write in ~/.config" in r.stderr, r.stderr)
+
     # systemd user services (only where a user session exists; skipped on CI runners)
     if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0:
         h = home("svc", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake",
