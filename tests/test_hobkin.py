@@ -1194,6 +1194,19 @@ try:
     pump(lambda b: b"echo: slow:3 spin for me" in b)
     check("[chat] no name: the only running hobkin", f"chatting with {aid}".encode() in buf, buf[-300:])
     check("[chat] a spinner while it thinks", f"{aid} is thinking (".encode() in buf, buf[-600:])
+    for ch in "hello world":                                   # typing while a reply lands, then editing mid-line
+        os.write(fd, ch.encode()); time.sleep(0.05)
+        if ch == "o":
+            subprocess.Popen([sys.executable, HOB, "send", aid, "landing mid-typing"], env={**os.environ, "HOBKIN_HOME": h},
+                             stdout=subprocess.DEVNULL)
+    pump(lambda b: b"echo: landing mid-typing" in b); time.sleep(0.5)
+    os.write(fd, b"\x1b[D\x1b[D\x1b[DX\r")
+    wait_for(d, "operator> hello woXrld")
+    import readline as rl
+    unhook = hbk.readline_hook(rl, lambda lib: None)
+    check("[chat] typing survives a reply landing mid-line; output is drawn from readline's own input hook",
+          unhook is not None)
+    if unhook: unhook()
     os.write(fd, b"\x04"); os.waitpid(pid, 0)
     p.send_signal(signal.SIGTERM); p.wait(10)
 

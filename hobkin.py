@@ -4216,6 +4216,35 @@ def cmd_chat(agent_id, full=False):
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
+def readline_hook(readline, fn):
+    """Run fn() about ten times a second in the main thread while input() waits for keys: readline calls
+    PyOS_InputHook between keystrokes, the one moment it's safe to print and redraw its line (readline isn't
+    thread-safe). Set through ctypes; returns a function that removes it, or None where it can't be set."""
+    if not readline:
+        return None
+    try:
+        lib = ctypes.CDLL(readline.__file__)          # the module's handle finds the readline library it uses
+        lib.rl_on_new_line, lib.rl_forced_update_display  # (GNU readline; libedit may lack them)
+        slot = ctypes.c_void_p.in_dll(ctypes.pythonapi, "PyOS_InputHook")
+    except (OSError, AttributeError, ValueError):
+        return None
+    if slot.value:                                    # someone else's hook (a GUI toolkit): leave it be
+        return None
+    def call():
+        try:
+            fn(lib)
+        except Exception:                             # never let a drawing hiccup kill the chat
+            pass
+        return 0
+    hook = ctypes.CFUNCTYPE(ctypes.c_int)(call)
+    slot.value = ctypes.cast(hook, ctypes.c_void_p).value
+    def remove():
+        slot.value = None
+        keep.clear()
+    keep = [hook]                                     # the callback must outlive its use
+    return remove
+
+
 def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False):
     """The interactive side of chat: input() with readline, output from a background thread
     that clears the input line, prints, then redraws the prompt with what you'd typed."""
@@ -4244,26 +4273,46 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
             return f"{agent_id} is {b['what']} ({span_text(time.time() - float(b['since']))})"
         return f"{agent_id} is {status}" if status.startswith(("working", "waiting")) else None
 
-    def printer():
-        spinning, turn = False, 0
-        while not done.is_set():
-            lines = new_lines()
-            with lock:
-                typed = readline.get_line_buffer() if readline else ""
-                note = None if lines or typed else doing()
-                if lines:
-                    sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n" + prompt + typed)
-                elif note:                   # only on an empty input line: it never gets in the way of typing
-                    turn += 1
-                    spin = SPINNER[turn % len(SPINNER)] + " " + note
-                    sys.stdout.write("\r\x1b[2K" + (ANSI["dim"] + spin + ANSI["off"] if short_color else spin))
-                elif spinning:
-                    sys.stdout.write("\r\x1b[2K" + prompt + typed)
-                spinning = bool(note)
-                sys.stdout.flush()
-            done.wait(0.15 if spinning else 0.3)
+    look = {"spinning": False, "turn": 0, "next": 0.0}
 
-    threading.Thread(target=printer, daemon=True).start()
+    def draw(lib=None):
+        """Print what's new above the input line, or the spinner on an empty one. With lib (in readline's
+        own thread, from its input hook) readline redraws its line, cursor where you left it."""
+        if time.time() < look["next"]:
+            return
+        lines = new_lines()
+        typed = readline.get_line_buffer() if readline else ""
+        note = None if lines or typed else doing()
+        def put_back():
+            if lib:
+                sys.stdout.flush()
+                lib.rl_on_new_line()
+                lib.rl_forced_update_display()
+            else:
+                sys.stdout.write(prompt + typed)
+        if lines:
+            sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n")
+            put_back()
+        elif note:                           # only on an empty input line: it never gets in the way of typing
+            look["turn"] += 1
+            spin = SPINNER[look["turn"] % len(SPINNER)] + " " + note
+            sys.stdout.write("\r\x1b[2K" + (ANSI["dim"] + spin + ANSI["off"] if short_color else spin))
+        elif look["spinning"]:
+            sys.stdout.write("\r\x1b[2K")
+            put_back()
+        look["spinning"] = bool(note)
+        look["next"] = time.time() + (0.15 if note else 0.3)
+        sys.stdout.flush()
+
+    def printer():                           # without the hook: from a thread (fine unless you type mid-reply)
+        while not done.is_set():
+            with lock:
+                draw()
+            done.wait(0.1)
+
+    unhook = readline_hook(readline, draw)
+    if not unhook:
+        threading.Thread(target=printer, daemon=True).start()
     try:
         while True:
             try:
@@ -4276,6 +4325,8 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
         pass
     finally:
         done.set()
+        if unhook:
+            unhook()
         print()
         if readline:
             try:
