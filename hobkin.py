@@ -5,7 +5,8 @@ line, or as a worker on hearthboard.
 
     hobkin URL MODEL [KEY] [--chat]   set up that API and start an agent on it (see below)
     hobkin [URL MODEL [KEY]] --hearthboard BOARD_URL TOKEN   ...and make it a worker on that board
-    hobkin [URL MODEL [KEY]] --chore NAME [--set K=V]...    ...and give it a standing job (a chore: tidy, watch...)
+    hobkin [URL MODEL [KEY]] --chore NAME [--set K=V]...    ...and give it a standing job (a chore: sweep, pulse...)
+    hobkin [...] --host user@host   ...working on another machine over ssh (its commands and files act there)
     hobkin                 start a new agent (prints its id)
     hobkin ID              resume agent ID
     hobkin chat [ID]       talk to a running agent in this terminal (no ID: a running one; --full: tool output too)
@@ -16,6 +17,7 @@ line, or as a worker on hearthboard.
     hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
     hobkin breakglass ID "what's wrong" [--for 2h] [--budget $]   an incident: the agent acts fully on its own (--off ends it)
     hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
+    hobkin breakglass ID ["what's wrong"] --chore mender   ...with a chore as the incident's playbook
     hobkin breakglass ID ["what's wrong"] --with ID2,ID3   one incident, shared: they see each other's work and holds
     hobkin watch [ID ...]   one screen for an incident: every agent on it, what they're doing, risky-looking commands
     hobkin purge [--yes]   stop every agent, remove their services, delete ~/.hobkins (asks first)
@@ -59,7 +61,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 import email.utils
 import base64
@@ -192,6 +194,11 @@ DEFAULT_CONFIG = {
     # Where `hobkin ... --chore NAME` looks for chores (folders, e.g. a clone of hobkin-chores), after
     # _shared/chores/. A chore is a standing job: instructions, settings, tools and spells (see README.md).
     "chore_dirs": [],
+    # Work on another machine: "user@host" (or an alias from ~/.ssh/config). Commands, background jobs, file tools,
+    # the watch and the agent's own tools act there, in ~/hobkin-work/ID on it; memory and conversation stay here.
+    # Keys only (no password prompts), one shared connection. "ssh" is the ssh command to use (e.g. "ssh -p 2222").
+    "host": None,
+    "ssh": "ssh",
     # Break-glass mode, for an incident: set by a person with `hobkin breakglass ID "reason" --for 2h`, never by
     # the agent. Until it expires the agent works fully autonomously: safe mode lifted, nothing announced
     # first, the daily budget as given, an incident timeline kept for it. {"reason", "by", "declared", "until"}
@@ -234,7 +241,8 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
                 "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
-                "break_glass": (dict, type(None)), "chore": (dict, type(None)), "chore_dirs": list}
+                "break_glass": (dict, type(None)), "chores": (dict, type(None)), "chore_dirs": list,
+                "host": (str, type(None)), "ssh": (str, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -799,6 +807,8 @@ SALVAGE = ("## No guidance given: salvage\n\n"
            "the copies, early and again at the end.\n"
            "- Delete nothing of the system's, not even to free space (only your own temporary copies).\n"
            "- Post a status after each step, and tell whoever turns up exactly where everything is.")
+PLAYBOOK = ("## Your playbook\n\nFor this incident, follow your **{name}** chore (CHORE-{name}.md), with its spells: it's "
+            "what the people who declared it want done. The break-glass rules above still hold.")
 TEAM = ("## Others on this incident\n\nYou're not alone on it ({incident}): other hobkins are working it too, on "
         "this machine. hobkin shows you what they've done since your last step, as it happens.\n{members}\n"
         "- **Don't undo each other:** before you restart, stop, move or clean up something, think whether a "
@@ -819,7 +829,7 @@ GLASS_ENDED = ("[from hobkin: break-glass mode has ended, {stamp}{how}; you're b
                "you'd pick it back up, so a restarted you doesn't have to investigate it all again. The timeline is in "
                "{log}.]")
 
-CHORE_MODE = ("# Your chore: {name}\n\nYou're on a standing job: {name}. Its instructions are in CHORE.md; its settings: "
+CHORE_MODE = ("# Your chores: {name}\n\nYou're on a standing job: {name}. Its instructions are in CHORE-<name>.md; its settings: "
               "{settings}. You'll do it again and again, unattended, so do it like the sorcerer's apprentice in "
               "Fantasia, only wiser:\n"
               "- **Enchant a broom; don't carry the water.** The first time you do any part of the chore, write a "
@@ -837,6 +847,12 @@ CHORE_MODE = ("# Your chore: {name}\n\nYou're on a standing job: {name}. Its ins
               "- **The sorcerer comes home.** Anyone should be able to see what your spells did from the spellbook "
               "and their logs. Report in a line or two, and gloat a little when the chore runs itself: that's the "
               "whole trick. A chore that does itself, and a hobkin who naps until something needs a hobkin.")
+HOST_NOTE = ("# Where you work: {host}\n\nYou work on **{host}**, over ssh. Your commands, background jobs, file "
+             "tools, watch and own tools all act there, starting in your workspace on it ({work}, $HOBKIN_WORK). "
+             "Your memory, blooper reel, conversation and notes stay with hobkin on {here} (the file tools still reach "
+             "them as $HOBKIN_MEMORY and $HOBKIN_BLOOPERS). If {host} can't be reached, your commands fail with ssh's "
+             "error: that's information too, so say what it means rather than retrying blindly.")
+REMOTE_CWD = "__HOBKIN_CWD__"
 CHORE_GIVEN = ("[from hobkin: you've been given a chore: {name}. Read CHORE.md and your spells (if it came with any), "
                "then get it going: the first round by hand if you must, but with spells from the start, so the next "
                "round runs itself. Say in a line or two what you'll do, and how often.]")
@@ -1063,60 +1079,144 @@ def chore_env(key: str) -> str:
     return "CHORE_" + re.sub(r"\W", "_", key).upper()
 
 
-def find_chore(chore: str, cfg: dict) -> str:
-    """A chore's folder: a path to one, or a name in _shared/chores/ or a config chore_dirs folder."""
+# Chores built into hobkin: hearthboard is one (`--hearthboard URL TOKEN` is short for it). A chores folder of the
+# same name wins over a built-in one.
+BUILTIN_CHORES = {
+    "hearthboard": ({
+        "name": "hearthboard",
+        "description": "Work from a hearthboard: its skill, its wait loop while idle, its chat answered mid-command.",
+        "apprentice": False,
+        "settings": {
+            "url": {"about": "the board's URL", "env": "HEARTHBOARD_URL"},
+            "token": {"about": "this agent's token on the board", "secret": True, "env": "HEARTHBOARD_TOKEN"},
+            "user": {"default": "", "about": "its username on the board"}},
+        # the board's own skill, so it works by the board's current rules (in this agent's skills/: agents here
+        # that aren't workers don't mistake the board for their work system)
+        "fetch": {"skills/hearthboard/SKILL.md": {"url": "{{url}}/api/skill", "headers": {"authorization": "Bearer {{token}}"}}},
+        "given": ("You're now a worker on the hearthboard at {{url}}, as {{user}}. Your hearthboard skill (just added) "
+                  "says how to work there: open it, say hello on the board, then start its wait loop."),
+        "config": {
+            "idle_prompt": None,
+            # hobkin waits on the board while the agent's idle, and wakes it with what the board says
+            "wake": {"url": "{{url}}/api/wait?timeout=50", "headers": {"Authorization": "Bearer {{token}}"},
+                     "quiet": {"reason": "timeout"}},
+            # the board's chat, for the front desk: answered while the agent's busy running a command
+            "inbox": {"url": "{{url}}/api/chat/inbox?flat=1", "reply": "{{url}}/api/chat/{thread}/messages",
+                      "headers": {"Authorization": "Bearer {{token}}"}, "every": 15}}},
+        "# Your work comes from the hearthboard at {{url}}\n\nYou're {{user}} there. Your hearthboard skill has the "
+        "board's rules: follow them. hobkin waits on the board for you while you're idle and wakes you with its news."),
+}
+
+
+def load_chore(chore: str, cfg: dict) -> tuple[dict, str, str | None]:
+    """(chore.json, CHORE.md, its folder or None for a built-in one): a path to a chore, a name in _shared/chores/
+    or a config chore_dirs folder, or a built-in chore."""
+    def from_dir(src):
+        spec = read_json(os.path.join(src, "chore.json"), None, exit_if_broken=True)
+        if not isinstance(spec, dict) or not os.path.isfile(os.path.join(src, "CHORE.md")):
+            sys.exit(f"hobkin: {src} isn't a chore (it needs a chore.json object and a CHORE.md)")
+        return spec, read(os.path.join(src, "CHORE.md")), src
     if os.path.isfile(os.path.join(os.path.expanduser(chore), "chore.json")):
-        return os.path.abspath(os.path.expanduser(chore))
+        return from_dir(os.path.abspath(os.path.expanduser(chore)))
     dirs = [os.path.join(SHARED, "chores")] + [os.path.expanduser(d) for d in cfg.get("chore_dirs") or []]
     for d in dirs:
         if os.path.isfile(os.path.join(d, chore, "chore.json")):
-            return os.path.join(d, chore)
+            return from_dir(os.path.join(d, chore))
+    if chore in BUILTIN_CHORES:
+        spec, md = BUILTIN_CHORES[chore]
+        return json.loads(json.dumps(spec)), md, None
     known = sorted({n for d in dirs if os.path.isdir(d) for n in os.listdir(d)
-                    if os.path.isfile(os.path.join(d, n, "chore.json"))})
-    sys.exit(f"hobkin: no chore {chore!r}" + (f" (there's {', '.join(known)})" if known else
-             " (give a path to one, or add the folder you keep them in to \"chore_dirs\" in config)"))
+                    if os.path.isfile(os.path.join(d, n, "chore.json"))} | set(BUILTIN_CHORES))
+    sys.exit(f"hobkin: no chore {chore!r} (there's {', '.join(known)}; give a path to one, or add the folder you "
+             "keep them in to \"chore_dirs\" in config)")
 
 
-def install_chore(agent_id: str, chore: str, sets: list[str]) -> str:
-    """Give an agent a chore (README.md, "Chores"): its settings (defaults, then --set NAME=VALUE), its config
-    merged into the agent's config.json, CHORE.md as part of its instructions, and its tools and spells in
-    the workspace. {{setting}} in CHORE.md and the config is filled in. Returns the chore's name."""
+def chore_vars(cfg: dict) -> dict:
+    """{ENV_NAME: value} for every chore's (non-secret) settings: they reach commands, tools and the watch."""
+    out = {}
+    for c in (cfg.get("chores") or {}).values():
+        for k, v in (c.get("settings") or {}).items():
+            out[(c.get("env") or {}).get(k) or chore_env(k)] = str(v)
+    return out
+
+
+def install_chore(agent_id: str, chore: str, sets: list[str], secret_sets: list[str] = ()) -> tuple[str, str]:
+    """Give an agent a chore (README.md, "Chores"), alongside any it has: settings (defaults, then --set NAME=VALUE;
+    secret ones with --secret NAME=VALUE, or asked for), its config merged into the agent's config.json, its
+    instructions as CHORE-<name>.md, files it fetches, and its tools and spells in the workspace. {{setting}} is
+    filled in; a secret one becomes ${ITS_ENV_NAME}, so its value stays in secrets.env, out of config and the
+    model's sight (hobkin fills ${...} in headers). Returns (its name, the message that tells the agent)."""
     d = os.path.join(HOME, agent_id)
-    src = find_chore(chore, load_config(d))
-    spec = read_json(os.path.join(src, "chore.json"), None, exit_if_broken=True)
-    if not isinstance(spec, dict) or not os.path.isfile(os.path.join(src, "CHORE.md")):
-        sys.exit(f"hobkin: {src} isn't a chore (it needs a chore.json object and a CHORE.md)")
-    name, known = spec.get("name") or os.path.basename(src.rstrip(os.sep)), spec.get("settings") or {}
+    spec, md, src = load_chore(chore, load_config(d))
+    name, known = spec.get("name") or chore, spec.get("settings") or {}
+    about = lambda k: f" ({known[k]['about']})" if isinstance(known[k], dict) and known[k].get("about") else ""
+    is_secret = lambda k: isinstance(known[k], dict) and bool(known[k].get("secret"))
+    env_name = lambda k: (known[k].get("env") if isinstance(known[k], dict) else None) or chore_env(k)
     values = {k: (v.get("default") if isinstance(v, dict) else v) for k, v in known.items()}
-    for item in sets:
+    for item, secret in [(i, False) for i in sets] + [(i, True) for i in secret_sets]:
         key, eq, value = item.partition("=")
         if not eq or key not in known:
-            sys.exit(f"hobkin: --set {item}: {name}'s settings are {', '.join(known) or 'none'} (--set NAME=VALUE)")
+            sys.exit(f"hobkin: {'--secret' if secret else '--set'} {item.split('=')[0]}: {name}'s settings are "
+                     f"{', '.join(known) or 'none'}")
+        if is_secret(key) != secret:
+            sys.exit(f"hobkin: {key} is {'a secret: give it with --secret' if is_secret(key) else 'not a secret: give it with --set'}"
+                     f" {key}=... (secrets go in secrets.env, never in config)")
         values[key] = value
+    for k in [k for k, v in values.items() if v is None and is_secret(k) and sys.stdin.isatty()]:
+        import getpass
+        values[k] = getpass.getpass(f"{name}: {k}{about(k)}: ") or None
     missing = [k for k, v in values.items() if v is None]
     if missing:
-        sys.exit(f"hobkin: {name} needs " + ", ".join(
-            f"--set {k}=..." + (f" ({known[k]['about']})" if isinstance(known[k], dict) and known[k].get("about") else "")
-            for k in missing))
+        sys.exit(f"hobkin: {name} needs " + ", ".join(f"{'--secret' if is_secret(k) else '--set'} {k}=...{about(k)}"
+                                                     for k in missing))
     values = {k: os.path.expanduser(v) if isinstance(v, str) and v.startswith("~") else v for k, v in values.items()}
-    fill = lambda text: re.sub(r"\{\{(\w+)\}\}", lambda m: str(values.get(m.group(1), m.group(0))), text)
-    def fill_all(o):
-        return fill(o) if isinstance(o, str) else [fill_all(x) for x in o] if isinstance(o, list) else \
-            {k: fill_all(v) for k, v in o.items()} if isinstance(o, dict) else o
+    secret = {k: v for k, v in values.items() if is_secret(k)}
+    shown = {k: ("${" + env_name(k) + "}" if k in secret else v) for k, v in values.items()}
+    def filler(vals):
+        fill = lambda text: re.sub(r"\{\{(\w+)\}\}", lambda m: str(vals.get(m.group(1), m.group(0))), text)
+        def fill_all(o):
+            return fill(o) if isinstance(o, str) else [fill_all(x) for x in o] if isinstance(o, list) else \
+                {k: fill_all(v) for k, v in o.items()} if isinstance(o, dict) else o
+        return fill, fill_all
+    fill, fill_all = filler(shown)
+    real_fill, real_all = filler(values)              # only for fetching, which hobkin does itself, now
+    for rel, how in (spec.get("fetch") or {}).items():
+        rel = os.path.normpath(rel)
+        if os.path.isabs(rel) or rel.startswith(".."):
+            sys.exit(f"hobkin: {name} wants to fetch into {rel}: only into its own folder")
+        how = real_all(how if isinstance(how, dict) else {"url": how})
+        try:
+            req = urllib.request.Request(how["url"], headers={**(how.get("headers") or {}), "user-agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+                write_atomic(os.path.join(d, rel), r.read().decode(errors="replace"))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            sys.exit(f"hobkin: {name} couldn't fetch {how['url']}: {e}")
+    if secret:                                          # secrets.env: only you can read it; the model never sees it
+        path = os.path.join(d, "secrets.env")
+        new = {env_name(k): v for k, v in secret.items() if v != ""}
+        kept = [l for l in read(path).splitlines() if l.split("=", 1)[0].strip() not in new]
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(kept + [f"{k}={v}" for k, v in new.items()]) + "\n")
+        os.chmod(path, 0o600)
     os.makedirs(os.path.join(d, "work"), exist_ok=True)
     path = os.path.join(d, "config.json")
     cfg = merged(read_json(path, {}, exit_if_broken=True), fill_all(spec.get("config") or {}))
-    cfg["chore"] = {"name": name, "from": src, "settings": values}
+    cfg.setdefault("chores", {})[name] = {
+        "from": src or "built in", "settings": {k: v for k, v in values.items() if k not in secret},
+        "env": {k: env_name(k) for k in known if env_name(k) != chore_env(k) and k not in secret},
+        "secrets": {k: env_name(k) for k in secret}, "apprentice": spec.get("apprentice", True)}
     write_json(path, cfg)
-    write_atomic(os.path.join(d, "CHORE.md"), fill(read(os.path.join(src, "CHORE.md"))))
+    write_atomic(os.path.join(d, f"CHORE-{name}.md"), fill(md))
     for part in ("tools", "spells"):                    # its own tools, and starter spells
-        if os.path.isdir(os.path.join(src, part)):
+        if src and os.path.isdir(os.path.join(src, part)):
             shutil.copytree(os.path.join(src, part), os.path.join(d, "work", part), dirs_exist_ok=True)
     tools = os.path.join(d, "work", "tools")
-    for t in os.listdir(os.path.join(src, "tools")) if os.path.isdir(os.path.join(src, "tools")) else []:
+    for t in os.listdir(os.path.join(src, "tools")) if src and os.path.isdir(os.path.join(src, "tools")) else []:
         if os.path.isfile(os.path.join(tools, t, "tool.json")):    # descriptions can name the settings too
             write_atomic(os.path.join(tools, t, "tool.json"), fill(read(os.path.join(tools, t, "tool.json"))))
-    return name
+    return name, "[from hobkin: " + fill(spec["given"]) + "]" if spec.get("given") else CHORE_GIVEN.format(name=name)
 
 
 def find_skills(agent_dir: str, extra_dirs=()) -> dict[str, tuple[str, str]]:
@@ -1873,6 +1973,9 @@ class Agent:
         self.inbox_checked = 0.0
         self.waker = None                  # the thread long-polling the wake URL while idle
         self.woken = None                  # what it brought back: (ok, body)
+        self.rhome = self.rwork = None     # the host's home and our workspace on it (config "host"), once reached
+        self.safe_remote = False           # safe mode on a host: its limits are that account's permissions
+        self.rtools = (0.0, None)          # the host's tools/ listing, cached briefly
         self.watched = 0.0                 # when wake.command last ran (0: run it as soon as it's idle)
         self.wake_backoff = 0.0
         self.wake_last = ("", 0.0)         # the last answer delivered, and when (the same one isn't sent twice soon)
@@ -1932,6 +2035,13 @@ class Agent:
         self.state.update({"id": self.id, "pid": os.getpid(), "model": self.model.describe()})
         self.setup_glass()
         self.setup_safe_mode()
+        if self.state.get("cwd_on") != self.host():          # a folder on another machine means nothing here
+            self.state.update({"cwd": None, "cwd_on": self.host()})
+        if self.host():
+            try:
+                self.log("hobkin", f"working on {self.host()}: workspace {self.remote_work()}")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                self.log("hobkin", f"can't reach {self.host()} yet ({e}); commands will say so until it can be")
         self.state.setdefault("created", now())
         self.messages = self.load_context()
         self.discover_limits()
@@ -2053,6 +2163,114 @@ class Agent:
         """Room kept free in the context window for the reply (what's sent as max_tokens, else a guess)."""
         return self.max_output() or min(16000, self.state.get("api_max_output") or 16000)
 
+    # --- the host: working on another machine over ssh (config "host")
+    def host(self) -> str | None:
+        return (self.cfg.get("host") or None) if hasattr(self, "cfg") else None
+
+    def ssh_argv(self, remote: str) -> list[str]:
+        """ssh to the host: keys only (BatchMode), one shared connection (ControlMaster), new host keys trusted on
+        first use. `remote` is the command line run there."""
+        sock = os.path.join(tempfile.gettempdir(), f"hobkin-{os.getuid()}-%C")
+        return shlex.split(self.cfg.get("ssh") or "ssh") + [
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
+            "-o", "ControlMaster=auto", "-o", f"ControlPath={sock}", "-o", "ControlPersist=600",
+            "-o", "StrictHostKeyChecking=accept-new", self.host(), remote]
+
+    def ssh_env(self) -> dict:
+        """What ssh itself runs with here (its agent socket, its config); never the model key."""
+        env = dict(os.environ)
+        env.pop(self.model.cfg.get("key_env") or "", None)
+        return env
+
+    def on_host(self, script: str, timeout: float = 60) -> subprocess.CompletedProcess:
+        """A short script on the host, fed to bash over stdin (so nothing secret is on a command line). Bytes out."""
+        return subprocess.run(self.ssh_argv("bash -s"), input=script.encode(), capture_output=True,
+                              env=self.ssh_env(), timeout=timeout)
+
+    def host_error(self, r) -> OSError:
+        text = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        return OSError(f"on {self.host()}: {text[-400:] or f'exit code {r.returncode}'}")
+
+    def remote_work(self) -> str:
+        """Our workspace on the host ($HOME/hobkin-work/ID), made on first contact, when the chore's spells and
+        tools are copied there too. Raises OSError while the host can't be reached."""
+        if self.rwork:
+            return self.rwork
+        r = self.on_host(f'w="$HOME/hobkin-work/{self.id}"; mkdir -p "$w/.hobkin-shell" && printf "%s\\n%s\\n" "$HOME" "$w"',
+                         timeout=30)
+        lines = r.stdout.decode(errors="replace").splitlines()
+        if r.returncode or len(lines) < 2:
+            raise self.host_error(r)
+        self.rhome, self.rwork = lines[0], lines[1]
+        parts = [d for d in ("spells", "tools") if os.path.isdir(os.path.join(self.work, d))]
+        if parts:                                   # what a chore brought, never over what's already there
+            tar = subprocess.run(["tar", "-C", self.work, "-czf", "-"] + parts, capture_output=True)
+            put = subprocess.run(self.ssh_argv(f"tar -C {shlex.quote(self.rwork)} -xzf - --skip-old-files"),
+                                 input=tar.stdout, capture_output=True, env=self.ssh_env(), timeout=120)
+            if put.returncode:
+                self.log("hobkin", f"couldn't copy {' and '.join(parts)} to {self.host()}: {self.host_error(put)}")
+        return self.rwork
+
+    def wdir(self) -> str:
+        """The workspace commands run in: here, or on the host."""
+        return self.remote_work() if self.host() else self.work
+
+    def remote_script(self, command: str, cwd: str, extra: str = "") -> str:
+        """A script for the host: our environment (secrets, HOBKIN_*, the chore's settings), the folder, then the
+        command, read whole first and run with an empty stdin (as here), so it can't swallow the script."""
+        env = {**load_env_file(os.path.join(SHARED, "secrets.env")), **load_env_file(self.p("secrets.env")),
+               "HOBKIN_ID": self.id, "HOBKIN_HOST": self.host(), "HOBKIN_WORK": self.rwork or ""}
+        env.update(chore_vars(self.cfg))
+        env["HOBKIN_NOSAVE"] = " ".join(list(env) + ["HOBKIN_NOSAVE"])
+        end = "HOBKIN_CMD_" + secrets.token_hex(6)
+        return ("".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in env.items() if re.match(r"^[A-Za-z_]\w*$", k))
+                + f"cd {shlex.quote(cwd)} 2>/dev/null || cd {shlex.quote(self.rwork or '.')}\n" + extra
+                + f"__hobkin_cmd=$(cat <<'{end}'\n{command}\n{end}\n)\neval \"$__hobkin_cmd\" </dev/null\n")
+
+    def is_local(self, full: str) -> bool:
+        """Is this path hobkin's side (the agent's own folder: memory, bloopers) rather than the host's?"""
+        return not self.host() or full == self.dir or full.startswith(self.dir + os.sep)
+
+    def fs_kind(self, full: str) -> str | None:
+        """'d' (a folder), 'f' (a file) or None, here or on the host."""
+        if self.is_local(full):
+            return "d" if os.path.isdir(full) else "f" if os.path.isfile(full) else None
+        q = shlex.quote(full)
+        r = self.on_host(f"if [ -d {q} ]; then echo d; elif [ -f {q} ]; then echo f; fi")
+        if r.returncode:
+            raise self.host_error(r)
+        return r.stdout.decode().strip() or None
+
+    def fs_list(self, full: str) -> list[str]:
+        """A folder's entries (folders end in /)."""
+        if self.is_local(full):
+            return [e + ("/" if os.path.isdir(os.path.join(full, e)) else "") for e in sorted(os.listdir(full))]
+        r = self.on_host(f"cd {shlex.quote(full)} && ls -1Ap")
+        if r.returncode:
+            raise self.host_error(r)
+        return sorted(r.stdout.decode(errors="replace").splitlines())
+
+    def fs_read(self, full: str) -> bytes:
+        if self.is_local(full):
+            return open(full, "rb").read()
+        r = self.on_host(f"cat -- {shlex.quote(full)}", timeout=120)
+        if r.returncode:
+            raise self.host_error(r)
+        return r.stdout
+
+    def fs_write(self, full: str, data: bytes) -> None:
+        """Write a whole file (folders made as needed), here or on the host."""
+        if self.is_local(full):
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f:
+                f.write(data)
+            return
+        end, q = "HOBKIN_B64_" + secrets.token_hex(6), shlex.quote(full)
+        r = self.on_host(f'mkdir -p "$(dirname {q})" && base64 -d > {q} <<\'{end}\'\n'
+                         f'{base64.b64encode(data).decode()}\n{end}\n', timeout=120)
+        if r.returncode:
+            raise self.host_error(r)
+
     # --- safe mode: the sandbox for commands, and where hobkin's own file tools may write
     def setup_safe_mode(self) -> None:
         """Safe mode: check the kernel can sandbox (and that it really does, here), or refuse to start."""
@@ -2061,6 +2279,19 @@ class Agent:
         if conf and self.glass:                    # break glass lifts it, until it ends
             self.log("hobkin", "safe mode lifted for break-glass mode")
             self.state.pop("safe_mode", None)
+            return
+        self.safe_remote = False
+        if conf and self.host():                   # Landlock can't reach another machine: its account is the limit
+            if not (isinstance(conf, dict) and conf.get("remote_account")):
+                msg = (f"safe mode can't sandbox commands on {self.host()} (Landlock only reaches this machine), so this "
+                       f"agent won't start. Give it an account on {self.host()} that can only do what it should, and "
+                       "say so in config: \"safe_mode\": {\"remote_account\": true}")
+                self.log("hobkin", msg)
+                sys.exit(f"hobkin: {msg}")
+            self.safe_remote = True
+            self.state["safe_mode"] = (f"on {self.host()}, your limits are that account's own permissions (Landlock "
+                                       "can't reach another machine).")
+            self.log("hobkin", f"safe mode: {self.state['safe_mode']}")
             return
         if not conf:
             self.state.pop("safe_mode", None)
@@ -2299,18 +2530,27 @@ class Agent:
                                            sandboxed=", sandboxed like your commands" if getattr(self, "safe", None) else ""))
         elif wake:
             parts.append(WAKE_NOTE)
-        chore = (self.cfg.get("chore") if hasattr(self, "cfg") else None) or {}
-        if chore:
-            settings = ", ".join(f"{k} = {v} (${chore_env(k)})" for k, v in (chore.get("settings") or {}).items())
-            parts.append(CHORE_MODE.format(name=chore.get("name", "?"), settings=settings or "none"))
-        if getattr(self, "safe", None):
+        chores = {n: c for n, c in ((self.cfg.get("chores") if hasattr(self, "cfg") else None) or {}).items()
+                  if c.get("apprentice", True)}
+        if chores:
+            settings = "; ".join(
+                ", ".join([f"{k} = {v} (${(c.get('env') or {}).get(k) or chore_env(k)})" for k, v in (c.get("settings") or {}).items()]
+                          + [f"{k} (secret, in ${e})" for k, e in (c.get("secrets") or {}).items()]) or f"{n}: none"
+                for n, c in chores.items())
+            parts.append(CHORE_MODE.format(name=", ".join(chores), settings=settings or "none"))
+        if self.host():
+            parts.append(HOST_NOTE.format(host=self.host(), work=self.rwork or "~/hobkin-work/" + self.id,
+                                          here=os.uname().nodename))
+        if getattr(self, "safe", None) or getattr(self, "safe_remote", False):
             parts.append(SAFE_MODE.format(coverage=self.state.get("safe_mode", "")))
         if getattr(self, "glass", None):
             g = self.glass
             parts.append(BREAK_GLASS.format(by=g.get("by", "someone"), declared=when_text(float(g["declared"])),
                                             reason=g["reason"], until=when_text(float(g["until"])), log=self.glass_log,
                                             lifted=" (and safe mode is lifted)" if self.cfg.get("safe_mode") else ""))
-            if g.get("salvage"):
+            if g.get("playbook"):
+                parts.append(PLAYBOOK.format(name=g["playbook"]))
+            elif g.get("salvage"):
                 parts.append(SALVAGE)
             if g.get("incident"):
                 team = self.incident_team()
@@ -2582,8 +2822,17 @@ class Agent:
         self.watched = started = time.time()
         timeout = float((self.cfg.get("wake") or {}).get("timeout") or 300)
         try:
-            r = subprocess.run(self.sandboxed(["bash", "-c", command]), cwd=self.work, env=self.safe_env(self.tool_env()),
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+            if self.host():                # on the host: if it can't be reached, that's worth waking for too
+                try:
+                    rw = self.remote_work()
+                except OSError as e:
+                    self.woken = (True, f"(couldn't reach {self.host()} to run it: {e})", started)
+                    return
+                r = subprocess.run(self.ssh_argv("bash --login -s"), input=self.remote_script(command, rw),
+                                   capture_output=True, text=True, timeout=timeout, env=self.ssh_env())
+            else:
+                r = subprocess.run(self.sandboxed(["bash", "-c", command]), cwd=self.work, env=self.safe_env(self.tool_env()),
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
             out = (r.stdout + r.stderr).strip()
             self.woken = (True, out if not r.returncode else f"(it failed: exit code {r.returncode})\n{out}", started)
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -2701,6 +2950,35 @@ class Agent:
             self.log(name, (result_text(result[0]).splitlines() or [""])[0])
         return result
 
+    def tool_listing(self) -> list[tuple[str, str, bool, str | None]]:
+        """(name, path to run, run is executable, tool.json text) for each folder in tools/, here or on the host
+        (listed in one ssh call, cached for 10 s, since it's read for every reply)."""
+        if not self.host():
+            root, out = os.path.join(self.work, "tools"), []
+            for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+                d = os.path.join(root, name)
+                if os.path.isdir(d):
+                    j = os.path.join(d, "tool.json")
+                    out.append((name, os.path.join(d, "run"), os.access(os.path.join(d, "run"), os.X_OK),
+                                read(j) if os.path.exists(j) else None))
+            return out
+        if time.time() - self.rtools[0] < 10 and self.rtools[1] is not None:
+            return self.rtools[1]
+        root = self.remote_work() + "/tools"
+        r = self.on_host(f'cd {shlex.quote(root)} 2>/dev/null || exit 0\nfor d in */; do n=${{d%/}}; x=n; '
+                         '[ -x "$n/run" ] && x=y; j=-; [ -f "$n/tool.json" ] && j=$(base64 < "$n/tool.json" | tr -d "\\n"); '
+                         'printf "%s\\t%s\\t%s\\n" "$n" "$x" "$j"; done')
+        if r.returncode:
+            raise self.host_error(r)
+        out = []
+        for line in r.stdout.decode(errors="replace").splitlines():
+            name, x, j = (line.split("\t") + ["", "", ""])[:3]
+            if name and name != "*":
+                text = None if j in ("", "-") else base64.b64decode(j).decode(errors="replace")
+                out.append((name, f"{root}/{name}/run", x == "y", text))
+        self.rtools = (time.time(), sorted(out))
+        return self.rtools[1]
+
     def tools(self) -> list[dict]:
         """What the model is offered: the built-in tools, then the agent's own."""
         team = [HOLD_TOOL] if getattr(self, "glass", None) and self.glass.get("incident") else []
@@ -2711,15 +2989,14 @@ class Agent:
         """The tools the agent made itself (OWN_TOOLS): their definitions, {name: run path}, and what's wrong with
         any that can't be offered, read fresh each time so a new one is there from the next reply."""
         defs, runs, problems = [], {}, []
-        root = os.path.join(self.work, "tools")
-        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL]}     # hold too: it's offered on a shared incident
-        for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-            d = os.path.join(root, name)
-            if not os.path.isdir(d):
-                continue
-            run = os.path.join(d, "run")
+        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL, NOTIFY_TOOL]}   # hold, notify: offered sometimes
+        try:
+            found = self.tool_listing()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return [], {}, [f"tools/: couldn't list them on {self.host()} ({e})"]
+        for name, run, executable, text in found:
             try:
-                spec = json.loads(read(os.path.join(d, "tool.json")) or "null")
+                spec = json.loads(text or "null")
             except json.JSONDecodeError as e:
                 spec, why = None, f"tool.json isn't valid JSON ({e})"
             else:
@@ -2731,7 +3008,7 @@ class Agent:
             elif not why and not (isinstance(spec, dict) and isinstance(spec.get("description"), str)
                                   and isinstance(spec.get("input_schema"), dict)):
                 why = "tool.json needs a \"description\" (text) and an \"input_schema\" (an object)"
-            elif not why and not os.access(run, os.X_OK):
+            elif not why and not executable:
                 why = "it has no executable `run` (chmod +x it)"
             if why:
                 problems.append(f"tools/{name}: not offered: {why}")
@@ -2757,25 +3034,32 @@ class Agent:
         env.update({"HOBKIN_ID": self.id, "HOBKIN_DIR": self.dir, "HOBKIN_WORK": self.work,
                     "HOBKIN_MEMORY": self.p("MEMORY.md"), "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"),
                     "HOBKIN_SELF": os.path.abspath(__file__)})
-        for k, v in ((self.cfg.get("chore") or {}).get("settings") or {}).items():
-            env[chore_env(k)] = str(v)                         # the chore's settings, for its spells and tools
+        env.update(chore_vars(self.cfg))                       # the chores' settings, for their spells and tools
         return env
 
     def cwd(self):
+        if self.host():
+            return self.state.get("cwd") or self.remote_work()
         cwd = self.state.get("cwd") or self.work
         return cwd if os.path.isdir(cwd) else self.work
 
     def where(self, cwd):
-        rel = os.path.relpath(cwd, self.work)
+        base = (self.rwork or "") if self.host() else self.work
+        rel = os.path.relpath(cwd, base) if base else cwd
         return "your workspace" if rel == "." else (f"{rel}/ in your workspace" if not rel.startswith("..") else cwd)
 
     def resolve(self, path):
-        """A tool path: $HOBKIN_* and ~ expanded, relative to the shell's current folder."""
-        names = {"HOBKIN_WORK": self.work, "HOBKIN_DIR": self.dir, "HOBKIN_MEMORY": self.p("MEMORY.md"),
-                 "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"), "HOME": os.path.expanduser("~")}
+        """A tool path: $HOBKIN_* and ~ expanded, relative to the shell's current folder (on the host, with one:
+        except the agent's own files, $HOBKIN_MEMORY and $HOBKIN_BLOOPERS, which stay here)."""
+        remote = bool(self.host())
+        home = (self.rhome or "~") if remote else os.path.expanduser("~")
+        names = {"HOBKIN_WORK": self.wdir(), "HOBKIN_DIR": self.dir, "HOBKIN_MEMORY": self.p("MEMORY.md"),
+                 "HOBKIN_BLOOPERS": self.p("BLOOPERS.md"), "HOME": home}
         path = re.sub(r"\$\{?(HOBKIN_WORK|HOBKIN_DIR|HOBKIN_MEMORY|HOBKIN_BLOOPERS|HOME)\}?",
                       lambda m: names[m.group(1)], path.strip())
-        return os.path.normpath(os.path.join(self.cwd(), os.path.expanduser(path)))
+        if path == "~" or path.startswith("~/"):
+            path = home + path[1:]
+        return os.path.normpath(os.path.join(self.cwd(), path))
 
     # --- bash and background jobs: announcing first, running a command, jobs that report back when they finish
     def announce_check(self, command: str, announced: str | None) -> ToolResult | None:
@@ -2824,6 +3108,8 @@ class Agent:
         if background:
             return self.start_job(command)
         timeout = max(1, int(timeout or self.cfg["bash_timeout"]))   # the agent can ask for any length
+        if self.host():
+            return self.run_bash_remote(command, timeout, reset)
         state_dir = self.p("shell") if self.safe else self.dir      # safe mode: a folder its commands may write
         state_file, cwd_file = os.path.join(state_dir, "shell.sh"), os.path.join(state_dir, ".cwd")
         if reset:
@@ -2839,7 +3125,7 @@ class Agent:
         env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
                                                               "HOBKIN_MEMORY", "HOBKIN_BLOOPERS", "HOBKIN_SELF", "HOBKIN_NOSAVE",
                                                               "HOBKIN_SANDBOX", "TMPDIR"]
-                                     + [chore_env(k) for k in ((self.cfg.get("chore") or {}).get("settings") or {})])
+                                     + list(chore_vars(self.cfg)))
         restore = os.path.exists(state_file)
         script = (f"__hobkin_state={shlex.quote(state_file)}\n__hobkin_cwd={shlex.quote(cwd_file)}\n"
                   + (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if restore else "")
@@ -2901,19 +3187,104 @@ class Agent:
         self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
         return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
 
+    def run_bash_remote(self, command: str, timeout: int, reset: bool) -> ToolResult:
+        """run_bash on the host: the same persistent shell (state saved in the workspace there), the folder it ends
+        in reported back on the output's last line, timeouts and /interrupt reaching the command over there too."""
+        try:
+            rw = self.remote_work()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.log("$", f"(not run) {command}")
+            self.log("=", f"({e})")
+            return f"Not run: {e}", True
+        sd, q = rw + "/.hobkin-shell", shlex.quote
+        if reset:
+            self.state["cwd"] = rw
+        cwd = self.cwd()
+        self.log("$", ("(fresh shell) " if reset else "") + command)
+        self.busy(f"running `{clip(' '.join(command.split()), 50, 0)}`")
+        self.interrupt = False
+        pre = ((f"rm -f {q(sd)}/shell.sh {q(sd)}/.cwd\n" if reset else "") + f"echo $$ > {q(sd)}/pid\n"
+               f"__hobkin_state={q(sd)}/shell.sh\n__hobkin_cwd={q(sd)}/.cwd\n"
+               "[ -f \"$__hobkin_state\" ] && source \"$__hobkin_state\" >/dev/null 2>&1\n" + SHELL_SAVE
+               + f"trap '__hobkin_save; printf \"\\n{REMOTE_CWD}%s\\n\" \"$PWD\"' EXIT\n")
+        with tempfile.TemporaryFile() as script, tempfile.TemporaryFile() as outf:
+            script.write(self.remote_script(command, cwd, pre).encode())
+            script.seek(0)
+            proc = subprocess.Popen(self.ssh_argv("bash --login -s"), cwd=self.work, env=self.ssh_env(), stdin=script,
+                                    stdout=outf, stderr=subprocess.STDOUT, start_new_session=True)
+            start, reason = time.time(), None
+            while proc.poll() is None:
+                self.poll_input(0.5)
+                if self.pending and self.cfg.get("front_desk", True):
+                    self.front_desk()
+                if self.stop:
+                    reason = "interrupted: hobkin is stopping"
+                elif self.interrupt:
+                    reason = "interrupted by the operator"
+                elif time.time() - start > timeout:
+                    reason = f"timed out after {timeout}s"
+                if reason:
+                    try:                                # over there first, then our ssh
+                        self.on_host(f"p=$(cat {q(sd)}/pid 2>/dev/null) && {{ kill -TERM -- -$(ps -o pgid= -p $p | tr -d ' ') "
+                                     f"2>/dev/null; kill -TERM $p 2>/dev/null; }}", timeout=15)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        proc.wait(5)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait()
+                    break
+            outf.seek(0)
+            out = outf.read().decode(errors="replace")
+        m = re.search(r"\n?" + REMOTE_CWD + r"([^\n]*)\n?$", out)
+        if m:
+            cwd, out = m.group(1) or cwd, out[:m.start()]
+        keep = int(self.cfg["output_limit"])
+        if len(out) > keep:
+            full = self.p("last-output.log")
+            write_atomic(full, out)
+            out = (f"{out[:keep // 2]}\n... [{len(out) - keep} characters cut: the whole output is in {full} (here, "
+                   f"not on {self.host()}) until your next long command; grep it] ...\n{out[-(keep // 2):]}")
+        self.state["cwd"] = cwd
+        status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)} on {self.host()}"
+        self.busy(None)
+        self.timeline(f"`{clip(command.strip(), 300, 100)}` on {self.host()} ({reason or f'exit code {proc.returncode}'})")
+        shown = clip(out, 1000, 800)
+        self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
+        return f"{out}\n[{status}]".strip(), bool(reason) or proc.returncode != 0
+
     def start_job(self, command: str) -> ToolResult:
         """Run a command detached (it outlives hobkin if need be), in the shell's current state, with its
         output and exit code in jobs/N/. The exit file appearing is how we know it finished."""
+        if self.host():
+            try:
+                rw = self.remote_work()
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return f"Not started: {e}", True
         n = self.state["next_job"] = self.state.get("next_job", 0) + 1
         jdir = self.p(f"jobs/{n}")
         os.makedirs(jdir, exist_ok=True)
-        state_file = os.path.join(self.p("shell") if self.safe else self.dir, "shell.sh")
-        script = (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if os.path.exists(state_file) else "") + command
-        env = self.safe_env(self.tool_env())
-        env.update({"HOBKIN_JOB": script, "HOBKIN_JOB_OUT": os.path.join(jdir, "out.log"),
-                    "HOBKIN_JOB_EXIT": os.path.join(jdir, "exit")})
-        proc = subprocess.Popen(self.sandboxed(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"']),
-                                cwd=self.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        files = {"HOBKIN_JOB_OUT": os.path.join(jdir, "out.log"), "HOBKIN_JOB_EXIT": os.path.join(jdir, "exit")}
+        if self.host():                    # the job runs over there; our ssh lives as long as it does
+            state = shlex.quote(rw + "/.hobkin-shell/shell.sh")
+            env = {**self.ssh_env(), **files, "HOBKIN_JOB": self.remote_script(
+                command, self.cwd(), f"[ -f {state} ] && source {state} >/dev/null 2>&1\n")}
+            argv = ["bash", "-c", f'printf "%s" "$HOBKIN_JOB" | {shlex.join(self.ssh_argv("bash --login -s"))} '
+                                  '> "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"']
+            cwd = self.work
+        else:
+            state_file = os.path.join(self.p("shell") if self.safe else self.dir, "shell.sh")
+            script = (f"source {shlex.quote(state_file)} >/dev/null 2>&1\n" if os.path.exists(state_file) else "") + command
+            env = self.safe_env(self.tool_env())
+            env.update({"HOBKIN_JOB": script, **files})
+            argv = self.sandboxed(["bash", "-c", 'bash -c "$HOBKIN_JOB" > "$HOBKIN_JOB_OUT" 2>&1; echo $? > "$HOBKIN_JOB_EXIT"'])
+            cwd = self.cwd()
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True)
         self.job_procs[n] = proc            # kept so it's reaped; the exit file is what counts
         self.state.setdefault("jobs", {})[str(n)] = {"command": command[:500], "started": time.time(), "dir": jdir,
@@ -2962,13 +3333,13 @@ class Agent:
     # --- files, skills, images
     def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
         full = self.resolve(path)
-        if os.path.isdir(full):
-            entries = sorted(os.listdir(full))
-            shown = [e + ("/" if os.path.isdir(os.path.join(full, e)) else "") for e in entries[:500]]
-            return f"{full} (folder, {len(entries)} entries):\n" + "\n".join(shown), False
-        if not os.path.isfile(full):
+        kind = self.fs_kind(full)
+        if kind == "d":
+            entries = self.fs_list(full)
+            return f"{full} (folder, {len(entries)} entries):\n" + "\n".join(entries[:500]), False
+        if kind != "f":
             return f"No such file: {full}", True
-        data = open(full, "rb").read()
+        data = self.fs_read(full)
         if b"\0" in data[:8000]:
             return f"{full} is a binary file ({len(data)} bytes); not shown.", True
         lines = data.decode(errors="replace").splitlines()
@@ -2988,12 +3359,11 @@ class Agent:
         full = self.resolve(path)
         if not self.writable(full):
             return SAFE_REFUSED.format(path=full), True
-        existed = os.path.exists(full)
-        if os.path.isdir(full):
+        kind = self.fs_kind(full)
+        if kind == "d":
             return f"{full} is a folder.", True
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(content)
+        existed = kind == "f"
+        self.fs_write(full, content.encode())
         n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         note = ""
         if "\n" not in content and "\\n" in content and len(content) > 80:
@@ -3005,9 +3375,9 @@ class Agent:
         full = self.resolve(path)
         if not self.writable(full):
             return SAFE_REFUSED.format(path=full), True
-        if not os.path.isfile(full):
+        if self.fs_kind(full) != "f":
             return f"No such file: {full}. Use write_file to create it.", True
-        text = open(full, encoding="utf-8", errors="replace").read()
+        text = self.fs_read(full).decode(errors="replace")
         if not old:
             return "old_text is empty. To write a whole file use write_file.", True
         note = ""
@@ -3028,8 +3398,7 @@ class Agent:
                     "surrounding lines so it matches once, or set replace_all."), True
         first = text.index(old)
         text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(text)
+        self.fs_write(full, text.encode())
         # Show the result around the (first) change, so it can be checked
         lines = text.splitlines()
         at = text.count("\n", 0, first)
@@ -3076,9 +3445,9 @@ class Agent:
 
     def view_image(self, path: str) -> ToolResult:
         full = self.resolve(path)
-        if not os.path.isfile(full):
+        if self.fs_kind(full) != "f":
             return f"No such file: {full}", True
-        data = open(full, "rb").read()
+        data = self.fs_read(full)
         kinds = {b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"GIF8": "image/gif"}
         media = next((t for magic, t in kinds.items() if data.startswith(magic)), None)
         if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
@@ -3109,7 +3478,7 @@ class Agent:
             if bad:
                 return f"No step {bad[0]}: the steps are 1 to {len(g['steps'])}.", True
             g["done"] = sorted(set(g["done"]) | set(done))
-            write_atomic(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g))
+            self.fs_write(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g).encode())
             self.step_done = True                      # a good moment to compact, if it's due
             self.log("goal", "ticked " + ", ".join(f"{n}. {g['steps'][n - 1]}" for n in done))
             left = [i + 1 for i in range(len(g["steps"])) if i + 1 not in g["done"]]
@@ -3122,11 +3491,10 @@ class Agent:
         missing = [k for k in ("goal", "what_would", "steps") if not inp.get(k)]
         if missing:
             return f"A goal needs {', '.join(missing)} (and how_it_works, why_it_doesnt).", True
-        folder = self.cwd()
-        if os.path.realpath(folder) == os.path.realpath(self.work):   # not in a task folder yet: make one
+        folder, base = self.cwd(), self.wdir()
+        if os.path.normpath(folder) == os.path.normpath(base):   # not in a task folder yet: make one
             slug = re.sub(r"[^a-z0-9]+", "-", str(inp["goal"]).lower()).strip("-")[:40] or "task"
-            folder = os.path.join(self.work, slug)
-            os.makedirs(folder, exist_ok=True)
+            folder = os.path.join(base, slug)
         keep = g.get("done", []) if g.get("open") and g.get("folder") == folder else []
         g = {"goal": str(inp["goal"]), "how_it_works": str(inp.get("how_it_works") or ""),
              "why_it_doesnt": str(inp.get("why_it_doesnt") or ""), "what_would": str(inp["what_would"]),
@@ -3134,7 +3502,7 @@ class Agent:
              "folder": folder, "open": True, "set": time.time()}
         self.state["goal"] = g
         path = os.path.join(folder, "CHECKLIST.md")
-        write_atomic(path, self.goal_checklist(g))
+        self.fs_write(path, self.goal_checklist(g).encode())
         self.save_state()
         self.log("goal", f"Goal: {g['goal']}\nHow it works: {g['how_it_works'] or '-'}\nWhy it doesn't: "
                          f"{g['why_it_doesnt'] or '-'}\nWhat would: {g['what_would']}\n"
@@ -3688,6 +4056,15 @@ class Agent:
         """(path, text) of the checklist the agent's working from: the CHECKLIST.md in its workspace
         changed most recently, if it changed in this conversation."""
         newest, since = None, self.state.get("context_started", 0)
+        if self.host():                            # on a host: the open goal's checklist, if there is one
+            g = self.state.get("goal") or {}
+            if not g.get("open"):
+                return None
+            path = os.path.join(g["folder"], "CHECKLIST.md")
+            try:
+                return path, self.fs_read(path).decode(errors="replace")
+            except (OSError, subprocess.TimeoutExpired):
+                return None
         for root, dirs, files in os.walk(self.work):
             dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("node_modules", "__pycache__", ".venv")]
             for f in files:
@@ -4792,48 +5169,19 @@ def hearthboard_user(url: str, token: str) -> dict:
         sys.exit(f"hobkin: can't reach a hearthboard at {url}: {e}")
 
 
-def join_hearthboard(d: str, url: str, token: str) -> None:
-    """--hearthboard URL TOKEN: the board's own skill (in this agent's own skills/, so agents that aren't
-    workers don't think they have a work system), its token in its secrets.env (only you can read it; the
-    model never sees it), and an idle prompt that runs the board's wait loop. Nothing else in hobkin knows
-    about hearthboard: the skill carries the board's rules."""
-    req = urllib.request.Request(f"{url}/api/skill", headers={"authorization": f"Bearer {token}", "user-agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        skill = r.read().decode()
-    os.makedirs(os.path.join(d, "skills", "hearthboard"), exist_ok=True)
-    write_atomic(os.path.join(d, "skills", "hearthboard", "SKILL.md"), skill)
-    env = {"HEARTHBOARD_URL": url, "HEARTHBOARD_TOKEN": token}
-    path = os.path.join(d, "secrets.env")
-    kept = [l for l in read(path).splitlines() if l.split("=", 1)[0].strip() not in env]
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write("\n".join(kept + [f"{k}={v}" for k, v in env.items()]) + "\n")
-    os.chmod(path, 0o600)
-    cfg_path = os.path.join(d, "config.json")
-    cfg = read_json(cfg_path, {}, exit_if_broken=True)
-    cfg.update({"idle_prompt": None,
-                # hobkin waits on the board while the agent's idle, and wakes it with what the board says
-                "wake": {"url": f"{url}/api/wait?timeout=50", "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"},
-                         "quiet": {"reason": "timeout"}},
-                # The board's chat, for the front desk: answered while the agent's busy running a command
-                "inbox": {"url": f"{url}/api/chat/inbox?flat=1", "reply": f"{url}/api/chat/{{thread}}/messages",
-                          "headers": {"Authorization": "Bearer ${HEARTHBOARD_TOKEN}"}, "every": 15}})
-    write_json(cfg_path, cfg)
-
-
 def cmd_setup(argv):
     """hobkin URL MODEL [KEY] [--chat] [--hearthboard URL TOKEN] ...: configure the model endpoint, start an
     agent on it, maybe join it to a hearthboard, maybe chat. With --hearthboard alone, the configured model."""
-    pos, opts = split_args(argv, {"--chat", "--no-service", "--force", "--safe"}, {"--id", "--api", "--chore"},
-                           {"--hearthboard"}, {"--set"})
+    pos, opts = split_args(argv, {"--chat", "--no-service", "--force", "--safe"}, {"--id", "--api", "--chore", "--host"},
+                           {"--hearthboard"}, {"--set", "--secret"})
     board = opts.get("--hearthboard")
-    if len(pos) not in (2, 3) and not ((board or opts.get("--chore")) and not pos):
+    if len(pos) not in (2, 3) and not ((board or opts.get("--chore") or opts.get("--host") is not None) and not pos):
         sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--hearthboard BOARD_URL TOKEN] [--chore NAME [--set K=V]...] "
-                 "[--id ID] [--safe] [--api anthropic|openai] [--no-service] [--force]\n"
+                 "[--secret K=V]... [--host user@host] [--id ID] [--safe] [--api anthropic|openai] [--no-service] [--force]\n"
                  "       hobkin --hearthboard BOARD_URL TOKEN [--id ID] [--chat]   (another agent, on the configured model)\n"
                  "       hobkin --chore NAME [--set K=V]... [--id ID] [--chat]      (likewise, with a chore)")
-    if opts.get("--set") and not opts.get("--chore"):
-        sys.exit("hobkin: --set is for a chore's settings: give --chore NAME too")
+    if (opts.get("--set") or opts.get("--secret")) and not opts.get("--chore"):
+        sys.exit("hobkin: --set and --secret are a chore's settings: give --chore NAME too")
     board_user = None
     if board:                                   # check the token before anything is written
         board = (board[0].rstrip("/"), board[1])
@@ -4936,9 +5284,6 @@ def new_agent_id() -> str:
     return stem() + stem() + stem() + "kin"
 
 
-JOINED = ("You're now a worker on the hearthboard at {url}, as {user}. Your hearthboard skill (just added) says "
-          "how to work there: open it, say hello on the board, then start its wait loop.")
-
 
 def queue_message(d: str, text: str) -> None:
     """A message for an agent, through its queue file: read within a second if it's running, at start-up if
@@ -4953,22 +5298,29 @@ def prepare_agent(agent_id, opts, board=None, board_user=None):
     d = os.path.join(HOME, agent_id)
     ensure_shared()
     os.makedirs(d, exist_ok=True)
-    if opts.get("--safe"):                  # in the agent's own config, which safe mode won't let it change
+    if opts.get("--safe") or opts.get("--host") is not None:   # the agent's own config, out of its reach
         path = os.path.join(d, "config.json")
         cfg = read_json(path, {}, exit_if_broken=True)
-        cfg["safe_mode"] = True
+        if opts.get("--safe"):
+            cfg["safe_mode"] = {"remote_account": True} if opts.get("--host") else True
+        if opts.get("--host") is not None:
+            cfg["host"] = opts["--host"] if opts["--host"] not in ("", "none", "local") else None
         write_json(path, cfg)
-    if board:
-        join_hearthboard(d, *board)
+    if opts.get("--host") and opts.get("--safe"):
+        print(f"{agent_id}: safe mode on {opts['--host']}: its limits are that account's own permissions there")
+    if board:                               # --hearthboard URL TOKEN: the built-in hearthboard chore
+        _, given = install_chore(agent_id, "hearthboard", [f"url={board[0]}", f"user={board_user.get('username')}"],
+                                 [f"token={board[1]}"])
         print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (the board's skill is in "
               f"{os.path.join(d, 'skills', 'hearthboard')}, its token in {os.path.join(d, 'secrets.env')})")
-        queue_message(d, JOINED.format(url=board[0], user=board_user.get("username")))
+        queue_message(d, given)
     if opts.get("--chore"):
-        name = install_chore(agent_id, opts["--chore"], opts.get("--set") or [])
-        settings = (read_json(os.path.join(d, "config.json"), {}).get("chore") or {}).get("settings") or {}
-        print(f"{agent_id}: chore {name}" + (" (" + ", ".join(f"{k}={v}" for k, v in settings.items()) + ")" if settings else "")
-              + f": instructions in {os.path.join(d, 'CHORE.md')}")
-        queue_message(d, CHORE_GIVEN.format(name=name))
+        name, given = install_chore(agent_id, opts["--chore"], opts.get("--set") or [], opts.get("--secret") or [])
+        c = read_json(os.path.join(d, "config.json"), {}).get("chores", {}).get(name) or {}
+        shown = [f"{k}={v}" for k, v in (c.get("settings") or {}).items()] + [f"{k}=(secret)" for k in c.get("secrets") or {}]
+        print(f"{agent_id}: chore {name}" + (f" ({', '.join(shown)})" if shown else "")
+              + f": instructions in {os.path.join(d, f'CHORE-{name}.md')}")
+        queue_message(d, given)
 
 
 def restart_running(agent_id) -> None:
@@ -5167,9 +5519,10 @@ def cmd_breakglass(argv):
     """hobkin breakglass ID ["what's wrong"] [--for 2h] [--budget DOLLARS|none] [--with ID,ID] [--off]
     With nothing said about what's wrong, it's a salvage: save what can't be replaced (SALVAGE). --with makes it
     one incident shared with those agents (joining theirs if they're on one; declaring it for them if they aren't)."""
-    pos, opts = split_args(argv, {"--off"}, {"--for", "--budget", "--with"})
+    pos, opts = split_args(argv, {"--off"}, {"--for", "--budget", "--with", "--chore"}, many={"--set", "--secret"})
     if not (len(pos) == 1 and not opts.get("--with") if opts.get("--off") else len(pos) in (1, 2)):
-        sys.exit('usage: hobkin breakglass ID ["what\'s wrong"] [--for 2h] [--budget DOLLARS|none] [--with ID,ID]\n'
+        sys.exit('usage: hobkin breakglass ID ["what\'s wrong"] [--for 2h] [--budget DOLLARS|none] [--with ID,ID] '
+                 '[--chore PLAYBOOK [--set K=V]...]\n'
                  '       hobkin breakglass ID --off')
     agent_id = valid_id(pos[0])
     team = [valid_id(t) for t in (opts.get("--with") or "").split(",") if t.strip() and t.strip() != agent_id]
@@ -5203,6 +5556,10 @@ def cmd_breakglass(argv):
     if len(names) > 1:
         sys.exit(f"hobkin: those agents are on different incidents ({', '.join(sorted(names))}); end one first")
     incident = next(iter(names), None) or (f"{time.strftime('%Y%m%d-%H%M')}-{agent_id}" if team else None)
+    playbook = None
+    if opts.get("--chore"):                         # the incident's playbook: a chore it's given now (mender, ark...)
+        playbook, _ = install_chore(agent_id, opts["--chore"], opts.get("--set") or [], opts.get("--secret") or [])
+        print(f"{agent_id}: playbook for this incident: the {playbook} chore")
 
     def declare(t):
         cfg, old = config(t), on(t)
@@ -5224,6 +5581,10 @@ def cmd_breakglass(argv):
             g["budget"] = None if opts["--budget"].lower() == "none" else float(opts["--budget"])
         if incident:
             g["incident"] = incident
+        if playbook and t == agent_id:
+            g["playbook"] = playbook
+        elif old.get("playbook"):
+            g["playbook"] = old["playbook"]
         cfg["break_glass"] = g
         print(f"{t}: break-glass mode until {when_text(g['until'])}: {g['reason']}"
               + (f" (incident {incident})" if incident else ""))
@@ -5264,7 +5625,8 @@ def main(argv):
         return cmd_watch(argv[1:])
     if argv[:1] == ["models"]:
         return cmd_models(argv[1:])
-    if argv and (argv[0].startswith(("http://", "https://")) or "--hearthboard" in argv or "--chore" in argv):
+    if argv and (argv[0].startswith(("http://", "https://")) or "--hearthboard" in argv or "--chore" in argv
+                 or "--host" in argv):
         return cmd_setup(argv)
     if argv[:1] == ["service"]:
         return cmd_service(argv[1:])

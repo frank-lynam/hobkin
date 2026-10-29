@@ -815,7 +815,8 @@ try:
           r.returncode == 0 and "joined http://127.0.0.1:48790/board as worker.7" in r.stdout
           and open(ad + "/skills/hearthboard/SKILL.md").read().startswith("---\nname: hearthboard")
           and not os.path.exists(hs + "/_shared/skills/hearthboard")
-          and "HEARTHBOARD_TOKEN=hb-good" in sec and "HEARTHBOARD_URL=http://127.0.0.1:48790/board" in sec
+          and "HEARTHBOARD_TOKEN=hb-good" in sec and "hb-good" not in open(ad + "/config.json").read()
+          and json.load(open(ad + "/config.json"))["chores"]["hearthboard"]["env"]["url"] == "HEARTHBOARD_URL"
           and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
     check("[hearthboard] on the configured model, with hobkin waiting on the board for it",
           "hi board" in open(ad + "/context.jsonl").read() and "You're now a worker" in open(ad + "/context.jsonl").read()
@@ -999,6 +1000,14 @@ try:
     check("[salvage] an extension with nothing said stays a salvage", g.get("salvage") is True and g.get("extensions") == 1, g)
     glass("disk full", "--for", "2h"); g = json.load(open(d + "/config.json"))["break_glass"]
     check("[salvage] a reason given makes it an ordinary incident", g["reason"] == "disk full" and "salvage" not in g, g)
+    r = glass("disk full", "--for", "2h", "--chore", os.path.join(HERE, "chores", "demo"), "--set", "folder=" + BASE)
+    for _ in range(100):
+        if "## Your playbook" in ctx(d)[0]["content"]: break
+        time.sleep(0.2)
+    g = json.load(open(d + "/config.json"))["break_glass"]
+    check("[glass] --chore: the chore is given, and named as the incident's playbook",
+          g.get("playbook") == "demo" and "follow your **demo** chore" in ctx(d)[0]["content"]
+          and "demo" in json.load(open(d + "/config.json"))["chores"], r.stdout + r.stderr)
     n = alerts().count("OFF (switched off)"); glass("--off")
     for _ in range(100):
         if alerts().count("OFF (switched off)") > n: break
@@ -1269,6 +1278,70 @@ try:
     check("[notify] no alert_command: no notify tool", "notify" not in [t["name"] for t in body2["tools"]])
     p2.send_signal(signal.SIGTERM); p2.wait(10)
 
+    # host: the agent works on another machine over ssh (a stand-in ssh here: another "home", none of our environment)
+    remote_home = os.path.join(BASE, "remote-home")
+    fake_ssh = f"{sys.executable} {os.path.join(HERE, 'fake_ssh.py')}"
+    h = home("host", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "host": "web-1", "ssh": fake_ssh})
+    os.makedirs(h + "/hoster/work/spells"); open(h + "/hoster/work/spells/hello.sh", "w").write("echo hello from $(hostname -s) $HOME\n")
+    open(h + "/hoster/secrets.env", "w").write("DB_PASS=s3cret\n")
+    p, aid, d = start(h, "hoster", FAKE_SSH_HOME=remote_home)
+    rwork = os.path.join(remote_home, "hobkin-work", "hoster")
+    check("[host] first contact: a workspace on the host, and the chore's spells copied there",
+          "working on web-1: workspace " + rwork in open(d + "/out").read() and os.path.isfile(rwork + "/spells/hello.sh"),
+          open(d + "/out").read()[-500:])
+    say(d, "run: echo HOME=$HOME WORK=$HOBKIN_WORK DB=$DB_PASS TESTKEY=${TESTKEY:-unset} && pwd")
+    wait_for(d, "Done. Output was: HOME=")
+    res = json.dumps(last_results(d))
+    check("[host] commands run there: its home, our workspace there, our secrets, never the model key",
+          f"HOME={remote_home} WORK={rwork} DB=s3cret TESTKEY=unset" in res and "now in your workspace on web-1" in res
+          and "__HOBKIN_CWD__" not in res, res[:600])
+    say(d, "run: mkdir -p proj && cd proj && export FLAVOUR=mint"); wait_for(d, "now in proj/ in your workspace on web-1")
+    say(d, "run: echo $FLAVOUR in $(pwd)"); wait_for(d, f"\n    mint in {rwork}/proj\n")
+    check("[host] the shell keeps its folder and variables between commands, there; secrets never saved in its state",
+          "s3cret" not in read_or_empty(rwork + "/.hobkin-shell/shell.sh") and "FLAVOUR" in read_or_empty(rwork + "/.hobkin-shell/shell.sh"))
+    say(d, 'call: write_file {"path": "notes.txt", "content": "made on the host\\n"}'); wait_for(d, "Created " + rwork + "/proj/notes.txt", file="context.jsonl")
+    say(d, 'call: edit_file {"path": "notes.txt", "old_text": "made", "new_text": "edited"}'); wait_for(d, "Edited " + rwork + "/proj/notes.txt", file="context.jsonl")
+    say(d, 'call: read_file {"path": "notes.txt"}'); wait_for(d, "read_file> " + rwork + "/proj/notes.txt")
+    check("[host] file tools act on the host, relative to the shell's folder there",
+          open(rwork + "/proj/notes.txt").read() == "edited on the host\n" and not os.path.exists(d + "/work/proj/notes.txt"))
+    say(d, 'call: write_file {"path": "$HOBKIN_MEMORY", "content": "- the host is web-1\\n"}'); wait_for(d, "Replaced " + d + "/MEMORY.md", file="context.jsonl")
+    check("[host] the agent's own memory stays here", "web-1" in open(d + "/MEMORY.md").read()
+          and not os.path.exists(os.path.join(remote_home, "MEMORY.md")))
+    say(d, 'call: bash {"command": "sleep 1; echo job-done > ../job.txt", "background": true}')
+    for _ in range(100):
+        if os.path.exists(rwork + "/job.txt"): break
+        time.sleep(0.1)
+    check("[host] background jobs run there too", read_or_empty(rwork + "/job.txt") == "job-done\n")
+    os.makedirs(rwork + "/tools/greet")
+    json.dump({"description": "Say hi", "input_schema": {"type": "object", "properties": {"who": {"type": "string"}}}},
+              open(rwork + "/tools/greet/tool.json", "w"))
+    open(rwork + "/tools/greet/run", "w").write("#!/bin/sh\npython3 -c 'import json,sys; print(\"hi\", json.load(sys.stdin)[\"who\"])'\n")
+    os.chmod(rwork + "/tools/greet/run", 0o755); time.sleep(11)          # past the listing's cache
+    say(d, 'call: greet {"who": "web-1"}'); wait_for(d, "Done. Output was: hi web-1")
+    check("[host] its own tools are found and run on the host", True)
+    sysp = ctx(d)[0]["content"]
+    check("[host] its instructions say where it works, and that memory stays here",
+          "# Where you work: web-1" in sysp and rwork in sysp, sysp[-900:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # a host that's down: the agent starts anyway, and its commands say why
+    h2 = home("hostdown", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+              {"idle_prompt": None, "host": "down", "ssh": fake_ssh})
+    p, aid, d = start(h2, FAKE_SSH_HOME=remote_home)
+    say(d, "run: uptime"); wait_for(d, "=> (on down: ssh: connect to host down port 22: Connection refused)")
+    check("[host] unreachable: it still starts, and each command says what ssh said", "can't reach down yet" in open(d + "/out").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # safe mode can't sandbox another machine: it won't start until the remote account is named as the limit
+    h3 = home("hostsafe", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+              {"idle_prompt": None, "host": "web-1", "ssh": fake_ssh, "safe_mode": True})
+    r = subprocess.run([sys.executable, HOB, "x"], env={**os.environ, "HOBKIN_HOME": h3, "TESTKEY": "test-key", "FAKE_SSH_HOME": remote_home},
+                       capture_output=True, text=True, timeout=30)
+    check("[host] safe mode alone won't start on a host", r.returncode != 0 and "remote_account" in r.stderr, r.stderr)
+    cfgp = os.path.join(h3, "_shared", "config.json"); c = json.load(open(cfgp)); c["safe_mode"] = {"remote_account": True}; json.dump(c, open(cfgp, "w"))
+    p, aid, d = start(h3, "y", FAKE_SSH_HOME=remote_home)
+    check("[host] ...and does once its account is named as the limit", "that account's own permissions" in open(d + "/out").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # chores: a standing job from a folder (settings, config, CHORE.md, tools, spells); its watch wakes it only when needed
     h = home("chores", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
     cenv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
@@ -1288,8 +1361,8 @@ try:
     cfg = json.load(open(d + "/config.json"))
     check("[chore] set up: its config merged, its settings recorded, CHORE.md filled in, tools and spells in the workspace",
           r.returncode == 0 and f"sw: chore demo (folder={yard}, pattern=*.litter)" in r.stdout
-          and cfg["wake"] == {"command": "spells/check.sh", "every": 10} and cfg["chore"]["settings"] == {"folder": yard, "pattern": "*.litter"}
-          and open(d + "/CHORE.md").read().startswith(f"# Demo {yard}") and os.access(d + "/work/spells/check.sh", os.X_OK)
+          and cfg["wake"] == {"command": "spells/check.sh", "every": 10} and cfg["chores"]["demo"]["settings"] == {"folder": yard, "pattern": "*.litter"}
+          and open(d + "/CHORE-demo.md").read().startswith(f"# Demo {yard}") and os.access(d + "/work/spells/check.sh", os.X_OK)
           and json.load(open(d + "/work/tools/count_litter/tool.json"))["description"] == f"Count the litter in {yard}.",
           r.stdout + r.stderr)
     wait_for(d, "you've been given a chore: demo", 20, file="context.jsonl")
@@ -1306,6 +1379,27 @@ try:
     wait_for(d, "woken by the watch", 30)
     check("[chore] something to do: the watch wakes it with what it printed", f"2 pieces of litter in {yard}" in open(d + "/context.jsonl").read()
           and "woken by your watch (`spells/check.sh`)" in open(d + "/context.jsonl").read())
+    # a second chore alongside, with a secret setting: in secrets.env, never in config or the model's sight
+    c2 = os.path.join(BASE, "chores2", "vault"); os.makedirs(c2)
+    json.dump({"name": "vault", "description": "a chore with a secret", "settings": {
+        "bucket": {"about": "where"}, "key": {"about": "its access key", "secret": True, "env": "VAULT_KEY"}},
+        "config": {"inbox": {"url": "http://x/inbox", "headers": {"Authorization": "Bearer {{key}}"}}}},
+        open(c2 + "/chore.json", "w"))
+    open(c2 + "/CHORE.md", "w").write("# Vault\n\nCopy to {{bucket}} with key {{key}}.\n")
+    r = subprocess.run([sys.executable, HOB, "--chore", c2, "--set", "bucket=b1", "--set", "key=nope", "--id", "sw", "--no-service"],
+                       env=cenv, capture_output=True, text=True, timeout=60)
+    check("[chore] a secret given with --set is refused", r.returncode != 0 and "key is a secret: give it with --secret" in r.stderr, r.stderr)
+    r = subprocess.run([sys.executable, HOB, "--chore", c2, "--set", "bucket=b1", "--secret", "key=TOPSECRET", "--id", "sw", "--no-service"],
+                       env=cenv, capture_output=True, text=True, timeout=60)
+    cfg = json.load(open(d + "/config.json"))
+    check("[chore] a secret setting: in secrets.env (600) under its env name, nowhere else; ${NAME} where it's used",
+          r.returncode == 0 and "VAULT_KEY=TOPSECRET" in read_or_empty(d + "/secrets.env")
+          and oct(os.stat(d + "/secrets.env").st_mode & 0o777) == "0o600"
+          and "TOPSECRET" not in open(d + "/config.json").read() + open(d + "/CHORE-vault.md").read()
+          and cfg["inbox"]["headers"]["Authorization"] == "Bearer ${VAULT_KEY}" and "with key ${VAULT_KEY}" in open(d + "/CHORE-vault.md").read(),
+          r.stdout + r.stderr)
+    check("[chore] several chores side by side, each with its own instructions", set(cfg["chores"]) == {"demo", "vault"}
+          and os.path.exists(d + "/CHORE-demo.md") and "key=(secret)" in r.stdout)
     subprocess.run([sys.executable, HOB, "send", "sw", "/stop"], env=cenv, timeout=30)
     for _ in range(50):
         if not hbk.is_running(d): break

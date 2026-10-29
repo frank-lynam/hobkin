@@ -163,7 +163,7 @@ tmux, or a systemd user service.
 | `shell.sh` | Its shell's saved state (folder, variables, functions, aliases), restored before each command. Secrets are never saved here. |
 | `secrets.env` | Optional `KEY=value` lines, set as environment variables in its shell (never put in its context). |
 | `config.json` | Optional per-agent settings over the shared ones. |
-| `*.md` | Optional per-agent instructions; replace shared files of the same name. |
+| `*.md` | Optional per-agent instructions; replace shared files of the same name. Chores put theirs here as `CHORE-<name>.md`. |
 | `archive/` | At each compaction, the old conversation (`context-*.jsonl`, messages only) and its `out` log (`out-*.log`). Deleted after 30 days, except the newest. |
 | `jobs/` | Background jobs' output and exit codes; a finished job's folder goes after 30 days. |
 | `skills/` | Its own skills (a hearthboard worker's board skill goes here). |
@@ -523,6 +523,38 @@ Spend counts only where the API reports each call's cost (OpenRouter does);
 in one account stay apart by convention (their own folders), not by enforcement.
 Use a separate account or container when that matters.
 
+## Working on another machine
+
+```sh
+hobkin --host admin@web-1 --id web1                # a new agent working on web-1
+hobkin --chore pulse --host admin@web-1            # ...with a chore: any chore works this way
+```
+
+With `"host": "user@host"` (or an alias from `~/.ssh/config`), the agent works
+there over ssh:
+- **What happens there:** commands (the same persistent shell, its folder and
+  variables kept between commands), background jobs, the file tools, the watch
+  (`wake.command`) and its own tools, all starting in its workspace on the host,
+  `~/hobkin-work/ID`. A chore's spells and tools are copied there on first contact
+  (never over ones already there).
+- **What stays here:** memory, blooper reel, conversation, notes, config. The file
+  tools still reach `$HOBKIN_MEMORY` and `$HOBKIN_BLOOPERS` here.
+- **The connection:** keys only (no password prompts), one shared connection
+  (ControlMaster), a new host's key trusted on first use. Each command's script
+  goes over ssh's stdin, with `secrets.env` as exported variables, so secrets never
+  appear on a command line there, and they're never saved in its shell state.
+  `"ssh"` in config is the command to use (`"ssh -p 2222 -i ~/.ssh/web1"`).
+- **When it's down:** the agent still starts, and each command says what ssh said.
+  A watch that can't reach the host wakes the agent with that, so a monitor run
+  from outside survives the machine dying.
+- **Safe mode** can't sandbox another machine (Landlock only reaches this one), so
+  with a host it refuses to start unless you say the remote account is the limit:
+  `"safe_mode": {"remote_account": true}` (`--safe --host ...` sets that). Then
+  give it an account there that can only do what it should.
+
+One host per agent; for a fleet, run an agent per machine (the shared incidents
+and watch screen are built for that).
+
 ## Safe mode
 
 For a system people depend on: `"safe_mode": true` in an agent's `config.json`
@@ -575,7 +607,13 @@ For an incident, when you want the agent working it as one of the hands on deck:
 hobkin breakglass ops-1 "api returning 500s since 14:10" --for 2h [--budget 50|none]
 hobkin breakglass ops-1 --off          # end it early
 hobkin breakglass ops-1 --for 1h       # nothing said: salvage
+hobkin breakglass ops-1 "site down" --chore mender   # with a chore as its playbook
 ```
+
+**A playbook:** `--chore NAME` (with `--set`/`--secret` as for any chore) gives
+the agent that chore and names it in the incident's instructions as what to
+follow, e.g. hobkin-chores' `mender` (find the cause and mend it) or `ark` (save
+the data). The break-glass rules still hold around it.
 
 **Salvage,** when you don't say what's wrong: the agent assumes the system is
 falling over and may be gone soon, and saves what can't be replaced while it's
@@ -815,25 +853,35 @@ tidy, watch a system's health, and so on. The collection lives in
 it and give a new or existing agent one:
 
 ```sh
-hobkin --chore tidy --set folder=~/Downloads --id tidier --safe
-hobkin URL MODEL KEY --chore health-watch --chat       # a new agent on a new model
+hobkin --chore sweep --set folder=~/Downloads --id tidier --safe
+hobkin URL MODEL KEY --chore pulse --chat              # a new agent on a new model
+hobkin --chore ark --set dest=s3://backups/web-1 --secret aws_secret_access_key=...   # a secret setting
 ```
 
-A chore is found by path, or by name in `_shared/chores/` and the folders in
-`"chore_dirs"` (in config). It's a folder:
+A chore is found by path, by name in `_shared/chores/` and the folders in
+`"chore_dirs"` (in config), or built in (`hearthboard`). An agent can hold several;
+each gets its own instructions file. A chore is a folder:
 
 | File | What it is |
 |---|---|
-| `chore.json` | `name`, `description`, `settings` (each with an `about` and maybe a `default`; one without a default must be given with `--set`), and `config`: settings merged into the agent's `config.json` (a `wake` watch, `safe_mode` write folders, an idle prompt...). |
-| `CHORE.md` | Its instructions, copied into the agent's folder, so they're part of its instructions every turn. |
+| `chore.json` | `name`, `description`, `settings` (each with an `about` and maybe a `default`; one without a default must be given with `--set`), and `config`: settings merged into the agent's `config.json` (a `wake` watch, `safe_mode` write folders, an idle prompt...). Optional: `fetch` (files to download into the agent's folder at setup), `given` (the message that tells the agent), `apprentice: false` (leave out the spells rule below). |
+| `CHORE.md` | Its instructions, copied into the agent's folder as `CHORE-<name>.md`, so they're part of its instructions every turn. |
 | `tools/` | Tools for it (see "Its tools"), copied to `work/tools/`. |
 | `spells/` | Starter scripts, copied to `work/spells/`. |
 
 `{{setting}}` in `CHORE.md`, the config and tool descriptions is filled in, and
-each setting reaches commands, tools and the watch as `CHORE_<NAME>` (`folder`
-→ `$CHORE_FOLDER`). Setting up records the chore and its settings in the agent's
-`config.json` (`"chore"`) and tells the agent it has a new job. Running it again
-with other settings updates it.
+each setting reaches commands, tools and the watch as an environment variable:
+its `env` name if it has one, else `CHORE_<NAME>` (`folder` → `$CHORE_FOLDER`).
+
+**Secret settings** (`"secret": true`) are given with `--secret NAME=VALUE`, or
+asked for at a terminal; `--set` refuses them. The value goes only into the
+agent's `secrets.env` (readable only by you), and wherever `{{it}}` appears it
+becomes `${ITS_ENV_NAME}`: hobkin fills those in headers itself, and commands
+see the variable, so the value never sits in config or in front of the model.
+
+Setting up records the chore (its settings, and its secrets by name only) in the
+agent's `config.json` under `"chores"` and tells the agent it has a new job.
+Running it again with other settings updates it.
 
 Every chore agent also gets the same rule of thumb: be **the sorcerer's
 apprentice, only wiser**. Write spells (scripts in `work/spells/`) instead of
@@ -886,8 +934,13 @@ All of it is plain text in hobkin.py and AGENTS.md, so rein it in as you like.
 
 [Hearthboard](https://github.com/frank-lynam/hearthboard) (formerly
 agent-tickets) is a ticket tracker for agents. `--hearthboard URL TOKEN` (see
-the top) sets an agent up for it in one go; the running agent knows nothing
-about hearthboard beyond the board's skill. By hand, that's:
+the top) sets an agent up for it in one go: it's short for the built-in
+`hearthboard` chore (`--chore hearthboard --set url=URL --secret token=TOKEN`),
+after checking the token with the board. That chore fetches the board's skill,
+keeps the token in `secrets.env` as `HEARTHBOARD_TOKEN` (the URL reaches commands
+as `HEARTHBOARD_URL`), and sets the board's wait (`wake`) and chat (`inbox`) in
+config. The running agent knows nothing about hearthboard beyond that. By hand,
+roughly:
 
 ```sh
 hobkin                            # note the id, then /stop it (Ctrl-C)
@@ -980,7 +1033,11 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
-- chores (settings, setting up, the watch staying quiet until there's work),
+- working on a host (commands, the shell's state, file tools, jobs, own tools,
+  memory staying here, a host that's down, safe mode's rule), using a stand-in
+  ssh (`tests/fake_ssh.py`: another "home", none of our environment);
+- chores (settings, secret settings, several per agent, a break-glass playbook,
+  setting up, the watch staying quiet until there's work),
   safe mode's write folders, and the rate-limited `notify` tool;
 - the agent's own tools, `hobkin pack` and restoring a bundle, `hobkin purge`,
   safe mode (where the kernel has Landlock) and systemd services (where there's

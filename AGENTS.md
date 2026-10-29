@@ -12,8 +12,11 @@
 - **Nothing model-specific is hard-coded:** models come from config.json, and context
   windows are asked of the API (or set in config, or learned from errors). Nothing
   tracker-specific belongs in the running agent either; that's instructions (skills) and secrets. The one
-  exception is setup: `--hearthboard` (`join_hearthboard`) only fetches the board's skill and writes the token
-  and idle prompt, so a worker is one command.
+  exception is setup: `--hearthboard` is short for the built-in `hearthboard` chore (`BUILTIN_CHORES`), which
+  fetches the board's skill and writes the token, wake and inbox config, so a worker is one command.
+- **Mechanisms in core, jobs in chores.** What must hold even if the agent edits it or it's missing (safe mode,
+  break glass's switch, timers and audit, the host connection, rate limits) is hobkin.py. A job description
+  (instructions, settings, spells, a default config) is a chore.
 - **Messages are stored in Anthropic's shape** (text / tool_use / tool_result blocks)
   and converted for OpenAI-style APIs in `Model`. Every tool call must get a result,
   and roles must alternate: the fake API in the tests rejects anything else.
