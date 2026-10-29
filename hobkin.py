@@ -59,7 +59,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.5.1"
 
 import email.utils
 import base64
@@ -233,7 +233,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
-                "inbox": (dict, type(None)), "wake": (dict, type(None)),
+                "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
                 "break_glass": (dict, type(None)), "chore": (dict, type(None)), "chore_dirs": list}
 
 
@@ -592,6 +592,18 @@ HOLD_TOOL = {
         "match": {"type": "string", "description": "A regular expression for the commands that would disturb it, e.g. \"systemctl .*(restart|stop) .*postgres|pg_ctl\"."},
         "release": {"type": "integer", "description": "Number of your hold to release."}}}}
 INCIDENTS = os.path.join(HOME, "_incidents")      # a shared incident's holds: _incidents/NAME/holds.json
+
+# Offered only when alert_command is set: a way for the agent to reach the person through it (its commands may
+# not be able to, in safe mode). Rate-limited (notify.min_gap, notify.per_hour in config) so it can't flood.
+NOTIFY_TOOL = {
+    "name": "notify",
+    "description": ("Send a short message to the person through their alert channel (the same one hobkin uses for "
+                    "its own notices). For something that needs a human: a monitor found trouble, a chore needs a "
+                    "decision, a job's done. Not for chit-chat; it's rate-limited. Say what and where to look, in a "
+                    "line or two."),
+    "input_schema": {"type": "object", "properties": {
+        "message": {"type": "string", "description": "What to tell them, short and specific."}},
+        "required": ["message"]}}
 
 
 # The agent's own tools: $HOBKIN_WORK/tools/NAME/ holds tool.json and an executable `run` (see Agent.own_tools)
@@ -2672,6 +2684,7 @@ class Agent:
             "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
             "web_search": lambda: self.web_search(s("query")),
             **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
+            **({"notify": lambda: self.tool_notify(s("message"))} if self.cfg.get("alert_command") else {}),
         }
         if name not in tools:
             runs = self.own_tools()[1]
@@ -2691,7 +2704,8 @@ class Agent:
     def tools(self) -> list[dict]:
         """What the model is offered: the built-in tools, then the agent's own."""
         team = [HOLD_TOOL] if getattr(self, "glass", None) and self.glass.get("incident") else []
-        return TOOLS + team + self.own_tools()[0]
+        notify = [NOTIFY_TOOL] if self.cfg.get("alert_command") else []
+        return TOOLS + team + notify + self.own_tools()[0]
 
     def own_tools(self) -> tuple[list[dict], dict[str, str], list[str]]:
         """The tools the agent made itself (OWN_TOOLS): their definitions, {name: run path}, and what's wrong with
@@ -3920,6 +3934,21 @@ class Agent:
         except (OSError, subprocess.TimeoutExpired) as e:
             self.log("hobkin", f"alert_command failed: {e}")
 
+    def tool_notify(self, message: str) -> ToolResult:
+        """The notify tool: send `message` through alert_command, rate-limited (notify.min_gap seconds between,
+        notify.per_hour an hour; defaults 20 and 30). Over the limit, it's held, not sent."""
+        conf = self.cfg.get("notify") or {}
+        min_gap, per_hour = float(conf.get("min_gap", 20)), int(conf.get("per_hour", 30))
+        now, times = time.time(), [t for t in (self.state.get("notify_times") or []) if now - t < 3600]
+        if times and now - times[-1] < min_gap:
+            return f"Not sent: you notified {int(now - times[-1])}s ago; wait {int(min_gap - (now - times[-1]))}s between notifications.", True
+        if len(times) >= per_hour:
+            return f"Not sent: that's the {per_hour}th notification this hour (the cap). It'll clear as the hour rolls on; save notify for what matters.", True
+        self.alert(f"hobkin {self.id}: {message}")
+        self.state["notify_times"] = times + [now]
+        self.timeline("notified: " + clip(" ".join(message.split()), 300, 80))
+        return "Sent to the person's alert channel.", False
+
     def duty(self) -> str | None:
         """What the heartbeat reports, or None when only a message can wake the agent."""
         if self.paused or self.stop:
@@ -4219,7 +4248,7 @@ def cmd_send(agent_id, text):
 
 # Out-log entries that are tool calls (chat shows them as one line): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full.
-TOOL_WHO = ({"$", "=", "job", "reminder", "hold"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
+TOOL_WHO = ({"$", "=", "job", "reminder", "hold", "notify"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
 
 
 # Colour in chat (only on a terminal, and not with NO_COLOR set): who's talking, `code` and file

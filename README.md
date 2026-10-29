@@ -778,6 +778,11 @@ hobkin service remove tickets-1   # stop it and take it off boot
   `alert_command` to a shell command and it runs with the news in
   `$HOBKIN_ALERT` and the agent's `secrets.env` in its environment, e.g.
   `curl -s -H "Authorization: Bearer $TICKETS_TOKEN" --data-urlencode "text=$HOBKIN_ALERT" https://tickets.example/api/comment`.
+  When `alert_command` is set, the agent also gets a **`notify`** tool, so it can
+  reach you through the same channel for something that needs a person (a monitor
+  found trouble, a chore needs a decision). It's rate-limited (`"notify":
+  {"min_gap": 20, "per_hour": 30}`) so it can't flood, and it works in safe mode
+  (the command is hobkin's, not the agent's sandboxed shell).
 - **Keys:** a service doesn't see your shell's environment. `key_file` works
   as is; for `key_env`, put `NAME=value` lines in `~/.config/hobkin/env`
   (chmod 600). `add` warns when that's needed.
@@ -975,8 +980,8 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
-- chores (settings, setting up, the watch staying quiet until there's work) and
-  safe mode's write folders;
+- chores (settings, setting up, the watch staying quiet until there's work),
+  safe mode's write folders, and the rate-limited `notify` tool;
 - the agent's own tools, `hobkin pack` and restoring a bundle, `hobkin purge`,
   safe mode (where the kernel has Landlock) and systemd services (where there's
   a user session).

@@ -1242,10 +1242,37 @@ try:
     check("[purge] stops the running agents and deletes the folder", not os.path.exists(h) and "alpha: stopped" in r.stdout
           and "beta: stopped" in r.stdout and p1.returncode is not None and p2.returncode is not None, r.stdout + r.stderr)
 
+    # notify: a tool offered only when alert_command is set, rate-limited so it can't flood
+    notify_log = os.path.join(BASE, "notify.txt")
+    h = home("notify", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "alert_command": f'echo "$HOBKIN_ALERT" >> {notify_log}', "notify": {"min_gap": 0, "per_hour": 1}})
+    p, aid, d = start(h)
+    say(d, "hello"); wait_for(d, "echo: hello")
+    body = [json.loads(l)["body"] for l in open(LOG) if '"path"' in l][-1]
+    check("[notify] offered only when alert_command is set", "notify" in [t["name"] for t in body["tools"]])
+    def notifies(): return read_or_empty(notify_log).count("hobkin ")
+    say(d, 'call: notify {"message": "disk almost full on web-1"}')
+    for _ in range(100):
+        if notifies() >= 1: break
+        time.sleep(0.1)
+    check("[notify] goes through the alert channel, tagged with the agent",
+          f"hobkin {aid}: disk almost full on web-1" in read_or_empty(notify_log))
+    say(d, 'call: notify {"message": "over the cap"}'); wait_for(d, "the cap", 20, file="context.jsonl")
+    time.sleep(1)
+    check("[notify] the per-hour cap holds extra notifications back", notifies() == 1
+          and "over the cap" not in read_or_empty(notify_log))
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    h2 = home("nonotify", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"}, {"idle_prompt": None})
+    p2, a2, d2 = start(h2)
+    say(d2, "hi"); wait_for(d2, "echo: hi")
+    body2 = [json.loads(l)["body"] for l in open(LOG) if '"path"' in l and a2 in l][-1]
+    check("[notify] no alert_command: no notify tool", "notify" not in [t["name"] for t in body2["tools"]])
+    p2.send_signal(signal.SIGTERM); p2.wait(10)
+
     # chores: a standing job from a folder (settings, config, CHORE.md, tools, spells); its watch wakes it only when needed
     h = home("chores", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
     cenv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}
-    chore = os.path.join(HERE, "chores", "sweep")
+    chore = os.path.join(HERE, "chores", "demo")
     yard = os.path.join(BASE, "yard"); os.makedirs(yard)
     r = subprocess.run([sys.executable, HOB, "--chore", chore, "--id", "sw", "--no-service"], env=cenv, capture_output=True, text=True, timeout=60)
     check("[chore] a setting with no default must be given", r.returncode != 0 and "--set folder=... (the folder to keep swept)" in r.stderr, r.stderr)
@@ -1260,15 +1287,15 @@ try:
     d = os.path.join(h, "sw")
     cfg = json.load(open(d + "/config.json"))
     check("[chore] set up: its config merged, its settings recorded, CHORE.md filled in, tools and spells in the workspace",
-          r.returncode == 0 and f"sw: chore sweep (folder={yard}, pattern=*.litter)" in r.stdout
+          r.returncode == 0 and f"sw: chore demo (folder={yard}, pattern=*.litter)" in r.stdout
           and cfg["wake"] == {"command": "spells/check.sh", "every": 10} and cfg["chore"]["settings"] == {"folder": yard, "pattern": "*.litter"}
-          and open(d + "/CHORE.md").read().startswith(f"# Sweep {yard}") and os.access(d + "/work/spells/check.sh", os.X_OK)
+          and open(d + "/CHORE.md").read().startswith(f"# Demo {yard}") and os.access(d + "/work/spells/check.sh", os.X_OK)
           and json.load(open(d + "/work/tools/count_litter/tool.json"))["description"] == f"Count the litter in {yard}.",
           r.stdout + r.stderr)
-    wait_for(d, "you've been given a chore: sweep", 20, file="context.jsonl")
+    wait_for(d, "you've been given a chore: demo", 20, file="context.jsonl")
     sysp = ctx(d)[0]["content"]
     check("[chore] its instructions: CHORE.md, the apprentice's rules, its settings (and their variables), its watch",
-          f"# Sweep {yard}" in sysp and "the sorcerer's apprentice" in sysp and f"folder = {yard} ($CHORE_FOLDER)" in sysp
+          f"# Demo {yard}" in sysp and "the sorcerer's apprentice" in sysp and f"folder = {yard} ($CHORE_FOLDER)" in sysp
           and "runs `spells/check.sh` for you every 10s" in sysp, sysp[-1500:])
     say(d, "run: echo folder=$CHORE_FOLDER pattern=$CHORE_PATTERN"); wait_for(d, f"Done. Output was: folder={yard} pattern=*.litter")
     say(d, 'call: count_litter {}'); wait_for(d, "Done. Output was: 0")

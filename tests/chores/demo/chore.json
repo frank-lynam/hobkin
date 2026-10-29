@@ -1,5 +1,5 @@
 {
-  "name": "sweep",
+  "name": "demo",
   "description": "A test chore: keep a folder free of *.litter files.",
   "settings": {
     "folder": {"about": "the folder to keep swept"},
