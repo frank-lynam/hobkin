@@ -6,6 +6,7 @@ CTX = int(sys.argv[2]) if len(sys.argv) > 2 else 100000
 LIST_CTX = sys.argv[3] != "nolist" if len(sys.argv) > 3 else True
 import os
 HICCUPS = {}
+EMPTY = {}                  # "empty-reply" in a message: the first two answers to it are empty
 RATE = {"until": 0.0, "mode": None, "count": 0, "seen": set()}
 LOG = open(os.environ.get("FAKE_API_LOG", "fake_api.log"), "a")
 def flat(content):
@@ -18,7 +19,8 @@ def decide(last_user_texts, tool_results, summary):
     m = re.search(r"while that is still running:\]\n(.*?)\n\[hobkin: answer them", last_user_texts, re.S)
     if summary and m: return ("text", "FRONT DESK: still on it, re: " + m.group(1).strip()[:60])
     if summary: return ("text", "SUMMARY: handoff note")
-    if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " "))
+    if "you stopped mid-step" in last_user_texts: return ("text", "All done now.")    # hobkin's carry-on nudge
+    if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " ") + ".")
     t = re.sub(r"(?m)^\[(message from [^\]]*|from hobkin[^\]]*)\]\n", "", last_user_texts)   # sender labels
     t = re.sub(r"(?m)\n?^\[hobkin: [^\n]*\]$", "", t)                                          # nudges
     m = re.search(r"multi-call:\s*(\[.*\])\s*$", t, re.S)        # several tool calls in one reply: [[TOOL, {input}], ...]
@@ -31,7 +33,8 @@ def decide(last_user_texts, tool_results, summary):
     if m: return ("silent", ("bash", {"command": m.group(1).strip()}))
     m = re.search(r"run:\s*(.+)", t, re.S)
     if m: return ("tool", ("bash", {"command": m.group(1).strip()}))
-    return ("text", "echo: " + t.strip()[:80])
+    if re.search(r"falsestop:", t): return ("text", "Let me check the logs.")   # stops mid-step, no tool call
+    return ("text", "echo: " + (t.strip()[:80] or "(nothing)"))
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def send(self, code, obj, headers=None):
@@ -62,9 +65,10 @@ class H(BaseHTTPRequestHandler):
         size = len(json.dumps(body)) // 4
         # Rate limiting like a real provider: "ratelimit:SECONDS:MODE" in a message blocks every request
         # for SECONDS; MODE says how the reset is given (header / epoch / body / none)
-        m = re.search(r"ratelimit:(\d+):(\w+)", json.dumps(body.get("messages", [])[-1:]))
-        if m and m.group(0) not in RATE["seen"]:
-            RATE["seen"].add(m.group(0)); RATE["until"] = time.time() + int(m.group(1)); RATE["mode"] = m.group(2)
+        # ("ratelimit@PORT:..." limits only the fake on that port)
+        m = re.search(r"ratelimit(?:@(\d+))?:(\d+):(\w+)", json.dumps(body.get("messages", [])[-1:]))
+        if m and m.group(0) not in RATE["seen"] and m.group(1) in (None, sys.argv[1]):
+            RATE["seen"].add(m.group(0)); RATE["until"] = time.time() + int(m.group(2)); RATE["mode"] = m.group(3)
         if time.time() < RATE["until"]:
             RATE["count"] += 1
             left, mode = RATE["until"] - time.time(), RATE["mode"]
@@ -75,6 +79,18 @@ class H(BaseHTTPRequestHandler):
                 err["metadata"] = {"headers": {"X-RateLimit-Reset": str(int(RATE["until"] * 1000))}}
             return self.send(429, {"type": "error", "error": {"type": "rate_limit_error", **err}}
                              if self.path == "/v1/messages" else {"error": err}, headers)
+        last_msg = json.dumps(body.get("messages", [])[-1:])
+        m = re.search(r"slow:(\d+)", last_msg)
+        if m and not body.get("tool_choice"):         # a slow model (the front desk isn't slowed)
+            time.sleep(int(m.group(1)))
+        if "empty-reply" in last_msg or "always-empty" in last_msg:
+            key = "always" if "always-empty" in last_msg else last_msg
+            EMPTY[key] = EMPTY.get(key, 0) + 1
+            if EMPTY[key] <= (3 if key == "always" else 2):
+                return self.send(200, {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": size}}
+                                 if self.path == "/v1/messages" else
+                                 {"choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+                                  "usage": {"prompt_tokens": size}})
         if "hiccup" in json.dumps(body.get("messages", [])[-1:]) and not HICCUPS.get(self.path):
             HICCUPS[self.path] = True                  # once per API: an error inside a 200 response
             return self.send(200, {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}

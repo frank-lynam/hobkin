@@ -1117,6 +1117,7 @@ try:
         time.sleep(0.1)
     check("[team] the same command again goes through, alerted and on the record",
           os.path.exists(df + "/work/restarted.txt") and "overrode saver's hold #1" in read_or_empty(alerts_file), read_or_empty(alerts_file))
+    wait_for(df, "Done. Output was: [exit code 0", file="out")     # the override's command has finished (no front desk)
     say(df, "run: echo sudo rm -rf /var/lib/old"); wait_for(df, "Done. Output was: sudo rm", file="out")
     r = hob_("watch", "fixer", "--once")
     w = r.stdout
@@ -1137,6 +1138,96 @@ try:
     r = hob_("watch", "--once")
     check("[watch] with no one named: whoever is in break-glass mode", "fixer" in r.stdout and " SALVAGE " not in r.stdout, r.stdout)
     pf.send_signal(signal.SIGTERM); ps.send_signal(signal.SIGTERM); pf.wait(10); ps.wait(10)
+
+    # max_tokens is sent only when it's set (some APIs refuse it), except to Anthropic-style APIs, which require it
+    for api, port, extra, want in (("openai", 48702, {}, False), ("openai", 48702, {"max_output_tokens": 3000}, True),
+                                   ("anthropic", 48701, {}, True)):
+        base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
+        h = home(f"maxtok-{api}-{bool(extra)}", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", **extra},
+                 {"idle_prompt": None})
+        p, aid, d = start(h)
+        say(d, f"maxtok {aid}"); wait_for(d, f"echo: maxtok {aid}")
+        body = [json.loads(l)["body"] for l in open(LOG) if f"maxtok {aid}" in l][-1]
+        check(f"[max_tokens] {api}{' with max_output_tokens set' if extra else ''}: " + ("sent" if want else "not sent"),
+              ("max_tokens" in body) == want and (not extra or body["max_tokens"] == 3000), {k: v for k, v in body.items() if k != "messages" and k != "tools" and k != "system"})
+        p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # an empty reply is asked again, never shown as "(no reply)"; a reply that stops mid-step is nudged on
+    h = home("replies", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    p, aid, d = start(h)
+    say(d, "empty-reply please"); wait_for(d, "echo: empty-reply please")
+    out = open(d + "/out").read()
+    check("[replies] an empty reply is asked again, quietly", "asking again (1 of 2)" in out and "asking again (2 of 2)" in out
+          and "(no reply)" not in out and "(no reply)" not in open(d + "/context.jsonl").read(), out[-600:])
+    say(d, "always-empty please"); wait_for(d, "three times running; waiting for a message")
+    say(d, "and now?"); wait_for(d, "echo: always-empty please")
+    check("[replies] three empty in a row: it waits, and the next message carries on (roles still alternate)",
+          "INVALID" not in open(LOG).read())
+    say(d, "falsestop: go"); wait_for(d, "All done now.")
+    out = open(d + "/out").read()
+    check("[replies] a reply that stops mid-step is nudged on", "agent> Let me check the logs." in out
+          and "stopped mid-step; nudging it on" in out, out[-600:])
+    check("[replies] 'Let me know...' and a finished sentence aren't false stops", not hbk.looks_unfinished("Let me know if you need more!")
+          and not hbk.looks_unfinished("Done! All 12 tests pass.") and hbk.looks_unfinished("Now I'll run the tests:"))
+    # commands work while the model thinks (the call runs in a thread), and chat shows a spinner meanwhile
+    say(d, "slow:4 think hard"); wait_for(d, "operator> slow:4 think hard"); time.sleep(0.5)
+    say(d, "/status"); wait_for(d, "echo: slow:4 think hard", 20)
+    out = open(d + "/out").read()
+    check("[commands] answered while the model is still thinking", out.index("command /status") < out.index("echo: slow:4 think hard"), out[-600:])
+    import pty
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update({"HOBKIN_HOME": h, "TERM": "xterm"})
+        os.execv(sys.executable, [sys.executable, HOB, "chat"])          # no name: the only one running
+    buf = b""
+    def pump(until, t=20):
+        global buf
+        end = time.time() + t
+        while time.time() < end and not until(buf):
+            if select.select([fd], [], [], 0.2)[0]:
+                try: buf += os.read(fd, 4096)
+                except OSError: break
+        return buf
+    pump(lambda b: b"chatting with" in b)
+    os.write(fd, b"slow:3 spin for me\n")
+    pump(lambda b: b"echo: slow:3 spin for me" in b)
+    check("[chat] no name: the only running hobkin", f"chatting with {aid}".encode() in buf, buf[-300:])
+    check("[chat] a spinner while it thinks", f"{aid} is thinking (".encode() in buf, buf[-600:])
+    os.write(fd, b"\x04"); os.waitpid(pid, 0)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # /model while rate limited: it switches now, instead of waiting the limit out first
+    mock(48706, 100000)
+    h = home("ratemodel", {"api": "anthropic", "base_url": "http://127.0.0.1:48706", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "models": {"m": {"api": "anthropic", "base_url": "http://127.0.0.1:48706", "model": "fake", "key_env": "TESTKEY"},
+                                              "n": {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}}})
+    p, aid, d = start(h)
+    say(d, "ratelimit@48706:120:header now"); wait_for(d, "rate limited by the API")
+    t0 = time.time(); say(d, "/model n"); wait_for(d, "echo: ratelimit@48706:120:header now", 20)
+    check("[commands] /model during a rate-limit wait switches now", time.time() - t0 < 15
+          and json.load(open(d + "/state.json"))["model"].startswith("n "), open(d + "/out").read()[-500:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # hobkin chat with several running: an idle one, and it says who else is running
+    h = home("pick", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"}, {"idle_prompt": None})
+    p1, a1, d1 = start(h, "alpha"); p2, a2, d2 = start(h, "beta")
+    say(d1, "slow:6 busy"); wait_for(d1, "operator> slow:6 busy"); time.sleep(0.5)
+    r = subprocess.run([sys.executable, HOB, "chat"], input="hi\n", env={**os.environ, "HOBKIN_HOME": h}, capture_output=True, text=True, timeout=30)
+    check("[chat] no name, several running: an idle one, and the others named", "-- beta, of the 2 running (also: alpha" in r.stdout
+          and "beta> echo: hi" in r.stdout, r.stdout + r.stderr)
+    # purge: asks first, refuses anything that isn't only hobkin's, then stops agents and deletes the folder
+    penv = {**os.environ, "HOBKIN_HOME": h}
+    r = subprocess.run([sys.executable, HOB, "purge"], input="", env=penv, capture_output=True, text=True, timeout=30)
+    check("[purge] not without --yes or a terminal to ask in", r.returncode != 0 and "without --yes" in r.stderr and os.path.isdir(h), r.stderr)
+    open(h + "/my-notes.txt", "w").write("not hobkin's")
+    r = subprocess.run([sys.executable, HOB, "purge", "--yes"], env=penv, capture_output=True, text=True, timeout=30)
+    check("[purge] refuses a folder that holds anything else", r.returncode != 0 and "my-notes.txt" in r.stderr and os.path.isdir(h + "/alpha"), r.stderr)
+    os.remove(h + "/my-notes.txt")
+    r = subprocess.run([sys.executable, HOB, "purge", "--yes"], env=penv, capture_output=True, text=True, timeout=60)
+    p1.wait(10); p2.wait(10)
+    check("[purge] stops the running agents and deletes the folder", not os.path.exists(h) and "alpha: stopped" in r.stdout
+          and "beta: stopped" in r.stdout and p1.returncode is not None and p2.returncode is not None, r.stdout + r.stderr)
 
     # systemd user services (only where a user session exists; skipped on CI runners)
     if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0:

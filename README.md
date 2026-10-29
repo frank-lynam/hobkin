@@ -108,7 +108,12 @@ Then, from another terminal, chat with it:
 
 ```sh
 hobkin chat bodkin
+hobkin chat            # no name: the only one running, else an idle one (it says which, and who else is up)
 ```
+
+While it's busy, an empty input line shows a spinner with what it's doing
+(`bodkin is thinking (12s)`, `bodkin is running `pytest` (40s)`), so a slow
+model doesn't look like a dead one. It disappears as soon as you type.
 
 Its replies come under its name (`bodkin> ...`), so with several chats open
 you know which hobkin is talking. (The `out` file says `agent>`, for scripts.)
@@ -317,7 +322,20 @@ are; if it's left out and there's only one model, that one is used.
     waiting 41s (until 13:42:10)`;
   - `state.json` says `waiting (rate limited)`;
   - the heartbeat says `waiting out a rate limit (until 13:42:10)`.
-  `/stop` and the other commands still work while it waits.
+  `/stop` and the other commands still work while it waits, and `/model NAME`
+  switches straight away, rather than after the wait.
+
+**Commands answer while the model thinks.** The model call runs in a thread,
+so `/stop`, `/status` and `/model` work during a slow call. `/model` drops the
+call and asks the new model.
+
+**Empty replies and false stops.** Some models stop too early:
+- **An empty reply** is asked again, up to twice. It's never stored or shown as
+  "(no reply)". After three in a row, the agent waits for a message.
+- **A reply that stops mid-step** (it says "Let me check the logs." or "Now I'll
+  run the tests:", or breaks off mid-sentence, with no tool call) gets a nudge to
+  carry on, up to three times a turn. "Let me know if…" and finished sentences
+  don't count.
 
 **The context window is asked for, not hard-coded.** At start-up hobkin asks the API:
 
@@ -370,7 +388,9 @@ stderr), with suggestions such as "unknown setting 'idel_seconds' (did you mean
 Other settings (shared or per agent): `bash_timeout` (600 s per command by
 default; the agent can ask for any longer timeout on a command),
 `output_limit` (30,000 characters of command output, head and tail kept),
-`max_output_tokens` (16,000, capped at what the API reports), and
+`max_output_tokens` (unset by default: then no `max_tokens` is sent, since some
+APIs refuse it, except to Anthropic-style APIs, which require one and get 16,000
+or the model's own limit; set it to send that limit), and
 `idle_prompt` / `idle_seconds` (see below).
 
 ## Its tools
@@ -694,6 +714,18 @@ then its own text.
   that out.
 - `reminders.json` is a plain file: read it, edit it, or delete entries. The
   agent's current reminders are also listed in its system prompt.
+
+## Removing everything
+
+```sh
+hobkin purge           # asks you to type "purge" first; --yes skips that
+```
+
+It stops every agent, removes their services and hobkin's service template, and
+deletes `~/.hobkins` (or `$HOBKIN_HOME`): every agent's memory, conversations,
+logs, workspace, keys and config. It refuses a folder that holds anything but
+agents (so a mistaken `HOBKIN_HOME` can't take your files with it). Your own
+`~/.config/hobkin/env` stays, and so does hobkin itself (`pipx uninstall hobkin`).
 
 ## Keeping agents running
 

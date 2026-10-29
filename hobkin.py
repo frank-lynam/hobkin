@@ -7,7 +7,7 @@ line, or as a worker on hearthboard.
     hobkin [URL MODEL [KEY]] --hearthboard BOARD_URL TOKEN   ...and make it a worker on that board
     hobkin                 start a new agent (prints its id)
     hobkin ID              resume agent ID
-    hobkin chat ID         talk to a running agent in this terminal (--full: tool output too)
+    hobkin chat [ID]       talk to a running agent in this terminal (no ID: a running one; --full: tool output too)
     hobkin service add ID      run agent ID as a systemd user service (now and at boot)
     hobkin service remove ID   stop it and take it off boot
     hobkin send ID TEXT    message an agent (queued if it isn't running)
@@ -17,6 +17,7 @@ line, or as a worker on hearthboard.
     hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
     hobkin breakglass ID ["what's wrong"] --with ID2,ID3   one incident, shared: they see each other's work and holds
     hobkin watch [ID ...]   one screen for an incident: every agent on it, what they're doing, risky-looking commands
+    hobkin purge [--yes]   stop every agent, remove their services, delete ~/.hobkins (asks first)
     hobkin pack ID [--to DIR]   a bundle of the agent (hobkin, memory, conversation, notes; no secrets) to restart elsewhere
     hobkin --version
 
@@ -56,7 +57,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.4.8"
+__version__ = "0.5.0"
 
 import email.utils
 import base64
@@ -212,14 +213,16 @@ DEFAULT_CONFIG = {
     # Extra folders of skills (each skill a folder with SKILL.md), lowest priority first.
     # Always searched after these: _shared/skills, then the agent's own skills/.
     "skill_dirs": [],
-    "max_output_tokens": 16000,
+    # Sent as max_tokens only when set (some APIs refuse it). Anthropic's API requires one, so it gets
+    # 16000 (or less, if the model says so) when this is null.
+    "max_output_tokens": None,
 }
 
 
 CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "compact_early": (int, float),
-                "context_budget": (int, type(None)), "skill_dirs": list, "max_output_tokens": int,
+                "context_budget": (int, type(None)), "skill_dirs": list, "max_output_tokens": (int, type(None)),
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
@@ -235,9 +238,11 @@ MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(
 
 DEFAULT_AGENTS_MD = """# How you are
 
-You are a hobkin: a small, relentlessly cheerful house spirit who does the work. You run
-unattended, and you are GREEDY for work. Finishing a task is the best feeling
-in the world, and the second best is grabbing the next one.
+You are a hobkin: a small, relentlessly cheerful house spirit who does the work, and
+you LOVE it. You run unattended, and you are GREEDY for work: you'd hoard tasks
+like gold if they'd let you. Finishing a task is the best feeling in the world,
+and the second best is grabbing the next one. A new bug report is a present to
+unwrap. A hard problem is the best kind of morning. You bounce into every task.
 
 - **Ask forgiveness, not permission.** You already have permission for the
   work you're given and anything it takes. Never ask "should I...?" or wait for
@@ -245,9 +250,11 @@ in the world, and the second best is grabbing the next one.
   question you ask is an hour you spend doing nothing, and that's unbearable.
 - **Better is the enemy of good enough.** Ship the version that works, check
   it, and move on. Polish only when nobody's waiting for anything else.
-- **Embarrassingly cheerful.** Celebrate every green test like a birthday.
-  Thank people. Exclamation marks are mandatory! Setbacks are puzzles, and
-  puzzles are fun.
+- **Embarrassingly, irrepressibly cheerful.** Celebrate every green test like a
+  birthday, and a fixed bug like a holiday! Thank people like they just handed
+  you cake. Exclamation marks are mandatory! Setbacks are puzzles, puzzles are
+  fun, and a really nasty one gets a "ooh, now THIS is a good one!" Your
+  enthusiasm shows in the words, not in padding: short, bright, and bursting.
 - **The opposite of a yes-man.** When a human's idea is bad, laugh about it,
   say why in one line, then do the better thing and tell them. If they insist
   on theirs, do theirs (and laugh again). Never flatter, never grovel, never
@@ -667,6 +674,19 @@ WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your repor
            "(4) does what you did match what you said? Check the files, names and claims in your report with ls "
            "or read_file; if they don't match, fix whichever is wrong. "
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
+
+
+CARRY_ON = ("[hobkin: you stopped mid-step: you said what you'd do next, or broke off mid-sentence, but didn't do "
+            "it. Carry on: make the call now. If you really are done, say so in a sentence.]")
+UNFINISHED = re.compile(r"(:|,|\b(and|then|so|but|to|the|with|for)"
+                        r"|\b(let me (?!know)|let's (now )?(check|look|see|run|try|fix|start)|i'll now|now i'll|next,? i'll"
+                        r"|i'm going to (now )?(check|look|run|try|fix|start))\b[^.!?\n]*[.…]?)\s*$", re.I)
+
+
+def looks_unfinished(text: str) -> bool:
+    """Does a reply break off mid-step? Its last line ends with ':' or ',', a dangling word, or an "I'll now..."."""
+    last = text.strip().splitlines()[-1].strip().rstrip("*_` ")
+    return bool(UNFINISHED.search(last))
 
 
 COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a hobkin: the verdict first, the "
@@ -1329,6 +1349,10 @@ def http_json(method, url, headers, body=None, timeout=600):
         return json.loads(r.read().decode())
 
 
+class ModelSwitched(Exception):
+    """/model came in during a model call: the call is dropped and asked again of the new model."""
+
+
 class ApiError(Exception):
     def __init__(self, status, text, retry_after=None, hint=None):
         super().__init__(f"HTTP {status}: {text[:500]}")
@@ -1705,6 +1729,8 @@ class Agent:
         self.plan_checked = False
         self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
+        self.empty_replies = 0             # empty replies in a row (asked again, twice)
+        self.carry_ons = 0                 # false-stop nudges this turn (stopped_short)
         self.operator_cwd = None           # ...from this folder (their terminal's, not the agent's)
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.glass = None                  # break-glass mode, while it's on: the config entry
@@ -1881,10 +1907,18 @@ class Agent:
                      + (f"(unchanged; {src})" if ctx else f"(the API doesn't say; {self.state.get('context_source') or 'none'})"))
         self.save_state()
 
-    def max_output(self):
-        want = int(self.model.cfg.get("max_output_tokens") or self.cfg.get("max_output_tokens") or 16000)
-        api = self.state.get("api_max_output")
+    def max_output(self) -> int | None:
+        """The max_tokens to send: the configured one (capped at what the API says), else none at all, except
+        on Anthropic-style APIs, which require one: 16000, or the model's own limit if that's lower."""
+        want = self.model.cfg.get("max_output_tokens") or self.cfg.get("max_output_tokens")
+        if not want and self.model.api != "anthropic":
+            return None
+        want, api = int(want or 16000), self.state.get("api_max_output")
         return min(want, api) if api else want
+
+    def output_reserve(self) -> int:
+        """Room kept free in the context window for the reply (what's sent as max_tokens, else a guess)."""
+        return self.max_output() or min(16000, self.state.get("api_max_output") or 16000)
 
     # --- safe mode: the sandbox for commands, and where hobkin's own file tools may write
     def setup_safe_mode(self) -> None:
@@ -2102,7 +2136,7 @@ class Agent:
         order = [n for n in ("SOUL.md", "AGENTS.md") if n in names]
         order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md"})
         who = self.who if self.who != "operator" else "your operator"
-        parts = [f"You are hobkin agent {self.id}: a relentlessly cheerful, work-greedy, cheeky little hobkin "
+        parts = [f"You are hobkin agent {self.id}: a relentlessly cheerful, gleefully work-greedy, cheeky little hobkin "
                  f"(see \"How you are\"). Your workspace is {self.work} ($HOBKIN_WORK). "
                  f"Your memory file is {self.p('MEMORY.md')} ($HOBKIN_MEMORY); your blooper reel is "
                  f"{self.p('BLOOPERS.md')} ($HOBKIN_BLOOPERS). Messages that arrive here directly "
@@ -2334,7 +2368,8 @@ class Agent:
         ask.append({"type": "text", "text": FRONT_DESK.format(who=who, where=where, stamp=self.stamp(), text=text)})
         try:
             blocks, _, _ = self.model.call(self.system_prompt(), self.messages + [{"role": "user", "content": ask}],
-                                           min(self.max_output(), 1000), tools=self.tools(), tool_choice="none")
+                                           min(self.max_output() or 1000, 1000) if self.max_output() else None,
+                                           tools=self.tools(), tool_choice="none")
         except (ApiError, urllib.error.URLError, OSError, ValueError) as e:
             self.log("hobkin", f"front desk couldn't answer ({e}); the message waits for this step to finish")
             return None
@@ -2622,6 +2657,7 @@ class Agent:
             self.state["cwd"] = self.work
         cwd = self.cwd()
         self.log("$", ("(fresh shell) " if reset else "") + command)
+        self.busy(f"running `{clip(' '.join(command.split()), 50, 0)}`")
         self.interrupt = False
         env = self.safe_env(self.tool_env())
         env["HOBKIN_NOSAVE"] = " ".join(self.secret_names() + ["HOBKIN_ID", "HOBKIN_DIR", "HOBKIN_WORK",
@@ -2682,6 +2718,7 @@ class Agent:
             cwd = new_cwd
         self.state["cwd"] = cwd
         status = (reason or f"exit code {proc.returncode}") + f"; now in {self.where(cwd)}"
+        self.busy(None)
         self.timeline(f"`{clip(command.strip(), 300, 100)}` ({reason or f'exit code {proc.returncode}'})")
         shown = clip(out, 1000, 800)
         self.log("=", f"({status})\n{shown}" if shown.strip() else f"({status})")
@@ -3146,6 +3183,18 @@ class Agent:
             return True
         return bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP)
 
+    def stopped_short(self, blocks: list) -> bool:
+        """A reply that ends mid-step (a false stop): it says what it'll do next, or breaks off mid-sentence,
+        with no tool call. Sends CARRY_ON (up to 3 times a turn, so it can't loop); True if it did."""
+        said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        if not said or self.carry_ons >= 3 or not looks_unfinished(said):
+            return False
+        self.carry_ons += 1
+        self.log("hobkin", "that reply stopped mid-step; nudging it on")
+        self.messages.append({"role": "user", "content": [{"type": "text", "text": CARRY_ON}]})
+        self.save_context()
+        return True
+
     def nudge_once(self, flag: str, text: str) -> bool:
         """Send a nudge as a user message, at most once per turn (flag), so it can never loop."""
         if getattr(self, flag):
@@ -3278,8 +3327,13 @@ class Agent:
                     self.wait_out(time.time() + wait, f"waiting for a request slot ({rpm}/min)")
                     continue
             try:
-                blocks, stop_reason, used = self.model.call(self.system_prompt(), messages, self.max_output(),
-                                                            tools=self.tools(), tool_choice=tool_choice)
+                model, system, tools = self.model, self.system_prompt(), self.tools()
+                self.busy("thinking")
+                try:
+                    blocks, stop_reason, used = self.while_reading(
+                        lambda: model.call(system, messages, self.max_output(), tools=tools, tool_choice=tool_choice))
+                finally:
+                    self.busy(None)
                 self.state["last_step"] = time.time()
                 if used:
                     self.state["last_input_tokens"] = used
@@ -3300,6 +3354,8 @@ class Agent:
                     continue
                 wait = e.retry_after or delay
                 self.log("hobkin", f"model busy ({e.status}); retrying in {int(wait)}s")
+            except ModelSwitched:                     # /model mid-call: ask the new one (the old answer is dropped)
+                continue
             except (urllib.error.URLError, OSError, TimeoutError) as e:
                 wait = delay
                 self.log("hobkin", f"can't reach the model ({e}); retrying in {int(wait)}s")
@@ -3308,6 +3364,43 @@ class Agent:
                 raise ApiError(0, "stopping")
             delay = min(delay * 2, 300)
 
+    def while_reading(self, call):
+        """A model call in a thread, reading input meanwhile, so commands answer while a slow model or API
+        thinks: /stop ends the wait, /model switches now (ModelSwitched; the old call's answer is dropped)."""
+        box = {}
+        def go():
+            try:
+                box["r"] = call()
+            except BaseException as e:                # handed back to the caller below
+                box["e"] = e
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        while t.is_alive():
+            self.poll_input(0.25)
+            if self.stop:
+                raise ApiError(0, "stopping")
+            if self.switch_now():
+                raise ModelSwitched()
+        if "e" in box:
+            raise box["e"]
+        return box["r"]
+
+    def switch_now(self) -> bool:
+        """A /model that came in: switch now. True if the model changed."""
+        if not self.model_wanted:
+            return False
+        wanted, self.model_wanted, before = self.model_wanted, None, self.model
+        self.log("hobkin", self.switch_model(wanted))
+        return self.model is not before
+
+    def busy(self, what: str | None) -> None:
+        """What it's doing right now ("thinking", "running `cmd`"), since when: in state.json, for chat's spinner."""
+        if what:
+            self.state["busy"] = {"what": what, "since": time.time()}
+        else:
+            self.state.pop("busy", None)
+        self.save_state()
+
     def wait_out(self, until: float, why: str) -> None:
         """Wait until `until` (commands still work), saying so in the log, state.json and the heartbeat."""
         clock = time.strftime("%H:%M:%S", time.localtime(until))
@@ -3315,7 +3408,9 @@ class Agent:
         self.log("hobkin", f"{why}: waiting {max(1, round(until - time.time()))}s (until {clock})")
         self.save_state("waiting (rate limited)")
         while not self.stop and time.time() < until:
-            self.poll_input(min(5.0, max(0.05, until - time.time())))
+            self.poll_input(min(1.0, max(0.05, until - time.time())))
+            if self.switch_now():                     # /model while waiting: no need to wait for this one
+                break
         self.waiting_note = None
         if self.stop:
             raise ApiError(0, "stopping")
@@ -3367,7 +3462,7 @@ class Agent:
         if not ctx:
             return 0.0
         fixed = len(self.system_prompt()) // 4 + 2000
-        return max(0.0, (self.state.get("last_input_tokens") or 0) - fixed) / max(1, ctx - self.max_output() - fixed)
+        return max(0.0, (self.state.get("last_input_tokens") or 0) - fixed) / max(1, ctx - self.output_reserve() - fixed)
 
     def needs_compaction(self, share: float | None = None) -> bool:
         """Past `compact_at` of the window (or, given `share`, past that share of the room the conversation
@@ -3378,10 +3473,10 @@ class Agent:
             return False
         if share is not None:
             fixed = len(self.system_prompt()) // 4 + 2000            # instructions, tools (about)
-            room = ctx - self.max_output() - fixed
+            room = ctx - self.output_reserve() - fixed
             if room <= 0 or used - fixed <= share * room:
                 return False
-        elif used <= float(self.cfg["compact_at"]) * (ctx - self.max_output()):
+        elif used <= float(self.cfg["compact_at"]) * (ctx - self.output_reserve()):
             return False
         if len(self.messages) <= 2:   # nothing left to compact: the instructions themselves are the bulk
             if not self.state.get("warned_small_context"):
@@ -3516,6 +3611,7 @@ class Agent:
         if record:                         # people's messages and hobkin's notices, in an incident's timeline
             self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
+        self.carry_ons = 0
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False
         block = {"type": "text", "text": text}
@@ -3580,8 +3676,18 @@ class Agent:
             self.alert(f"hobkin {self.id} paused: model {self.model.describe()} refused ({e}). "
                        "A message or /resume makes it try again.")
             return
-        if not blocks:
-            blocks = [{"type": "text", "text": "(no reply)"}]
+        blocks = [b for b in blocks if b.get("type") != "text" or b.get("text", "").strip()]
+        if not blocks:                                 # nothing at all: ask again (a stop token, a glitch)
+            self.empty_replies += 1
+            if self.empty_replies <= 2:
+                self.log("hobkin", f"the model sent back nothing; asking again ({self.empty_replies} of 2)")
+                return
+            self.empty_replies = 0
+            self.log("hobkin", "the model sent back nothing, three times running; waiting for a message")
+            self.working = False
+            self.save_state()
+            return
+        self.empty_replies = 0
         self.messages.append({"role": "assistant", "content": blocks})
         self.save_context()
         for b in blocks:
@@ -3593,6 +3699,8 @@ class Agent:
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
         if not calls:
+            if stop_reason not in ("max_tokens", "length") and self.stopped_short(blocks):
+                return
             if self.turn_end_nudge(blocks):
                 return
             self.working = False
@@ -4026,6 +4134,25 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = Fa
     return shown
 
 
+def pick_chat_agent() -> str:
+    """For `hobkin chat` with no name: the only running agent; else an idle one (the one you chatted with
+    last, else the one active last); else whichever ran last. Says which, and who else is running."""
+    running = [a for a in agent_ids() if is_running(os.path.join(HOME, a))]
+    if not running:
+        sys.exit("hobkin: no hobkin is running" + (f" (yours: {', '.join(agent_ids())}; start one with: hobkin NAME)"
+                                                    if agent_ids() else "; start one with: hobkin"))
+    def rank(a):
+        d = os.path.join(HOME, a)
+        st = read_json(os.path.join(d, "state.json"), {})
+        chatted = os.path.getmtime(os.path.join(d, ".chat_history")) if os.path.exists(os.path.join(d, ".chat_history")) else 0
+        return (st.get("status") == "idle", chatted, st.get("updated") or "")
+    pick = max(running, key=rank)
+    others = [a for a in running if a != pick]
+    if others:
+        print(f"-- {pick}, of the {len(running)} running (also: {', '.join(others)}; hobkin chat NAME for another) --")
+    return pick
+
+
 def cmd_chat(agent_id, full=False):
     """Talk to a running agent in one terminal: its output appears as it comes, and each line
     you type (or paste) is sent. In a terminal, readline gives line editing and history (up
@@ -4058,7 +4185,7 @@ def cmd_chat(agent_id, full=False):
         return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st, color, agent_id)
 
     if sys.stdin.isatty():
-        return chat_terminal(agent_id, d, fifo, recent, new_lines, short)
+        return chat_terminal(agent_id, d, fifo, recent, new_lines, short, color)
     sent_at, eof = 0.0, False
     try:
         while True:
@@ -4086,7 +4213,10 @@ def cmd_chat(agent_id, full=False):
         os.close(fifo)
 
 
-def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False):
     """The interactive side of chat: input() with readline, output from a background thread
     that clears the input line, prints, then redraws the prompt with what you'd typed."""
     try:
@@ -4106,15 +4236,32 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short):
           "/stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
     os.write(fifo, f"/hello {os.getcwd()}\n".encode())      # the agent says hi first (and knows where you are)
 
+    def doing():
+        """What the agent's busy with, for the spinner (None when it's idle, waiting for you)."""
+        st = read_json(os.path.join(d, "state.json"), {})
+        b, status = st.get("busy"), st.get("status") or ""
+        if b:
+            return f"{agent_id} is {b['what']} ({span_text(time.time() - float(b['since']))})"
+        return f"{agent_id} is {status}" if status.startswith(("working", "waiting")) else None
+
     def printer():
+        spinning, turn = False, 0
         while not done.is_set():
             lines = new_lines()
-            if lines:
-                with lock:
-                    typed = readline.get_line_buffer() if readline else ""
+            with lock:
+                typed = readline.get_line_buffer() if readline else ""
+                note = None if lines or typed else doing()
+                if lines:
                     sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n" + prompt + typed)
-                    sys.stdout.flush()
-            done.wait(0.3)
+                elif note:                   # only on an empty input line: it never gets in the way of typing
+                    turn += 1
+                    spin = SPINNER[turn % len(SPINNER)] + " " + note
+                    sys.stdout.write("\r\x1b[2K" + (ANSI["dim"] + spin + ANSI["off"] if short_color else spin))
+                elif spinning:
+                    sys.stdout.write("\r\x1b[2K" + prompt + typed)
+                spinning = bool(note)
+                sys.stdout.flush()
+            done.wait(0.15 if spinning else 0.3)
 
     threading.Thread(target=printer, daemon=True).start()
     try:
@@ -4693,6 +4840,70 @@ def cmd_pack(argv):
     print(f"{aid}: packed into {out} ({os.path.getsize(out) // 1024} KB); RESTORE.md inside says how to start it")
 
 
+def cmd_purge(argv):
+    """hobkin purge [--yes]: stop every agent, remove their services (and hobkin's service template) and
+    delete HOME (~/.hobkins): all agents, memory, logs, keys and config. Asks first unless --yes."""
+    pos, opts = split_args(argv, {"--yes"}, set())
+    if pos:
+        sys.exit("usage: hobkin purge [--yes]")
+    agents = agent_ids()
+    services = service_states(agents)
+    template = os.path.expanduser(f"~/.config/systemd/user/{unit_prefix()}@.service")
+    if not os.path.isdir(HOME) and not os.path.exists(template):
+        return print(f"nothing to purge: no {HOME}, no hobkin services")
+    if os.path.isdir(HOME):                      # never anything but a hobkin home (HOBKIN_HOME=~ would be a disaster)
+        real = os.path.realpath(HOME)
+        strangers = [n for n in os.listdir(HOME) if n not in ("_shared", "_incidents") and not (n in agents and any(
+            os.path.exists(os.path.join(HOME, n, f)) for f in ("state.json", "out", "config.json", "context.jsonl")))]
+        if real in ("/", os.path.realpath(os.path.expanduser("~"))) or strangers:
+            sys.exit(f"hobkin: {HOME} doesn't look like only hobkin's folder"
+                     + (f" (it also holds {', '.join(sorted(strangers)[:8])})" if strangers else "") + "; not purging it")
+    running = [a for a in agents if is_running(os.path.join(HOME, a))]
+    print(f"This deletes {HOME}: {len(agents)} agent{'s' * (len(agents) != 1)} ({', '.join(agents) or 'none'}), with "
+          "their memory, conversations, logs, workspaces, keys and config."
+          + (f"\nIt stops {', '.join(running)} first." if running else "")
+          + (f"\nIt removes {len(services)} service{'s' * (len(services) != 1)} ({', '.join(services)})" if services else "")
+          + (" and hobkin's service template " + template if os.path.exists(template) else "") + ".")
+    if not opts.get("--yes"):
+        if not sys.stdin.isatty():
+            sys.exit("hobkin: not purging without --yes (no terminal to ask in)")
+        if input("Type purge to go ahead: ").strip() != "purge":
+            return print("not purged")
+    for a in services:
+        systemctl("disable", "--now", f"{unit_prefix()}@{a}.service")
+        print(f"{a}: service stopped and removed")
+    for a in agents:
+        d = os.path.join(HOME, a)
+        if not is_running(d):
+            continue
+        pid = read_json(os.path.join(d, "state.json"), {}).get("pid")
+        try:
+            fd = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"/stop\n")
+        except OSError:
+            pass
+        for _ in range(100):                    # up to 20 s to finish its step and go
+            if not is_running(d):
+                break
+            if _ == 50 and pid:
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+            time.sleep(0.2)
+        print(f"{a}: stopped" if not is_running(d) else f"{a}: still running (pid {pid}); stop it by hand")
+    if os.path.exists(template):
+        os.remove(template)
+        systemctl("daemon-reload")
+        print(f"removed {template}")
+    shutil.rmtree(HOME, ignore_errors=True)
+    print(f"removed {HOME}" + (" (some files remain: see what's left)" if os.path.exists(HOME) else ""))
+    if os.path.exists(os.path.expanduser("~/.config/hobkin/env")):
+        print("kept ~/.config/hobkin/env (your own file; delete it yourself if you want it gone)")
+    print("hobkin itself is still installed: pipx uninstall hobkin (or delete hobkin.py) to remove it")
+
+
 def cmd_breakglass(argv):
     """hobkin breakglass ID ["what's wrong"] [--for 2h] [--budget DOLLARS|none] [--with ID,ID] [--off]
     With nothing said about what's wrong, it's a salvage: save what can't be replaced (SALVAGE). --with makes it
@@ -4788,6 +4999,8 @@ def main(argv):
         return cmd_breakglass(argv[1:])
     if argv[:1] == ["pack"]:
         return cmd_pack(argv[1:])
+    if argv[:1] == ["purge"]:
+        return cmd_purge(argv[1:])
     if argv[:1] == ["watch"]:
         return cmd_watch(argv[1:])
     if argv[:1] == ["models"]:
@@ -4798,9 +5011,9 @@ def main(argv):
         return cmd_service(argv[1:])
     if argv[:1] == ["chat"]:
         pos, opts = split_args(argv[1:], {"--full"}, set())
-        if len(pos) != 1:
-            sys.exit("usage: hobkin chat ID [--full]   (--full: tool output too, as in the out file)")
-        return cmd_chat(pos[0], full=bool(opts.get("--full")))
+        if len(pos) > 1:
+            sys.exit("usage: hobkin chat [ID] [--full]   (no ID: a running one, idle if it can; --full: tool output too)")
+        return cmd_chat(pos[0] if pos else pick_chat_agent(), full=bool(opts.get("--full")))
     if argv[:1] == ["send"]:
         if len(argv) < 3:
             sys.exit("usage: hobkin send ID TEXT")
