@@ -445,6 +445,20 @@ or the model's own limit; set it to send that limit), and
   `save_as` downloads anything else (a PDF, an image) into the workspace.
 - **`web_search`** searches DuckDuckGo and returns the top ten results: title,
   URL, snippet.
+- **`session`** keeps an interactive program running between calls: a debugger
+  (gdb, lldb, radare2), a REPL, a database shell, `nc` to a service.
+  - **Actions:** `start` it, `send` it a line (or Ctrl-C / Ctrl-D), `read` more,
+    `close` it, `list` what's open.
+  - **When a reply comes back:** as soon as the program shows its prompt (an
+    `until` pattern such as `\(gdb\) $`), goes quiet, or `wait` runs out.
+    Commands like `/stop` keep working meanwhile.
+  - **The terminal:** it runs in a pseudo-terminal, with echo off and colour
+    codes stripped, so what comes back is just what it printed. A reader thread
+    keeps draining it, so a chatty program never blocks.
+  - **Same rules as bash:** the sandbox, announce-first, holds, the timeline and
+    the output cap. With a `host`, it runs there over ssh with a terminal; the
+    secrets go in a private file that's deleted as soon as they're read.
+  - **Lifetime:** up to eight at once; they end when hobkin stops.
 - **Its own tools:** the agent can make itself tools, for a command it would
   otherwise keep retyping (calls to a synthesizer's API, say). Each is a folder
   `work/tools/NAME/` holding `tool.json` (`{"description": ..., "input_schema":
@@ -1033,6 +1047,8 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
+- sessions (a REPL keeping its state, Ctrl-C, a program exiting, list and close,
+  ending with hobkin, on a host);
 - working on a host (commands, the shell's state, file tools, jobs, own tools,
   memory staying here, a host that's down, safe mode's rule), using a stand-in
   ssh (`tests/fake_ssh.py`: another "home", none of our environment);

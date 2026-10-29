@@ -1342,6 +1342,54 @@ try:
     check("[host] ...and does once its account is named as the limit", "that account's own permissions" in open(d + "/out").read())
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # sessions: an interactive program that stays running between calls (a REPL here; gdb works the same way)
+    h = home("sess", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    p, aid, d = start(h)
+    open(d + "/secrets.env", "w").write("SESS_SECRET=pssst\n")
+    def sess(args, marker):                       # one call: wait for its result, then for the agent to be idle again
+        n = read_or_empty(d + "/context.jsonl").count('"tool_use_id"')
+        say(d, "call: session " + json.dumps(args))
+        for _ in range(300):
+            if read_or_empty(d + "/context.jsonl").count('"tool_use_id"') > n \
+                    and json.load(open(d + "/state.json")).get("status") == "idle": break
+            time.sleep(0.1)
+        return json.dumps(last_results(d))
+    r = sess({"action": "start", "command": "python3 -q -i", "until": ">>> $"}, "Session #1 started")
+    check("[session] start: it runs, its prompt comes back", ">>> " in r and "still running" in r, r[:300])
+    sess({"action": "send", "id": 1, "input": "x = 6 * 7", "until": ">>> $"}, "session #1 still running")
+    r = sess({"action": "send", "id": 1, "input": "print(x, __import__('os').environ.get('SESS_SECRET'))", "until": ">>> $"}, "42 pssst")
+    check("[session] it keeps its state between calls, with our environment (no echo of what's sent)",
+          "42 pssst" in r and "print(x" not in r, r[:300])
+    sess({"action": "send", "id": 1, "input": "import time; time.sleep(30)", "wait": 1}, "nothing printed yet")
+    r = sess({"action": "send", "id": 1, "ctrl": "c", "until": ">>> $"}, "KeyboardInterrupt")
+    check("[session] Ctrl-C interrupts what it's doing, and it carries on", "KeyboardInterrupt" in r and "still running" in r, r[:300])
+    r = sess({"action": "start", "command": "cat"}, "Session #2 started")
+    r = sess({"action": "list"}, "#2: cat")
+    check("[session] list shows them", "#1: python3 -q -i" in r and "#2: cat" in r, r[:300])
+    r = sess({"action": "close", "id": 2}, "[session #2 closed]")
+    r = sess({"action": "send", "id": 1, "input": "raise SystemExit(3)"}, "session #1 ended: exit code 3")
+    check("[session] a program that exits says so, with its exit code", "ended: exit code 3" in r, r[:300])
+    r = sess({"action": "send", "id": 1, "input": "x"}, "No session #1")
+    check("[session] closed and ended ones are gone", "No session #1" in r)
+    sess({"action": "start", "command": "sleep 300"}, "Session #1 started")
+    pid = int(subprocess.run(["pgrep", "-f", "^sleep 300$"], capture_output=True, text=True).stdout.split()[0])
+    p.send_signal(signal.SIGTERM); p.wait(10); time.sleep(0.5)
+    check("[session] sessions end when hobkin stops", not os.path.exists(f"/proc/{pid}") or
+          open(f"/proc/{pid}/stat").read().split()[2] == "Z")
+    # ...and on a host, over ssh with a terminal there; secrets reach it, never on a command line or in its output
+    h = home("sesshost", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "host": "web-1", "ssh": f"{sys.executable} {os.path.join(HERE, 'fake_ssh.py')}"})
+    os.makedirs(h + "/rem"); open(h + "/rem/secrets.env", "w").write("SESS_SECRET=pssst\n")
+    p, aid, d = start(h, "rem", FAKE_SSH_HOME=os.path.join(BASE, "sess-remote"))
+    r = sess({"action": "start", "command": "python3 -q -i", "until": ">>> $"}, "Session #1 started")
+    r = sess({"action": "send", "id": 1, "input": "import os; print(os.environ['HOME'], os.environ.get('SESS_SECRET'))", "until": ">>> $"}, "pssst")
+    rhome = os.path.join(BASE, "sess-remote")
+    check("[session] on a host: it runs there, with our secrets, and leaves no env file behind",
+          f"{rhome} pssst" in r and not [f for f in os.listdir(os.path.join(rhome, "hobkin-work", "rem", ".hobkin-shell")) if f.startswith("session-env")],
+          r[:300])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # chores: a standing job from a folder (settings, config, CHORE.md, tools, spells); its watch wakes it only when needed
     h = home("chores", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
     cenv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}

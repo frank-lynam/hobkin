@@ -83,12 +83,14 @@ import select
 import shlex
 import struct
 import shutil
+import pty
 import ssl
 import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
 import threading
 import time
 import urllib.error
@@ -586,6 +588,24 @@ TOOLS = [
          "what_would": {"type": "string", "description": "What would make it do the thing, and how you'll check it worked."},
          "steps": {"type": "array", "items": {"type": "string"}, "description": "Small steps you can check, in order."},
          "done": {"type": "array", "items": {"type": "integer"}, "description": "Step numbers just finished, e.g. [2]."}}}},
+    {"name": "session",
+     "description": ("An interactive program that keeps running between calls: a debugger (gdb, lldb, radare2), a REPL "
+                     "(python3 -q, node, irb), a database shell, nc or socat to a service. `start` it with a command; "
+                     "`send` it a line (or a Ctrl key) and get back what it printed; `read` for more without sending; "
+                     "`close` when done; `list` what's open. Each reply comes back when the program shows its prompt "
+                     "(give `until`, e.g. \"\\(gdb\\) $\" or \">>> $\"), goes quiet, or `wait` runs out. It "
+                     "runs in a terminal (echo off, colours stripped). Sessions end when hobkin stops. For one-shot "
+                     "commands use bash."),
+     "input_schema": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["start", "send", "read", "close", "list"]},
+         "command": {"type": "string", "description": "start: the program to run, e.g. \"gdb -q ./crackme\"."},
+         "id": {"type": "integer", "description": "send, read, close: which session (start says its id)."},
+         "input": {"type": "string", "description": "send: the line to type (Enter is added)."},
+         "ctrl": {"type": "string", "description": "send: a Ctrl key instead of a line: \"c\" to interrupt, \"d\" for end-of-input."},
+         "until": {"type": "string", "description": "A regular expression for its prompt: the reply comes back as soon as the output ends with it."},
+         "wait": {"type": "number", "description": "Seconds to wait for output at most (default 10)."},
+         "announced": {"type": "string", "description": "start: as for bash, when it says a program needs announcing first."}},
+         "required": ["action"]}},
 ]
 
 # Only during a shared incident (`hobkin breakglass ... --with`): holds, so teammates don't undo each other's work
@@ -1976,6 +1996,7 @@ class Agent:
         self.rhome = self.rwork = None     # the host's home and our workspace on it (config "host"), once reached
         self.safe_remote = False           # safe mode on a host: its limits are that account's permissions
         self.rtools = (0.0, None)          # the host's tools/ listing, cached briefly
+        self.sessions = {}                 # the session tool's running programs, by id
         self.watched = 0.0                 # when wake.command last ran (0: run it as soon as it's idle)
         self.wake_backoff = 0.0
         self.wake_last = ("", 0.0)         # the last answer delivered, and when (the same one isn't sent twice soon)
@@ -2932,6 +2953,7 @@ class Agent:
             "view_image": lambda: self.view_image(s("path")),
             "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
             "web_search": lambda: self.web_search(s("query")),
+            "session": lambda: self.tool_session(inp),
             **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
             **({"notify": lambda: self.tool_notify(s("message"))} if self.cfg.get("alert_command") else {}),
         }
@@ -3329,6 +3351,175 @@ class Agent:
             return False
         except PermissionError:
             return True
+
+    # --- sessions: interactive programs that stay running between calls (the session tool)
+    def tool_session(self, inp: dict) -> ToolResult:
+        act = str(inp.get("action") or "")
+        if act == "list":
+            if not self.sessions:
+                return "No sessions open.", False
+            return "\n".join(f"#{n}: {x['command']} (running {span_text(time.time() - x['started'])}"
+                             f"{', ended' if x['proc'].poll() is not None else ''})" for n, x in self.sessions.items()), False
+        if act == "start":
+            return self.session_start(str(inp.get("command") or ""), inp)
+        if act not in ("send", "read", "close"):
+            return "action is start, send, read, close or list.", True
+        try:
+            n = int(inp.get("id"))
+        except (TypeError, ValueError):
+            return f"Give the session's id ({', '.join(f'#{k}' for k in self.sessions) or 'none open'}).", True
+        x = self.sessions.get(n)
+        if not x:
+            return f"No session #{n} (open: {', '.join(f'#{k}' for k in self.sessions) or 'none'}).", True
+        if act == "close":
+            out = self.session_output(x, 0.3, None)
+            self.session_end(n)
+            self.log("session", f"#{n} closed")
+            return (out + "\n" if out.strip() else "") + f"[session #{n} closed]", False
+        if act == "send":
+            if inp.get("ctrl"):
+                key = str(inp["ctrl"]).strip().lower()[:1]
+                if not key.isalpha():
+                    return "ctrl is a letter: c to interrupt, d for end-of-input.", True
+                data, shown = bytes([ord(key) - 96]), f"Ctrl-{key.upper()}"
+            else:
+                text = str(inp.get("input") or "")
+                data, shown = (text + "\n").encode(), text
+            try:
+                os.write(x["fd"], data)
+            except OSError as e:
+                return f"Couldn't send to session #{n}: {e}", True
+            self.log("session", f"#{n} < {clip(shown, 200, 0)}")
+            self.timeline(f"session #{n} < {clip(shown, 200, 0)}")
+        return self.session_reply(n, x, inp)
+
+    def session_start(self, command: str, inp: dict) -> ToolResult:
+        if not command.strip():
+            return "Give the command to start, e.g. \"gdb -q ./target\".", True
+        refused = self.hold_check(command) or self.announce_check(command, inp.get("announced"))
+        if refused:
+            return refused
+        if len([x for x in self.sessions.values() if x["proc"].poll() is None]) >= 8:
+            return "Eight sessions are open already: close one you're done with first.", True
+        master, slave = pty.openpty()
+        attrs = termios.tcgetattr(slave)
+        attrs[3] &= ~(termios.ECHO | termios.ECHONL)             # no echo: the output is just what it prints
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+        def own_terminal():                                      # its own session, with the pty as its terminal
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        try:
+            if self.host():
+                rw = self.remote_work()
+                envf = f"{rw}/.hobkin-shell/session-env-{secrets.token_hex(4)}"
+                env_text = self.remote_script(":", rw).split("cd ", 1)[0]     # just the exports
+                r = self.on_host(f"umask 077; base64 -d > {shlex.quote(envf)} <<'HOBKIN_ENV'\n"
+                                 f"{base64.b64encode(env_text.encode()).decode()}\nHOBKIN_ENV\n")
+                if r.returncode:
+                    raise self.host_error(r)
+                remote = (f"set -a; . {shlex.quote(envf)}; set +a; rm -f {shlex.quote(envf)}; export TERM=dumb; "
+                          f"cd {shlex.quote(self.cwd())} 2>/dev/null || cd {shlex.quote(rw)}; exec bash -c {shlex.quote(command)}")
+                argv = self.ssh_argv(remote)
+                argv.insert(len(argv) - 2, "-tt")                  # a terminal over there too
+                env, cwd = self.ssh_env(), self.work
+            else:
+                argv = self.sandboxed(["bash", "-c", command])
+                env, cwd = self.safe_env(self.tool_env()), self.cwd()
+            env["TERM"] = "dumb"
+            proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, cwd=cwd, env=env,
+                                    start_new_session=True, preexec_fn=own_terminal)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            os.close(master)
+            os.close(slave)
+            return f"Couldn't start it: {e}", True
+        os.close(slave)
+        n = max(self.sessions, default=0) + 1
+        x = {"proc": proc, "fd": master, "command": command, "started": time.time(), "buf": bytearray(),
+             "lock": threading.Lock(), "dropped": 0, "last": time.time()}
+        def reader():                                            # keeps reading, so the program never blocks on output
+            while True:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                with x["lock"]:
+                    x["buf"] += chunk
+                    x["last"] = time.time()
+                    if len(x["buf"]) > 1 << 20:                  # keep the newest MB
+                        x["dropped"] += len(x["buf"]) - (1 << 20)
+                        del x["buf"][:len(x["buf"]) - (1 << 20)]
+        threading.Thread(target=reader, daemon=True).start()
+        self.sessions[n] = x
+        self.log("session", f"#{n} started: {command}" + (f" (on {self.host()})" if self.host() else ""))
+        self.timeline(f"session #{n} started: `{clip(command, 200, 0)}`")
+        reply, err = self.session_reply(n, x, inp)
+        return f"Session #{n} started.\n{reply}", err
+
+    def session_output(self, x: dict, wait: float, until) -> str:
+        """What it printed since the last read: back when it ends with `until`, goes quiet, exits, or `wait` is up."""
+        end, rx = time.time() + wait, re.compile(until) if until else None
+        seen_at = None
+        while time.time() < end and not self.stop and not self.interrupt:
+            with x["lock"]:
+                text, last = x["buf"].decode(errors="replace"), x["last"]
+            clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r", "", text)
+            if rx and (rx.search(clean) or rx.search(clean.rstrip("\n"))):
+                break
+            if x["proc"].poll() is not None and time.time() - last > 0.2:
+                break
+            if text and not rx:
+                seen_at = seen_at or time.time()
+                if time.time() - last > 0.7:                     # it's gone quiet
+                    break
+            self.poll_input(0.1)
+        with x["lock"]:
+            data, dropped = bytes(x["buf"]), x["dropped"]
+            x["buf"].clear()
+            x["dropped"] = 0
+        out = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r", "", data.decode(errors="replace"))
+        return (f"[... {dropped} bytes it printed earlier were dropped]\n" if dropped else "") + out
+
+    def session_reply(self, n: int, x: dict, inp: dict) -> ToolResult:
+        until = inp.get("until")
+        if until:
+            try:
+                re.compile(until)
+            except re.error as e:
+                return f"`until` isn't a valid regular expression: {e}", True
+        out = self.session_output(x, max(0.2, float(inp.get("wait") or 10)), until)
+        keep = int(self.cfg["output_limit"])
+        if len(out) > keep:
+            out = f"{out[:keep // 2]}\n... [{len(out) - keep} characters cut] ...\n{out[-(keep // 2):]}"
+        if x["proc"].poll() is not None:
+            code = x["proc"].returncode
+            self.session_end(n)
+            self.log("session", f"#{n} ended (exit code {code})")
+            return (out + "\n" if out.strip() else "") + f"[session #{n} ended: exit code {code}]", code != 0
+        note = "" if out.strip() else "(nothing printed yet)"
+        self.log("=", f"(session #{n})\n{clip(out, 1000, 800)}" if out.strip() else f"(session #{n}: nothing yet)")
+        return (out or note) + f"\n[session #{n} still running]", False
+
+    def session_end(self, n: int) -> None:
+        x = self.sessions.pop(n, None)
+        if not x:
+            return
+        if x["proc"].poll() is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(x["proc"].pid, sig)
+                    x["proc"].wait(3)
+                    break
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    continue
+        try:
+            os.close(x["fd"])
+        except OSError:
+            pass
+
+    def close_sessions(self) -> None:
+        for n in list(getattr(self, "sessions", {})):
+            self.session_end(n)
 
     # --- files, skills, images
     def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
@@ -4461,6 +4652,7 @@ class Agent:
         except KeyboardInterrupt:
             pass
         finally:
+            self.close_sessions()
             if self.restart_requested and not self.stop and self.pending:
                 # Messages that arrived but weren't started on yet: into the conversation, so a restart keeps them
                 self.add_user("\n\n".join(self.from_operator(t) for t in self.pending))
