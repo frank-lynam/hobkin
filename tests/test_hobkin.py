@@ -1390,6 +1390,31 @@ try:
           r[:300])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # helper: a throwaway agent with a fresh context, on its own model, that sends back only its report
+    h = home("helper", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None, "models": {
+                 "m": {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+                 "cheap": {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}},
+              "helper": {"model": "cheap"}})
+    p, aid, d = start(h)
+    open(d + "/secrets.env", "w").write("HELP_SECRET=xyzzy\n")
+    say(d, 'call: helper {"task": "REPORT: the password is hunter2"}')
+    wait_for(d, "helper> #1 done", 60)
+    res = json.dumps(last_results(d))
+    hd = os.path.join(d, "helpers", f"{aid}-helper-1")
+    check("[helper] a fresh agent on the helper's model does the task; only its report comes back",
+          "Helper #1 (cheap) is done" in res and "the password is hunter2" in res and "you're a helper" not in res
+          and json.load(open(hd + "/state.json"))["model"].startswith("cheap "), res[:500])
+    check("[helper] it started with an empty context (just the brief), and it's stopped",
+          [m["role"] for m in ctx(hd)][:2] == ["system", "user"] and not hbk.is_running(hd)
+          and "you're a helper" in ctx(hd)[1]["content"][0]["text"], [m["role"] for m in ctx(hd)])
+    check("[helper] it gets our secrets (only you can read its copy), and it isn't one of your agents",
+          "HELP_SECRET=xyzzy" in open(os.path.join(d, "helpers", "_shared", "secrets.env")).read()
+          and oct(os.stat(os.path.join(d, "helpers", "_shared", "secrets.env")).st_mode & 0o777) == "0o600"
+          and f"{aid}-helper-1" not in subprocess.run([sys.executable, HOB, "list"], env={**os.environ, "HOBKIN_HOME": h},
+                                                      capture_output=True, text=True).stdout)
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # chores: a standing job from a folder (settings, config, CHORE.md, tools, spells); its watch wakes it only when needed
     h = home("chores", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"})
     cenv = {**os.environ, "HOBKIN_HOME": h, "TESTKEY": "test-key"}

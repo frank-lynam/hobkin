@@ -459,6 +459,20 @@ or the model's own limit; set it to send that limit), and
     the output cap. With a `host`, it runs there over ssh with a terminal; the
     secrets go in a private file that's deleted as soon as they're read.
   - **Lifetime:** up to eight at once; they end when hobkin stops.
+- **`helper`** hands one self-contained task to a throwaway agent with a fresh,
+  empty context, and only its report comes back. That keeps the main context
+  lean: analysing one function, digging through a big log, trying an approach
+  that may be thrown away.
+  - **Its model:** `"helper": {"model": "cheap"}` in config picks any configured
+    model for it (else it uses the agent's own); `"timeout"` caps it (default `30m`).
+  - **Same machine, same rules:** it inherits the host, safe mode, secrets and
+    settings, and break-glass mode if one is on. It doesn't get the agent's chores,
+    wake-ups or board.
+  - **What it does:** it can't ask questions, so it decides and says what it
+    assumed. It ends with a `REPORT:`, which is what comes back, with its cost.
+  - **Where it lives:** in the agent's own `helpers/` folder (not in `hobkin
+    list`), where its whole transcript stays for a look. While it works, commands
+    keep working, and `/interrupt` stops it.
 - **Its own tools:** the agent can make itself tools, for a command it would
   otherwise keep retyping (calls to a synthesizer's API, say). Each is a folder
   `work/tools/NAME/` holding `tool.json` (`{"description": ..., "input_schema":
@@ -1047,6 +1061,7 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
+- the helper (a fresh agent on its own model, only its report coming back);
 - sessions (a REPL keeping its state, Ctrl-C, a program exiting, list and close,
   ending with hobkin, on a host);
 - working on a host (commands, the shell's state, file tools, jobs, own tools,

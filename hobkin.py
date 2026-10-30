@@ -201,6 +201,9 @@ DEFAULT_CONFIG = {
     # Keys only (no password prompts), one shared connection. "ssh" is the ssh command to use (e.g. "ssh -p 2222").
     "host": None,
     "ssh": "ssh",
+    # The helper tool: a throwaway agent with a fresh context, for one task. {"model": NAME} picks one of the
+    # configured models for it (else the agent's own); "timeout" caps how long it may take (default "30m").
+    "helper": None,
     # Break-glass mode, for an incident: set by a person with `hobkin breakglass ID "reason" --for 2h`, never by
     # the agent. Until it expires the agent works fully autonomously: safe mode lifted, nothing announced
     # first, the daily budget as given, an incident timeline kept for it. {"reason", "by", "declared", "until"}
@@ -244,7 +247,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
                 "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
                 "break_glass": (dict, type(None)), "chores": (dict, type(None)), "chore_dirs": list,
-                "host": (str, type(None)), "ssh": (str, type(None))}
+                "host": (str, type(None)), "ssh": (str, type(None)), "helper": (dict, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -606,6 +609,15 @@ TOOLS = [
          "wait": {"type": "number", "description": "Seconds to wait for output at most (default 10)."},
          "announced": {"type": "string", "description": "start: as for bash, when it says a program needs announcing first."}},
          "required": ["action"]}},
+    {"name": "helper",
+     "description": ("Hand one self-contained task to a helper: a fresh agent with an empty context (often a different "
+                     "model), on the same machine and under the same rules as you, which works it alone and sends back "
+                     "only its report. Use it to keep your own context lean: analysing one function or one binary, "
+                     "digging through a big log, surveying a codebase, trying an approach you might throw away. Say "
+                     "everything it needs: paths, what you already know, what to report. It can't ask you questions."),
+     "input_schema": {"type": "object", "properties": {
+         "task": {"type": "string", "description": "The whole task: what to do, where, and exactly what to report back."}},
+         "required": ["task"]}},
 ]
 
 # Only during a shared incident (`hobkin breakglass ... --with`): holds, so teammates don't undo each other's work
@@ -873,6 +885,11 @@ HOST_NOTE = ("# Where you work: {host}\n\nYou work on **{host}**, over ssh. Your
              "them as $HOBKIN_MEMORY and $HOBKIN_BLOOPERS). If {host} can't be reached, your commands fail with ssh's "
              "error: that's information too, so say what it means rather than retrying blindly.")
 REMOTE_CWD = "__HOBKIN_CWD__"
+HELPER_BRIEF = ("[from hobkin: you're a helper. {parent} handed you one task and works on while you do it; you have a fresh "
+                "context. Nobody will answer questions, so don't ask any: decide, and say what you assumed. Their "
+                "folder is {cwd}{where}. Work it through, then end with ONE final reply that starts with `REPORT:` and "
+                "holds everything they need: findings, evidence (paths, addresses, line numbers), what you changed if "
+                "anything, and what's still unknown. Keep it tight: they read only that.]\n\n{task}")
 CHORE_GIVEN = ("[from hobkin: you've been given a chore: {name}. Read CHORE.md and your spells (if it came with any), "
                "then get it going: the first round by hand if you must, but with spells from the start, so the next "
                "round runs itself. Say in a line or two what you'll do, and how often.]")
@@ -2954,6 +2971,7 @@ class Agent:
             "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
             "web_search": lambda: self.web_search(s("query")),
             "session": lambda: self.tool_session(inp),
+            "helper": lambda: self.tool_helper(s("task")),
             **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
             **({"notify": lambda: self.tool_notify(s("message"))} if self.cfg.get("alert_command") else {}),
         }
@@ -3520,6 +3538,88 @@ class Agent:
     def close_sessions(self) -> None:
         for n in list(getattr(self, "sessions", {})):
             self.session_end(n)
+
+    # --- the helper: a throwaway agent with a fresh context, for one task (the helper tool)
+    def tool_helper(self, task: str) -> ToolResult:
+        """Start a helper agent (its own home in helpers/, on the helper model), give it the task, wait while
+        reading input (commands work; /interrupt stops it), and hand back its REPORT. Its files stay for a look."""
+        conf = self.cfg.get("helper") or {}
+        name = conf.get("model") or self.model.name
+        if name not in self.cfg["models"]:
+            return f"The helper model {name!r} isn't configured (models: {', '.join(self.cfg['models'])}).", True
+        n = self.state["next_helper"] = self.state.get("next_helper", 0) + 1
+        home, hid = self.p("helpers"), f"{self.id}-helper-{n}"
+        hd = os.path.join(home, hid)
+        os.makedirs(os.path.join(home, "_shared"), exist_ok=True)
+        cfg = {k: v for k, v in self.cfg.items() if not k.startswith("_") and k not in (
+            "idle_prompt", "wake", "inbox", "chores", "break_glass", "alert_command", "helper", "operator", "front_desk")}
+        cfg.update({"model": name, "idle_prompt": None, "heartbeat_seconds": 0})
+        if self.glass:                               # in an incident, so is it (and safe mode is lifted for it too)
+            cfg["break_glass"] = {k: v for k, v in self.glass.items() if k not in ("incident",)}
+        write_json(os.path.join(home, "_shared", "config.json"), cfg)
+        secrets_text = read(os.path.join(SHARED, "secrets.env")) + "\n" + read(self.p("secrets.env"))
+        fd = os.open(os.path.join(home, "_shared", "secrets.env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets_text)
+        os.makedirs(hd, exist_ok=True)
+        where = f" on {self.host()}" if self.host() else ""
+        queue_message(hd, HELPER_BRIEF.format(parent=self.id, cwd=self.cwd(), where=where, task=task))
+        env = {**os.environ, "HOBKIN_HOME": home}
+        log = open(os.path.join(hd, "hobkin.log"), "ab")
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), hid], env=env, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=log, start_new_session=True)
+        log.close()
+        self.log("helper", f"#{n} on {name}: {clip(' '.join(task.split()), 200, 0)}")
+        self.timeline(f"helper #{n} ({name}): {clip(' '.join(task.split()), 200, 0)}")
+        self.busy(f"waiting for helper #{n}")
+        timeout = parse_duration(str(conf.get("timeout") or "30m"))
+        start, reason, worked = time.time(), None, False
+        while True:
+            self.poll_input(1.0)
+            st = read_json(os.path.join(hd, "state.json"), {})
+            worked = worked or '"role": "assistant"' in read(os.path.join(hd, "context.jsonl"))
+            if proc.poll() is not None:
+                reason = f"it stopped (exit code {proc.returncode}; see {hd}/hobkin.log)"
+                break
+            if worked and st.get("status") == "idle":
+                break
+            if self.stop:
+                reason = "hobkin is stopping"
+            elif self.interrupt:
+                reason = "interrupted by the operator"
+            elif time.time() - start > timeout:
+                reason = f"it ran out of time ({span_text(timeout)})"
+            if reason:
+                break
+        if proc.poll() is None:                      # done or not, it goes now
+            try:
+                with open(os.path.join(hd, "in"), "w") as f:
+                    f.write("/stop\n")
+                proc.wait(20)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.busy(None)
+        said = []
+        for line in read(os.path.join(hd, "context.jsonl")).splitlines()[1:]:
+            m = json.loads(line)
+            if m["role"] == "assistant":
+                text = "\n".join(b.get("text", "") for b in m["content"] if b.get("type") == "text").strip()
+                if text:
+                    said.append(text)
+        report = next((t for t in reversed(said) if "REPORT:" in t), said[-1] if said else "")
+        report = report[report.find("REPORT:") + 7:].strip() if "REPORT:" in report else report
+        cost = read_json(os.path.join(hd, "state.json"), {}).get("spend_usd")
+        head = (f"Helper #{n} ({name}) " + (f"stopped early: {reason}" if reason else "is done")
+                + (f", ${cost:.2f}" if cost else "") + f". Its whole transcript: {hd}/context.jsonl")
+        self.log("helper", f"#{n} " + ("stopped: " + reason if reason else "done"))
+        self.timeline(f"helper #{n} " + ("stopped: " + reason if reason else "reported"))
+        if not report:
+            return head + "\n(it wrote no report)", True
+        keep = int(self.cfg["output_limit"])
+        return f"{head}\n\n{clip(report, keep // 2, keep // 2)}", bool(reason)
 
     # --- files, skills, images
     def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
