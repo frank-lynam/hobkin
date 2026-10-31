@@ -435,6 +435,15 @@ or the model's own limit; set it to send that limit), and
   `{"done": [N]}`. File changes (other than `CHECKLIST.md` and `NOTES.md`) aren't
   made until there's a goal (or the agent has said **What would:**), once per
   turn: a second try goes through.
+  - **Sub-goals:** when you ask for something mid-task, the agent doesn't drop
+    its goal: `{"subgoal": ..., "why": ..., "steps": [...]}` (optionally
+    `"before_step": N`) adds a sub-goal it works on first, shown in the checklist
+    before that step. When it's done, hobkin hands it back to the goal and its
+    next step. Messages you send while a goal is open remind it to fold them in.
+  - **Revise:** `{"revise": {"add": [...], "after": N, "drop": [N], "goal": ...}}`
+    reshapes the goal (or the sub-goal it's on): done steps stay done, only
+    unfinished ones can go. Setting a different goal while one is open needs
+    `"replace": true`.
 - **`view_image`** shows it an image (PNG, JPEG, GIF, WebP, under 5 MB): a
   screenshot of the UI it built, a chart, a photo. On OpenAI-style APIs the image
   follows the tool result as a user message, because tool messages can't hold
@@ -459,20 +468,25 @@ or the model's own limit; set it to send that limit), and
     the output cap. With a `host`, it runs there over ssh with a terminal; the
     secrets go in a private file that's deleted as soon as they're read.
   - **Lifetime:** up to eight at once; they end when hobkin stops.
-- **`helper`** hands one self-contained task to a throwaway agent with a fresh,
-  empty context, and only its report comes back. That keeps the main context
-  lean: analysing one function, digging through a big log, trying an approach
-  that may be thrown away.
-  - **Its model:** `"helper": {"model": "cheap"}` in config picks any configured
-    model for it (else it uses the agent's own); `"timeout"` caps it (default `30m`).
+- **`coworker`** hands a small, well-scoped job to a co-worker: a fully
+  autonomous agent with a fresh, empty context, for the little problems not worth
+  the main agent's attention (analysing one function, digging through a big log,
+  trying an approach that may be thrown away). You never have to see it.
+  - **In the background:** by default the agent goes on working and the
+    co-worker's report arrives later as a message; `"wait": true` blocks until it
+    reports, for when the agent can't go on without the answer.
+  - **Its model:** the default model for hobkins in general (`"model"` in
+    `_shared/config.json`), not the spawning agent's own, so you can run the main
+    agent on a big model and co-workers on a cheaper default.
+    `"coworker": {"model": "cheap"}` in config overrides it; `"timeout"` caps each
+    one (default `30m`) and `"max"` how many run at once (default 3).
   - **Same machine, same rules:** it inherits the host, safe mode, secrets and
     settings, and break-glass mode if one is on. It doesn't get the agent's chores,
     wake-ups or board.
   - **What it does:** it can't ask questions, so it decides and says what it
     assumed. It ends with a `REPORT:`, which is what comes back, with its cost.
-  - **Where it lives:** in the agent's own `helpers/` folder (not in `hobkin
-    list`), where its whole transcript stays for a look. While it works, commands
-    keep working, and `/interrupt` stops it.
+  - **Where it lives:** in the agent's own `coworkers/` folder (not in `hobkin
+    list`), where its whole transcript stays for a look.
 - **Its own tools:** the agent can make itself tools, for a command it would
   otherwise keep retyping (calls to a synthesizer's API, say). Each is a folder
   `work/tools/NAME/` holding `tool.json` (`{"description": ..., "input_schema":
@@ -1061,7 +1075,8 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
-- the helper (a fresh agent on its own model, only its report coming back);
+- co-workers (on the default model, in the background or waited on, only their
+  report coming back) and sub-goals (folded in, revised, back to the goal);
 - sessions (a REPL keeping its state, Ctrl-C, a program exiting, list and close,
   ending with hobkin, on a host);
 - working on a host (commands, the shell's state, file tools, jobs, own tools,

@@ -1390,29 +1390,68 @@ try:
           r[:300])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
-    # helper: a throwaway agent with a fresh context, on its own model, that sends back only its report
-    h = home("helper", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+    # co-workers: fully autonomous agents on the default model (not the spawner's own), reporting back as messages
+    h = home("coworker", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"idle_prompt": None, "models": {
                  "m": {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
-                 "cheap": {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}},
-              "helper": {"model": "cheap"}})
-    p, aid, d = start(h)
+                 "everyday": {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}},
+              "model": "everyday"})                                     # the default for hobkins in general
+    os.makedirs(h + "/boss"); json.dump({"model": "m"}, open(h + "/boss/config.json", "w"))   # this one runs on "m"
+    p, aid, d = start(h, "boss")
     open(d + "/secrets.env", "w").write("HELP_SECRET=xyzzy\n")
-    say(d, 'call: helper {"task": "REPORT: the password is hunter2"}')
-    wait_for(d, "helper> #1 done", 60)
-    res = json.dumps(last_results(d))
-    hd = os.path.join(d, "helpers", f"{aid}-helper-1")
-    check("[helper] a fresh agent on the helper's model does the task; only its report comes back",
-          "Helper #1 (cheap) is done" in res and "the password is hunter2" in res and "you're a helper" not in res
-          and json.load(open(hd + "/state.json"))["model"].startswith("cheap "), res[:500])
-    check("[helper] it started with an empty context (just the brief), and it's stopped",
-          [m["role"] for m in ctx(hd)][:2] == ["system", "user"] and not hbk.is_running(hd)
-          and "you're a helper" in ctx(hd)[1]["content"][0]["text"], [m["role"] for m in ctx(hd)])
-    check("[helper] it gets our secrets (only you can read its copy), and it isn't one of your agents",
-          "HELP_SECRET=xyzzy" in open(os.path.join(d, "helpers", "_shared", "secrets.env")).read()
-          and oct(os.stat(os.path.join(d, "helpers", "_shared", "secrets.env")).st_mode & 0o777) == "0o600"
-          and f"{aid}-helper-1" not in subprocess.run([sys.executable, HOB, "list"], env={**os.environ, "HOBKIN_HOME": h},
+    say(d, 'call: coworker {"task": "REPORT: the password is hunter2"}')
+    wait_for(d, "is on it. Carry on", file="context.jsonl")
+    wait_for(d, "a co-worker you sent reports back", 60, file="context.jsonl")
+    cd = os.path.join(d, "coworkers", "boss-coworker-1")
+    reported = [m for m in ctx(d) if "a co-worker you sent reports back" in json.dumps(m)][-1]
+    check("[coworker] it runs in the background, and its report arrives later as a message",
+          "the password is hunter2" in json.dumps(reported) and "you're a co-worker" not in json.dumps(reported), json.dumps(reported)[:400])
+    check("[coworker] it runs on the default model for hobkins, not the spawning agent's own",
+          json.load(open(cd + "/state.json"))["model"].startswith("everyday ") and json.load(open(d + "/state.json"))["model"].startswith("m "))
+    check("[coworker] a fresh context (just the brief), stopped when done; our secrets; not one of your agents",
+          [m["role"] for m in ctx(cd)][:2] == ["system", "user"] and not hbk.is_running(cd)
+          and "HELP_SECRET=xyzzy" in open(os.path.join(d, "coworkers", "_shared", "secrets.env")).read()
+          and oct(os.stat(os.path.join(d, "coworkers", "_shared", "secrets.env")).st_mode & 0o777) == "0o600"
+          and "boss-coworker-1" not in subprocess.run([sys.executable, HOB, "list"], env={**os.environ, "HOBKIN_HOME": h},
                                                       capture_output=True, text=True).stdout)
+    say(d, 'call: coworker {"task": "REPORT: waited for this one", "wait": true}')
+    wait_for(d, "coworker> #2 done", 60)
+    check("[coworker] wait: true holds the step until its report", "waited for this one" in json.dumps(last_results(d)))
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # sub-goals: new work folds into the open goal instead of replacing it; revise reshapes it, keeping what's done
+    h = home("subgoals", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    p, aid, d = start(h)
+    def goal(args, marker):
+        n = read_or_empty(d + "/context.jsonl").count('"tool_use_id"')
+        say(d, "call: goal " + json.dumps(args))
+        for _ in range(150):
+            if read_or_empty(d + "/context.jsonl").count('"tool_use_id"') > n \
+                    and json.load(open(d + "/state.json")).get("status") == "idle": break
+            time.sleep(0.1)
+        r = json.dumps(last_results(d))
+        assert marker in r, r[:500]
+        return r
+    goal({"goal": "Ship the report", "how_it_works": "x", "why_it_doesnt": "y", "what_would": "z",
+          "steps": ["gather data", "write it", "send it"]}, "Goal set")
+    goal({"done": [1]}, "Next: 2. write it")
+    r = goal({"goal": "Fix the printer", "what_would": "z", "steps": ["a"]}, "already have an open goal")
+    check("[goal] a new goal doesn't silently replace an open one", json.load(open(d + "/state.json"))["goal"]["goal"] == "Ship the report")
+    goal({"subgoal": "Add the chart Frank asked for", "why": "Frank asked mid-task", "steps": ["make chart", "embed it"]}, "Sub-goal set, before step 2")
+    sysp = ctx(d)[0]["content"]
+    cl = open(json.load(open(d + "/state.json"))["goal"]["folder"] + "/CHECKLIST.md").read()
+    check("[goal] a sub-goal sits before the next step, in the checklist and the prompt; the goal is kept",
+          cl.index("Sub-goal (on it now): Add the chart") < cl.index("2. write it") and "Ship the report" in cl
+          and "You're on the sub-goal" in sysp, cl)
+    goal({"done": [1]}, "Next: 2. embed it")                              # ticks the sub-goal's steps
+    r = goal({"done": [2]}, "Sub-goal done. Back to your goal: Ship the report. Next: step 2. write it")
+    check("[goal] when the sub-goal is done, it's back to the goal where it left off", True)
+    r = goal({"revise": {"add": ["proofread it"], "after": 2, "drop": [3]}}, "Revised, keeping what's done")
+    g = json.load(open(d + "/state.json"))["goal"]
+    check("[goal] revise reshapes the steps, keeping what's done and the sub-goal's place",
+          g["steps"] == ["gather data", "write it", "proofread it"] and g["done"] == [1] and g["subs"][0]["before"] == 2, g)
+    r = goal({"revise": {"drop": [1]}}, "Done steps stay done")
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # chores: a standing job from a folder (settings, config, CHORE.md, tools, spells); its watch wakes it only when needed
