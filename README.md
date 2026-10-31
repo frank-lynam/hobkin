@@ -133,7 +133,9 @@ output too, as the `out` file has it. Each line you type (or paste) is sent;
 what you're typing: the line is redrawn below it, with the cursor where you left
 it, even mid-edit. You get the usual line
 editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
-←/→, Ctrl-R to search. Piped, it sends the
+←/→, Ctrl-R to search. In a message that spans rows (a pasted block, or a long
+line wrapped on screen), ↑/↓ move between its rows first, and go through history
+from its top or bottom row (GNU readline; with libedit they only do history). Piped, it sends the
 input, prints the reply and exits: `echo "status?" | hobkin chat bodkin`.
 
 Or with plain files:

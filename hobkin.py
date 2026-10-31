@@ -83,6 +83,7 @@ import select
 import shlex
 import struct
 import shutil
+import unicodedata
 import pty
 import ssl
 import signal
@@ -5265,6 +5266,74 @@ def readline_hook(readline, fn):
     return remove
 
 
+def cell_width(ch):
+    """Columns a character takes on screen, as readline draws it: wide (CJK, emoji) 2, combining 0, controls ^X."""
+    if ord(ch) < 32 or ord(ch) == 127:
+        return 2
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def line_move(text, point, prompt_len, width, step):
+    """Where up (step -1) or down (+1) puts the cursor in an input that spans screen rows (pasted lines, or
+    one long line wrapped): the same column on the row above or below. None on the top or bottom row
+    (the arrows go through history there)."""
+    row, col, cells = 0, prompt_len, []
+    for ch in text:
+        w = cell_width(ch)
+        if ch != "\n" and col + w > width:
+            row, col = row + 1, 0
+        cells.append((row, col))
+        if ch == "\n":
+            row, col = row + 1, 0
+        else:
+            col += w
+            if col >= width:
+                row, col = row + 1, 0
+    cells.append((row, col))                          # the end of the input
+    r, c = cells[point]
+    want = r + step
+    if want < 0 or want > cells[-1][0]:
+        return None
+    on_row = [i for i, (ri, _) in enumerate(cells) if ri == want]
+    return max((i for i in on_row if cells[i][1] <= c), default=on_row[0])
+
+
+def readline_arrows(readline, prompt_len):
+    """Bind up and down so they move between the rows of a multi-row input first, and through history
+    only from its top or bottom row. GNU readline through ctypes; returns what has to stay alive, or None
+    where it can't be bound (libedit), and the arrows just go through history."""
+    if not readline or "libedit" in (readline.__doc__ or ""):
+        return None
+    try:
+        lib = ctypes.CDLL(readline.__file__)
+        point, end = ctypes.c_int.in_dll(lib, "rl_point"), ctypes.c_int.in_dll(lib, "rl_end")
+        buffer = ctypes.c_char_p.in_dll(lib, "rl_line_buffer")
+        history = {-1: lib.rl_get_previous_history, 1: lib.rl_get_next_history}
+        lib.rl_bind_keyseq.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+    except (OSError, AttributeError, ValueError):
+        return None
+    def arrow(step):
+        def move(count, key):
+            try:
+                raw = ctypes.string_at(buffer.value or b"", end.value) if buffer.value else b""
+                text = raw.decode("utf-8", "surrogateescape")
+                at = len(raw[:point.value].decode("utf-8", "surrogateescape"))
+                to = line_move(text, at, prompt_len, shutil.get_terminal_size().columns, step)
+            except Exception:                         # never let the arrow keys kill the chat
+                to = None
+            if to is None:
+                return history[step](count, key)
+            point.value = len(text[:to].encode("utf-8", "surrogateescape"))
+            return 0
+        return ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)(move)
+    up, down = arrow(-1), arrow(1)
+    for seq, fn in ((b"\x1b[A", up), (b"\x1bOA", up), (b"\x1b[B", down), (b"\x1bOB", down)):
+        lib.rl_bind_keyseq(seq, ctypes.cast(fn, ctypes.c_void_p))
+    return up, down
+
+
 def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False):
     """The interactive side of chat: input() with readline, output from a background thread
     that clears the input line, prints, then redraws the prompt with what you'd typed."""
@@ -5331,6 +5400,7 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
             done.wait(0.1)
 
     unhook = readline_hook(readline, draw)
+    arrows = readline_arrows(readline, len(prompt))   # noqa: F841 (the callbacks must stay alive while input() runs)
     if not unhook:
         threading.Thread(target=printer, daemon=True).start()
     try:

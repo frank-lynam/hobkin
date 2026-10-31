@@ -1216,6 +1216,17 @@ try:
     check("[chat] typing survives a reply landing mid-line; output is drawn from readline's own input hook",
           unhook is not None)
     if unhook: unhook()
+    # up and down: between the rows of a multi-row input first, through history only from its top or bottom
+    os.write(fd, b"\x1b[200~line one\nline two\x1b[201~\x1b[AY\r")   # a pasted two-line message; up, then type
+    wait_for(d, "operator> line oYne")
+    os.write(fd, b"\x1b[A\x1b[A\x1b[A\r")      # history: that message (cursor on its last row), its top row, the one before
+    end = time.time() + 20
+    while time.time() < end and open(d + "/out").read().count("operator> hello woXrld") < 2: time.sleep(0.2)
+    check("[chat] up moves between the rows of what you're typing, then through history",
+          open(d + "/out").read().count("operator> hello woXrld") == 2, open(d + "/out").read()[-600:])
+    check("[chat] the rows of a long line wrapped on screen count too",
+          hbk.line_move("a" * 30, 30, 2, 10, -1) == 20 and hbk.line_move("a" * 30, 3, 2, 10, 1) == 13
+          and hbk.line_move("a" * 30, 3, 2, 10, -1) is None and hbk.line_move("界" * 6, 6, 2, 10, -1) == 1)
     os.write(fd, b"\x04"); os.waitpid(pid, 0)
     p.send_signal(signal.SIGTERM); p.wait(10)
 
