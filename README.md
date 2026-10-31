@@ -468,24 +468,25 @@ or the model's own limit; set it to send that limit), and
     the output cap. With a `host`, it runs there over ssh with a terminal; the
     secrets go in a private file that's deleted as soon as they're read.
   - **Lifetime:** up to eight at once; they end when hobkin stops.
-- **`coworker`** hands a small, well-scoped job to a co-worker: a fully
+- **`brownie`** hands a small, well-scoped job to a brownie (after the
+  household spirit that does the chores while nobody's looking): a fully
   autonomous agent with a fresh, empty context, for the little problems not worth
   the main agent's attention (analysing one function, digging through a big log,
   trying an approach that may be thrown away). You never have to see it.
   - **In the background:** by default the agent goes on working and the
-    co-worker's report arrives later as a message; `"wait": true` blocks until it
+    brownie's report arrives later as a message; `"wait": true` blocks until it
     reports, for when the agent can't go on without the answer.
   - **Its model:** the default model for hobkins in general (`"model"` in
     `_shared/config.json`), not the spawning agent's own, so you can run the main
-    agent on a big model and co-workers on a cheaper default.
-    `"coworker": {"model": "cheap"}` in config overrides it; `"timeout"` caps each
+    agent on a big model and brownies on a cheaper default.
+    `"brownie": {"model": "cheap"}` in config overrides it; `"timeout"` caps each
     one (default `30m`) and `"max"` how many run at once (default 3).
   - **Same machine, same rules:** it inherits the host, safe mode, secrets and
     settings, and break-glass mode if one is on. It doesn't get the agent's chores,
     wake-ups or board.
   - **What it does:** it can't ask questions, so it decides and says what it
     assumed. It ends with a `REPORT:`, which is what comes back, with its cost.
-  - **Where it lives:** in the agent's own `coworkers/` folder (not in `hobkin
+  - **Where it lives:** in the agent's own `brownies/` folder (not in `hobkin
     list`), where its whole transcript stays for a look.
 - **Its own tools:** the agent can make itself tools, for a command it would
   otherwise keep retyping (calls to a synthesizer's API, say). Each is a folder
@@ -1075,7 +1076,7 @@ nothing and don't need a key. They cover both API styles:
   commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
-- co-workers (on the default model, in the background or waited on, only their
+- brownies (on the default model, in the background or waited on, only their
   report coming back) and sub-goals (folded in, revised, back to the goal);
 - sessions (a REPL keeping its state, Ctrl-C, a program exiting, list and close,
   ending with hobkin, on a host);

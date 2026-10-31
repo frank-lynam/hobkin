@@ -201,10 +201,10 @@ DEFAULT_CONFIG = {
     # Keys only (no password prompts), one shared connection. "ssh" is the ssh command to use (e.g. "ssh -p 2222").
     "host": None,
     "ssh": "ssh",
-    # The coworker tool: fully autonomous agents with a fresh context, for small well-scoped jobs. "model" picks
+    # The brownie tool: fully autonomous agents with a fresh context, for small well-scoped jobs. "model" picks
     # theirs (default: this file's "model", the default for hobkins in general, not the spawning agent's own);
     # "timeout" caps each (default "30m"); "max" is how many may run at once (default 3).
-    "coworker": None,
+    "brownie": None,
     # Break-glass mode, for an incident: set by a person with `hobkin breakglass ID "reason" --for 2h`, never by
     # the agent. Until it expires the agent works fully autonomously: safe mode lifted, nothing announced
     # first, the daily budget as given, an incident timeline kept for it. {"reason", "by", "declared", "until"}
@@ -248,7 +248,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
                 "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
                 "break_glass": (dict, type(None)), "chores": (dict, type(None)), "chore_dirs": list,
-                "host": (str, type(None)), "ssh": (str, type(None)), "coworker": (dict, type(None))}
+                "host": (str, type(None)), "ssh": (str, type(None)), "brownie": (dict, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -618,8 +618,8 @@ TOOLS = [
          "wait": {"type": "number", "description": "Seconds to wait for output at most (default 10)."},
          "announced": {"type": "string", "description": "start: as for bash, when it says a program needs announcing first."}},
          "required": ["action"]}},
-    {"name": "coworker",
-     "description": ("Hand a small, well-scoped job to a co-worker: a fully autonomous agent with a fresh, empty context "
+    {"name": "brownie",
+     "description": ("Hand a small, well-scoped job to a brownie: a fully autonomous agent with a fresh, empty context "
                      "(on the everyday model), on the same machine and under the same rules as you. It works the job "
                      "alone and sends back only its report, so the problems not worth your attention don't take it, or "
                      "your context: a flaky test, one function to analyse, a log to dig through, a survey of a codebase, "
@@ -897,7 +897,7 @@ HOST_NOTE = ("# Where you work: {host}\n\nYou work on **{host}**, over ssh. Your
              "them as $HOBKIN_MEMORY and $HOBKIN_BLOOPERS). If {host} can't be reached, your commands fail with ssh's "
              "error: that's information too, so say what it means rather than retrying blindly.")
 REMOTE_CWD = "__HOBKIN_CWD__"
-COWORKER_BRIEF = ("[from hobkin: you're a co-worker. {parent} handed you one well-scoped job and works on while you do it; you have a fresh "
+BROWNIE_BRIEF = ("[from hobkin: you're a brownie (a helper agent, like the household spirit that does the chores unseen). {parent} handed you one well-scoped job and works on while you do it; you have a fresh "
                 "context, and you work fully on your own. Nobody will answer questions, so don't ask any: decide, and say what you assumed. Their "
                 "folder is {cwd}{where}. Work it through, then end with ONE final reply that starts with `REPORT:` and "
                 "holds everything they need: findings, evidence (paths, addresses, line numbers), what you changed if "
@@ -2988,7 +2988,7 @@ class Agent:
             "fetch_url": lambda: self.fetch_url(s("url"), inp.get("offset"), inp.get("limit"), inp.get("save_as")),
             "web_search": lambda: self.web_search(s("query")),
             "session": lambda: self.tool_session(inp),
-            "coworker": lambda: self.tool_coworker(s("task"), bool(inp.get("wait"))),
+            "brownie": lambda: self.tool_brownie(s("task"), bool(inp.get("wait"))),
             **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
             **({"notify": lambda: self.tool_notify(s("message"))} if self.cfg.get("alert_command") else {}),
         }
@@ -3556,27 +3556,27 @@ class Agent:
         for n in list(getattr(self, "sessions", {})):
             self.session_end(n)
 
-    # --- co-workers: fully autonomous agents for small, well-scoped jobs (the coworker tool)
-    def coworker_model(self) -> str:
-        """coworker.model if set; else the default model for hobkins in general (_shared/config.json's "model"),
-        not this agent's own: run the main agent on a big model and its co-workers on the everyday one."""
-        conf = self.cfg.get("coworker") or {}
+    # --- brownies: fully autonomous agents for small, well-scoped jobs (the brownie tool)
+    def brownie_model(self) -> str:
+        """brownie.model if set; else the default model for hobkins in general (_shared/config.json's "model"),
+        not this agent's own: run the main agent on a big model and its brownies on the everyday one."""
+        conf = self.cfg.get("brownie") or {}
         shared = read_json(os.path.join(SHARED, "config.json"), {}).get("model")
         for name in (conf.get("model"), shared, self.model.name):
             if name and name in self.cfg["models"]:
                 return name
         return self.model.name
 
-    def coworker_start(self, task: str) -> tuple[int, str, str, subprocess.Popen]:
-        """A co-worker: its own home in coworkers/ (not one of your agents), the same host, safe mode, secrets and
+    def brownie_start(self, task: str) -> tuple[int, str, str, subprocess.Popen]:
+        """A brownie: its own home in brownies/ (not one of your agents), the same host, safe mode, secrets and
         settings (and an open incident), none of this agent's chores, wake-ups or board. The task is its first message."""
-        name = self.coworker_model()
-        n = self.state["next_coworker"] = self.state.get("next_coworker", 0) + 1
-        home, cid = self.p("coworkers"), f"{self.id}-coworker-{n}"
+        name = self.brownie_model()
+        n = self.state["next_brownie"] = self.state.get("next_brownie", 0) + 1
+        home, cid = self.p("brownies"), f"{self.id}-brownie-{n}"
         cd = os.path.join(home, cid)
         os.makedirs(os.path.join(home, "_shared"), exist_ok=True)
         cfg = {k: v for k, v in self.cfg.items() if not k.startswith("_") and k not in (
-            "idle_prompt", "wake", "inbox", "chores", "break_glass", "alert_command", "coworker", "operator",
+            "idle_prompt", "wake", "inbox", "chores", "break_glass", "alert_command", "brownie", "operator",
             "front_desk")}
         cfg.update({"model": name, "idle_prompt": None, "heartbeat_seconds": 0})
         if self.glass:                               # in an incident, so is it (and safe mode is lifted for it too)
@@ -3588,17 +3588,17 @@ class Agent:
             f.write(secrets_text)
         os.makedirs(cd, exist_ok=True)
         where = f" on {self.host()}" if self.host() else ""
-        queue_message(cd, COWORKER_BRIEF.format(parent=self.id, cwd=self.cwd(), where=where, task=task))
+        queue_message(cd, BROWNIE_BRIEF.format(parent=self.id, cwd=self.cwd(), where=where, task=task))
         log = open(os.path.join(cd, "hobkin.log"), "ab")
         proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), cid], env={**os.environ, "HOBKIN_HOME": home},
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         log.close()
-        self.log("coworker", f"#{n} on {name}: {clip(' '.join(task.split()), 200, 0)}")
-        self.timeline(f"co-worker #{n} ({name}): {clip(' '.join(task.split()), 200, 0)}")
+        self.log("brownie", f"#{n} on {name}: {clip(' '.join(task.split()), 200, 0)}")
+        self.timeline(f"brownie #{n} ({name}): {clip(' '.join(task.split()), 200, 0)}")
         return n, cd, name, proc
 
     @staticmethod
-    def coworker_state(cd: str, pid: int) -> str:
+    def brownie_state(cd: str, pid: int) -> str:
         """'working', 'done' (it has replied and gone idle) or 'stopped' (its process is gone)."""
         st = read_json(os.path.join(cd, "state.json"), {})
         try:
@@ -3609,7 +3609,7 @@ class Agent:
             return "done"
         return "working"
 
-    def coworker_finish(self, n: int, cd: str, name: str, pid: int, reason: str | None) -> tuple[str, bool]:
+    def brownie_finish(self, n: int, cd: str, name: str, pid: int, reason: str | None) -> tuple[str, bool]:
         """Stop it (if it's still there) and make its report into a message: its REPORT, else its last reply."""
         try:
             os.kill(pid, 0)
@@ -3631,34 +3631,34 @@ class Agent:
         report = next((t for t in reversed(said) if "REPORT:" in t), said[-1] if said else "")
         report = report[report.find("REPORT:") + 7:].strip() if "REPORT:" in report else report
         cost = read_json(os.path.join(cd, "state.json"), {}).get("spend_usd")
-        head = (f"Co-worker #{n} ({name}) " + (f"stopped early: {reason}" if reason else "is done")
+        head = (f"Brownie #{n} ({name}) " + (f"stopped early: {reason}" if reason else "is done")
                 + (f", ${cost:.2f}" if cost else "") + f". Its whole transcript: {cd}/context.jsonl")
-        self.log("coworker", f"#{n} " + ("stopped: " + reason if reason else "done"))
-        self.timeline(f"co-worker #{n} " + ("stopped: " + reason if reason else "reported"))
+        self.log("brownie", f"#{n} " + ("stopped: " + reason if reason else "done"))
+        self.timeline(f"brownie #{n} " + ("stopped: " + reason if reason else "reported"))
         if not report:
             return head + "\n(it wrote no report)", True
         keep = int(self.cfg["output_limit"])
         return f"{head}\n\n{clip(report, keep // 2, keep // 2)}", bool(reason)
 
-    def tool_coworker(self, task: str, wait: bool) -> ToolResult:
-        conf = self.cfg.get("coworker") or {}
-        running = self.state.setdefault("coworkers", {})
+    def tool_brownie(self, task: str, wait: bool) -> ToolResult:
+        conf = self.cfg.get("brownie") or {}
+        running = self.state.setdefault("brownies", {})
         if len(running) >= int(conf.get("max", 3)):
-            return (f"{len(running)} co-workers are already on jobs (the limit is {conf.get('max', 3)}): let one finish, "
+            return (f"{len(running)} brownies are already on jobs (the limit is {conf.get('max', 3)}): let one finish, "
                     "or do this yourself."), True
-        n, cd, name, proc = self.coworker_start(task)
+        n, cd, name, proc = self.brownie_start(task)
         timeout = parse_duration(str(conf.get("timeout") or "30m"))
         if not wait:                                 # it reports back as a message, like a background job
             running[str(n)] = {"dir": cd, "pid": proc.pid, "model": name, "started": time.time(), "timeout": timeout,
                                "task": task[:300]}
             self.save_state()
-            return (f"Co-worker #{n} ({name}) is on it. Carry on with your own work: its report arrives as a message "
+            return (f"Brownie #{n} ({name}) is on it. Carry on with your own work: its report arrives as a message "
                     "when it's done. Don't check on it or do its job in the meantime."), False
-        self.busy(f"waiting for co-worker #{n}")
+        self.busy(f"waiting for brownie #{n}")
         start, reason = time.time(), None
         while True:
             self.poll_input(1.0)
-            state = self.coworker_state(cd, proc.pid)
+            state = self.brownie_state(cd, proc.pid)
             if state == "stopped":
                 reason = f"it stopped (exit code {proc.poll()}; see {cd}/hobkin.log)"
             elif state == "done":
@@ -3672,21 +3672,21 @@ class Agent:
             if reason:
                 break
         self.busy(None)
-        return self.coworker_finish(n, cd, name, proc.pid, reason)
+        return self.brownie_finish(n, cd, name, proc.pid, reason)
 
-    def finished_coworkers(self) -> list[str]:
-        """Messages for background co-workers that are done (or stopped, or out of time) since we last looked."""
+    def finished_brownies(self) -> list[str]:
+        """Messages for background brownies that are done (or stopped, or out of time) since we last looked."""
         out = []
-        for key, c in list((self.state.get("coworkers") or {}).items()):
-            state = self.coworker_state(c["dir"], c["pid"])
+        for key, c in list((self.state.get("brownies") or {}).items()):
+            state = self.brownie_state(c["dir"], c["pid"])
             late = time.time() - c["started"] > c["timeout"]
             if state == "working" and not late:
                 continue
             reason = None if state == "done" else ("it stopped (see its hobkin.log)" if state == "stopped"
                                                    else f"it ran out of time ({span_text(c['timeout'])})")
-            text, _ = self.coworker_finish(int(key), c["dir"], c["model"], c["pid"], reason)
-            del self.state["coworkers"][key]
-            out.append(f"[from hobkin: a co-worker you sent reports back, {self.stamp()}. You gave it: "
+            text, _ = self.brownie_finish(int(key), c["dir"], c["model"], c["pid"], reason)
+            del self.state["brownies"][key]
+            out.append(f"[from hobkin: a brownie you sent reports back, {self.stamp()}. You gave it: "
                        f"{clip(c['task'], 200, 0)}]\n{text}")
         if out:
             self.save_state()
@@ -4093,12 +4093,12 @@ class Agent:
             self.greet_wanted = False
             where = GREET_WHERE.format(cwd=self.operator_cwd) if self.operator_cwd else ""
             greet = [GREET.format(who=self.who, stamp=self.stamp(), name=self.id, where=where)]
-        return greet + self.take_due_reminders() + self.finished_jobs() + self.finished_coworkers()
+        return greet + self.take_due_reminders() + self.finished_jobs() + self.finished_brownies()
 
     def scheduled(self) -> bool:
         """True when the agent has set up its own next wake-up: a reminder, or a job still running.
         Then it's managing itself, and the hot-take, wrap-up and idle nudges stay quiet."""
-        return bool(self.state.get("jobs")) or bool(self.state.get("coworkers")) or self.next_reminder_in() is not None
+        return bool(self.state.get("jobs")) or bool(self.state.get("brownies")) or self.next_reminder_in() is not None
 
     # --- nudges: where the [hobkin: ...] hints (texts and detectors: the "nudges" section) get attached
     # Small models skim long instructions but follow a hint at the moment it applies.
@@ -4899,8 +4899,8 @@ class Agent:
                 wait = max(0.0, idle_since + every - time.time()) if prompt else every if quiet else 3600
                 self.next_idle_prompt = idle_since + every if prompt else None
                 nxt = self.next_reminder_in()
-                if self.state.get("jobs") or self.state.get("coworkers"):
-                    nxt = min(nxt, 1.0) if nxt is not None else 1.0   # look for finished jobs and co-workers every second
+                if self.state.get("jobs") or self.state.get("brownies"):
+                    nxt = min(nxt, 1.0) if nxt is not None else 1.0   # look for finished jobs and brownies every second
                 self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
                     self.log("hobkin", "idle prompt")

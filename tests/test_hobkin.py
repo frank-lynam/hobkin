@@ -1390,8 +1390,8 @@ try:
           r[:300])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
-    # co-workers: fully autonomous agents on the default model (not the spawner's own), reporting back as messages
-    h = home("coworker", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+    # brownies: fully autonomous agents on the default model (not the spawner's own), reporting back as messages
+    h = home("brownie", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"idle_prompt": None, "models": {
                  "m": {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
                  "everyday": {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}},
@@ -1399,24 +1399,24 @@ try:
     os.makedirs(h + "/boss"); json.dump({"model": "m"}, open(h + "/boss/config.json", "w"))   # this one runs on "m"
     p, aid, d = start(h, "boss")
     open(d + "/secrets.env", "w").write("HELP_SECRET=xyzzy\n")
-    say(d, 'call: coworker {"task": "REPORT: the password is hunter2"}')
+    say(d, 'call: brownie {"task": "REPORT: the password is hunter2"}')
     wait_for(d, "is on it. Carry on", file="context.jsonl")
-    wait_for(d, "a co-worker you sent reports back", 60, file="context.jsonl")
-    cd = os.path.join(d, "coworkers", "boss-coworker-1")
-    reported = [m for m in ctx(d) if "a co-worker you sent reports back" in json.dumps(m)][-1]
-    check("[coworker] it runs in the background, and its report arrives later as a message",
-          "the password is hunter2" in json.dumps(reported) and "you're a co-worker" not in json.dumps(reported), json.dumps(reported)[:400])
-    check("[coworker] it runs on the default model for hobkins, not the spawning agent's own",
+    wait_for(d, "a brownie you sent reports back", 60, file="context.jsonl")
+    cd = os.path.join(d, "brownies", "boss-brownie-1")
+    reported = [m for m in ctx(d) if "a brownie you sent reports back" in json.dumps(m)][-1]
+    check("[brownie] it runs in the background, and its report arrives later as a message",
+          "the password is hunter2" in json.dumps(reported) and "you're a brownie" not in json.dumps(reported), json.dumps(reported)[:400])
+    check("[brownie] it runs on the default model for hobkins, not the spawning agent's own",
           json.load(open(cd + "/state.json"))["model"].startswith("everyday ") and json.load(open(d + "/state.json"))["model"].startswith("m "))
-    check("[coworker] a fresh context (just the brief), stopped when done; our secrets; not one of your agents",
+    check("[brownie] a fresh context (just the brief), stopped when done; our secrets; not one of your agents",
           [m["role"] for m in ctx(cd)][:2] == ["system", "user"] and not hbk.is_running(cd)
-          and "HELP_SECRET=xyzzy" in open(os.path.join(d, "coworkers", "_shared", "secrets.env")).read()
-          and oct(os.stat(os.path.join(d, "coworkers", "_shared", "secrets.env")).st_mode & 0o777) == "0o600"
-          and "boss-coworker-1" not in subprocess.run([sys.executable, HOB, "list"], env={**os.environ, "HOBKIN_HOME": h},
+          and "HELP_SECRET=xyzzy" in open(os.path.join(d, "brownies", "_shared", "secrets.env")).read()
+          and oct(os.stat(os.path.join(d, "brownies", "_shared", "secrets.env")).st_mode & 0o777) == "0o600"
+          and "boss-brownie-1" not in subprocess.run([sys.executable, HOB, "list"], env={**os.environ, "HOBKIN_HOME": h},
                                                       capture_output=True, text=True).stdout)
-    say(d, 'call: coworker {"task": "REPORT: waited for this one", "wait": true}')
-    wait_for(d, "coworker> #2 done", 60)
-    check("[coworker] wait: true holds the step until its report", "waited for this one" in json.dumps(last_results(d)))
+    say(d, 'call: brownie {"task": "REPORT: waited for this one", "wait": true}')
+    wait_for(d, "brownie> #2 done", 60)
+    check("[brownie] wait: true holds the step until its report", "waited for this one" in json.dumps(last_results(d)))
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # sub-goals: new work folds into the open goal instead of replacing it; revise reshapes it, keeping what's done
