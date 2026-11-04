@@ -818,9 +818,11 @@ try:
           and "HEARTHBOARD_TOKEN=hb-good" in sec and "hb-good" not in open(ad + "/config.json").read()
           and json.load(open(ad + "/config.json"))["chores"]["hearthboard"]["env"]["url"] == "HEARTHBOARD_URL"
           and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
-    check("[hearthboard] on the configured model, with hobkin waiting on the board for it",
+    check("[hearthboard] on the configured model, with hobkin waiting on the board and answering its chat (and saying so)",
           "hi board" in open(ad + "/context.jsonl").read() and "You're now a worker" in open(ad + "/context.jsonl").read()
+          and "don't call /api/wait yourself" in open(ad + "/context.jsonl").read()
           and "/api/wait" in json.load(open(ad + "/config.json"))["wake"]["url"]
+          and json.load(open(ad + "/config.json"))["inbox"]["url"].endswith("/api/chat/inbox?flat=1")
           and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
     check("[hearthboard] other agents here don't get the board's skill (s1 isn't a worker)",
           "You have no skills, so no work system" in open(hs + "/s1/context.jsonl").read())

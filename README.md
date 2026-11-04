@@ -984,28 +984,47 @@ the top) sets an agent up for it in one go: it's short for the built-in
 after checking the token with the board. That chore fetches the board's skill,
 keeps the token in `secrets.env` as `HEARTHBOARD_TOKEN` (the URL reaches commands
 as `HEARTHBOARD_URL`), and sets the board's wait (`wake`) and chat (`inbox`) in
-config. The running agent knows nothing about hearthboard beyond that. By hand,
-roughly:
+config. The running agent knows nothing about hearthboard beyond that.
+
+**hobkin is the worker's listener.** The board's skill tells an agent to keep
+`GET /api/wait` running and set up its own listener (a background wait, a cron
+job). A hobkin worker doesn't: while it's idle, hobkin holds `/api/wait` open for
+it (`wake`) and wakes it with what the board says; while it's busy running a
+command, hobkin checks the board's chat every 15 seconds (`inbox`) and the front
+desk answers. The chore's instructions tell the agent so, and to just end its
+turn when an action is done. If a worker is slow to answer the board, check its
+config has both (`grep -E '"wake"|"inbox"' ~/.hobkins/ID/config.json`); if not,
+paste the board's line again with `--id ID`.
+
+By hand, roughly:
 
 ```sh
 hobkin                            # note the id, then /stop it (Ctrl-C)
 ID=bodkin URL=http://127.0.0.1:43917 TOKEN=the-token-for-this-agent
-printf 'AGENT_TICKETS_URL=%s\nAGENT_TICKETS_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
+printf 'HEARTHBOARD_URL=%s\nHEARTHBOARD_TOKEN=%s\n' "$URL" "$TOKEN" > ~/.hobkins/$ID/secrets.env
 chmod 600 ~/.hobkins/$ID/secrets.env
 curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \
   -o ~/.hobkins/$ID/skills/hearthboard/SKILL.md
-echo '{"idle_prompt": "Run the hearthboard wait loop (GET /api/wait) and do what it says.", "idle_seconds": 60}' \
-  > ~/.hobkins/$ID/config.json
+cat > ~/.hobkins/$ID/config.json <<EOF
+{"idle_prompt": null,
+ "wake": {"url": "$URL/api/wait?timeout=50", "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"},
+          "quiet": {"reason": "timeout"}},
+ "inbox": {"url": "$URL/api/chat/inbox?flat=1", "reply": "$URL/api/chat/{thread}/messages",
+           "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"}, "every": 15}}
+EOF
 hobkin $ID
 ```
+
+(That replaces the agent's own config.json; merge by hand if it already has one.
+The token stays in `secrets.env`: hobkin fills `${HEARTHBOARD_TOKEN}` in the
+headers itself.) Then tell it it's a worker there and that hobkin is its
+listener, as the chore does.
 
 Each worker keeps the board's skill in its own `skills/` folder, not
 `_shared/`: an agent that isn't a worker shouldn't see the board as its work
 system. The skill reads the token from `HEARTHBOARD_TOKEN`, and each worker has
-its own in `secrets.env`. The idle prompt keeps it
-checking for work, and it can also hold `/api/wait` open itself inside a
-command. Give each worker its own token, so claims and comments show which
-agent did what.
+its own in `secrets.env`. Give each worker its own token, so claims and comments
+show which agent did what.
 
 ## Releasing
 

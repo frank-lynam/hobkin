@@ -1131,12 +1131,20 @@ def chore_env(key: str) -> str:
     return "CHORE_" + re.sub(r"\W", "_", key).upper()
 
 
+# The board's skill tells an agent to keep GET /api/wait running and set up its own listener; on hobkin, hobkin is it.
+HEARTHBOARD_LISTENER = (
+    "hobkin is your listener: while you're idle it waits on the board (GET /api/wait) for you and wakes you "
+    "with what the board says, and while you're busy running a command it answers board chat for you. So don't "
+    "call /api/wait yourself, and don't set up background waits, cron jobs or polling for the board: when you've "
+    "finished an action, end your turn. Where the skill asks how you set up the listener, that's the answer: "
+    "hobkin does it (wake and inbox in its config), nothing to run.")
+
 # Chores built into hobkin: hearthboard is one (`--hearthboard URL TOKEN` is short for it). A chores folder of the
 # same name wins over a built-in one.
 BUILTIN_CHORES = {
     "hearthboard": ({
         "name": "hearthboard",
-        "description": "Work from a hearthboard: its skill, its wait loop while idle, its chat answered mid-command.",
+        "description": "Work from a hearthboard: its skill, hobkin waiting on it while idle, its chat answered mid-command.",
         "apprentice": False,
         "settings": {
             "url": {"about": "the board's URL", "env": "HEARTHBOARD_URL"},
@@ -1146,7 +1154,7 @@ BUILTIN_CHORES = {
         # that aren't workers don't mistake the board for their work system)
         "fetch": {"skills/hearthboard/SKILL.md": {"url": "{{url}}/api/skill", "headers": {"authorization": "Bearer {{token}}"}}},
         "given": ("You're now a worker on the hearthboard at {{url}}, as {{user}}. Your hearthboard skill (just added) "
-                  "says how to work there: open it, say hello on the board, then start its wait loop."),
+                  "says how to work there: open it and say hello on the board. " + HEARTHBOARD_LISTENER),
         "config": {
             "idle_prompt": None,
             # hobkin waits on the board while the agent's idle, and wakes it with what the board says
@@ -1156,7 +1164,7 @@ BUILTIN_CHORES = {
             "inbox": {"url": "{{url}}/api/chat/inbox?flat=1", "reply": "{{url}}/api/chat/{thread}/messages",
                       "headers": {"Authorization": "Bearer {{token}}"}, "every": 15}}},
         "# Your work comes from the hearthboard at {{url}}\n\nYou're {{user}} there. Your hearthboard skill has the "
-        "board's rules: follow them. hobkin waits on the board for you while you're idle and wakes you with its news."),
+        "board's rules: follow them, except for its wait loop. " + HEARTHBOARD_LISTENER),
 }
 
 
