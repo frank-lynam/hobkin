@@ -128,10 +128,14 @@ bold, links underlined, tool calls dimmed and failed commands in red (agents are
 asked to put names of things in backticks for this). Piped, or with `NO_COLOR`
 set, it's plain text. Its replies appear as they come, and each tool call as one line (a command, a file
 read, a failed exit status), without its output; `hobkin chat ID --full` shows the
-output too, as the `out` file has it. Each line you type (or paste) is sent;
-`/stop` and the other commands work, and Ctrl-D leaves. Output never wipes out
-what you're typing: the line is redrawn below it, with the cursor where you left
-it, even mid-edit. You get the usual line
+output too, as the `out` file has it. Each line you type is sent; lines you paste
+arrive together and become one message (the chat says "(5 lines, sent as one
+message)"), though a pasted line that's exactly a command, such as `/stop`, still
+runs as one. `/stop` and the other commands work, and Ctrl-D leaves. What the
+agent's doing ("bodkin is thinking (12s)") shows on a status line of its own just
+above your prompt, so it never sits where you type. Output never wipes out what
+you're typing: it's printed above, and your input is redrawn below it, with the
+cursor where you left it, even mid-edit. You get the usual line
 editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
 ←/→, Ctrl-R to search. In a message that spans rows (a pasted block, or a long
 line wrapped on screen), ↑/↓ move between its rows first, and go through history
@@ -296,9 +300,17 @@ are; if it's left out and there's only one model, that one is used.
 - The key comes from the environment variable `key_env`, or else from the file
   `key_file`. It's removed from the agent's shell environment.
 - `headers` (optional): extra HTTP headers.
+- `max_output_tokens` (optional): sent as `max_tokens` on every request to this
+  model (capped at the model's own limit, if the API reports one). Without it, no
+  `max_tokens` is sent at all, whatever the API style, since some endpoints
+  refuse it. Anthropic's own Messages API requires it: setup and `/model` write
+  `16000` into new Anthropic-style entries, and if one of your older entries gets
+  a 400 about a missing `max_tokens`, add it there. It belongs to the model's
+  entry only: a top-level `max_output_tokens` isn't used (you get a config
+  warning).
 - `thinking` (optional): `"adaptive"`, a token budget (`8000`), or the API's own
-  object. Anthropic only; a budget must be smaller than the `max_tokens` sent
-  (`max_output_tokens`, or 16,000 when that is unset).
+  object. Anthropic only; a budget must be smaller than the model's
+  `max_output_tokens`.
 - `effort` (optional): `"low"` to `"max"`. It goes to Anthropic as
   `output_config.effort`, to OpenRouter as `reasoning.effort`, and to other
   OpenAI-style APIs as `reasoning_effort`.
@@ -338,13 +350,9 @@ are; if it's left out and there's only one model, that one is used.
 so `/stop`, `/status` and `/model` work during a slow call. `/model` drops the
 call and asks the new model.
 
-**Empty replies and false stops.** Some models stop too early:
-- **An empty reply** is asked again, up to twice. It's never stored or shown as
-  "(no reply)". After three in a row, the agent waits for a message.
-- **A reply that stops mid-step** (it says "Let me check the logs." or "Now I'll
-  run the tests:", or breaks off mid-sentence, with no tool call) gets a nudge to
-  carry on, up to three times a turn. "Let me know if…" and finished sentences
-  don't count.
+**Empty replies.** An empty reply is asked again, up to twice. It's never
+stored or shown as "(no reply)". After three in a row, the agent waits for a
+message.
 
 **The context window is asked for, not hard-coded.** At start-up hobkin asks the API:
 
@@ -365,7 +373,9 @@ limit, and on `/limits`.
 **Compaction, at good moments.** The window it works within is the model's, capped
 at `context_budget` (100,000 tokens). Models that advertise 1M-token windows get slow,
 expensive and forgetful long before they fill one; `null` uses the model's full window.
-- **Past `compact_early` (half) of the room the conversation has** (the window less
+If a model with a big window compacts more often than you'd like mid-task, raise
+`context_budget` for that agent (in its own `config.json`), say to 200,000.
+- **Past `compact_early` (75%) of the room the conversation has** (the window less
   the instructions), the agent is told once to read narrowly and keep its checklist
   current. It's compacted at the next good moment: right after it ticks a step in
   its `CHECKLIST.md`, or when it finishes a task (that one happens quietly, without
@@ -374,8 +384,10 @@ expensive and forgetful long before they fill one; `null` uses the model's full 
 - **A big command output is counted as it arrives,** not after the next request,
   so one huge output can't blow the window before anything notices.
 - **What carries it over** is its handoff note plus its current checklist, word
-  for word. The note is its own summary; the checklist is the plan, so it picks up
-  at the first unchecked step.
+  for word. The note is its own summary, including, for each file it read, what
+  it'll need from it later; the checklist is the plan, so it picks up at the first
+  unchecked step. Mid-task, the last two command results come over too (shortened),
+  so what it was just looking at isn't lost.
 
 When the conversation is compacted, the agent writes
 itself a handoff note. The conversation is replaced by that note, with the
@@ -388,7 +400,10 @@ so it can grep it.
 `models`) are tried in order when the model refuses outright: withdrawn,
 renamed, a bad key, out of credit. Free models on OpenRouter come and go, so
 it's worth having one. Busy and rate-limited models are waited out instead. A
-restart goes back to `model`.
+restart goes back to `model`. With no fallback left, the agent pauses; `/model`,
+`/models` and `/limits` still work then, and `/model NAME` switches and carries
+on without another message. During a rate-limit wait or a retry, `/model`
+switches at once too.
 
 Typos and wrong types in `config.json` are reported at startup (in `out` and on
 stderr), with suggestions such as "unknown setting 'idel_seconds' (did you mean
@@ -396,10 +411,7 @@ stderr), with suggestions such as "unknown setting 'idel_seconds' (did you mean
 
 Other settings (shared or per agent): `bash_timeout` (600 s per command by
 default; the agent can ask for any longer timeout on a command),
-`output_limit` (30,000 characters of command output, head and tail kept),
-`max_output_tokens` (unset by default: then no `max_tokens` is sent, since some
-APIs refuse it, except to Anthropic-style APIs, which require one and get 16,000
-or the model's own limit; set it to send that limit), and
+`output_limit` (30,000 characters of command output, head and tail kept), and
 `idle_prompt` / `idle_seconds` (see below).
 
 ## Its tools
@@ -960,8 +972,6 @@ behaviour matters:
   reads like a committee wrote it", once per turn.
 - **A file read only partly** ends with how many lines are still unread, so the
   agent doesn't fill the rest in from imagination.
-- **A reply that stops mid-step** ("Let me check the logs." with no tool call)
-  gets "carry on", up to three times a turn (see "Empty replies and false stops").
 - **When a working turn ends,** there's one wrap-up check: did you report where
   the people are, any bloopers, more work to grab? It's sent once per turn, so
   it can't loop.
@@ -985,6 +995,15 @@ after checking the token with the board. That chore fetches the board's skill,
 keeps the token in `secrets.env` as `HEARTHBOARD_TOKEN` (the URL reaches commands
 as `HEARTHBOARD_URL`), and sets the board's wait (`wake`) and chat (`inbox`) in
 config. The running agent knows nothing about hearthboard beyond that.
+
+**Projects.** A board has one project per team, and a worker serves the
+projects the board makes it a member of. To narrow that on this side, add
+`--project records` (repeatable, or `records,legal`) to the board's line: it goes
+in that agent's own `config.json` as `"projects": ["records"]`, the board wait asks
+for only those, the chore's instructions tell the agent to pass them to `POST
+/api/next`, and the heartbeat says which it serves ("waiting on the work system
+(projects: records)"). Without it, the worker serves all its projects. The
+board's skill explains projects to the agent.
 
 **hobkin is the worker's listener.** The board's skill tells an agent to keep
 `GET /api/wait` running and set up its own listener (a background wait, a cron
@@ -1093,8 +1112,8 @@ nothing and don't need a key. They cover both API styles:
   restart, a broken `reminders.json`);
 - chat: names, colour, the folder it's opened in, the spinner, typing while
   replies land, picking a hobkin when none is named;
-- model calls: `max_tokens` only where it's set or required, 429s, fallbacks,
-  commands (and `/model`) mid-call and mid-wait, empty replies and false stops;
+- model calls: `max_tokens` only where the model's entry sets it, 429s, fallbacks,
+  commands (and `/model`) mid-call and mid-wait, empty replies;
 - break glass: alerts, extensions, `--off` and time's-up endings, salvage, the
   incident budget, shared incidents and holds, the watch screen;
 - brownies (on the default model, in the background or waited on, only their
@@ -1113,6 +1132,6 @@ nothing and don't need a key. They cover both API styles:
 
 The fake API plays real-world trouble on cue: a word in a message makes it
 rate-limit (`ratelimit:SECONDS:MODE`, or `ratelimit@PORT:…` for one server),
-reply with nothing (`empty-reply`, `always-empty`), stop mid-step
-(`falsestop:`), think slowly (`slow:N`) or hiccup (`hiccup`). A message like
+reply with nothing (`empty-reply`, `always-empty`), think slowly (`slow:N`)
+or hiccup (`hiccup`). A message like
 `run: CMD` or `call: TOOL {json}` makes it call a tool.

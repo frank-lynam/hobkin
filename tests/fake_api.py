@@ -19,7 +19,6 @@ def decide(last_user_texts, tool_results, summary):
     m = re.search(r"while that is still running:\]\n(.*?)\n\[hobkin: answer them", last_user_texts, re.S)
     if summary and m: return ("text", "FRONT DESK: still on it, re: " + m.group(1).strip()[:60])
     if summary: return ("text", "SUMMARY: handoff note")
-    if "you stopped mid-step" in last_user_texts: return ("text", "All done now.")    # hobkin's carry-on nudge
     if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " ") + ".")
     t = re.sub(r"(?m)^\[(message from [^\]]*|from hobkin[^\]]*)\]\n", "", last_user_texts)   # sender labels
     t = re.sub(r"(?m)\n?^\[hobkin: [^\n]*\]$", "", t)                                          # nudges
@@ -33,7 +32,6 @@ def decide(last_user_texts, tool_results, summary):
     if m: return ("silent", ("bash", {"command": m.group(1).strip()}))
     m = re.search(r"run:\s*(.+)", t, re.S)
     if m: return ("tool", ("bash", {"command": m.group(1).strip()}))
-    if re.search(r"falsestop:", t): return ("text", "Let me check the logs.")   # stops mid-step, no tool call
     return ("text", "echo: " + (t.strip()[:80] or "(nothing)"))
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass

@@ -5,6 +5,7 @@ line, or as a worker on hearthboard.
 
     hobkin URL MODEL [KEY] [--chat]   set up that API and start an agent on it (see below)
     hobkin [URL MODEL [KEY]] --hearthboard BOARD_URL TOKEN   ...and make it a worker on that board
+                                    [--project SLUG]...         (only those of its board projects)
     hobkin [URL MODEL [KEY]] --chore NAME [--set K=V]...    ...and give it a standing job (a chore: sweep, pulse...)
     hobkin [...] --host user@host   ...working on another machine over ssh (its commands and files act there)
     hobkin                 start a new agent (prints its id)
@@ -136,6 +137,7 @@ DEFAULT_CONFIG = {
             "model": "claude-sonnet-5-5",
             "key_env": "ANTHROPIC_API_KEY",
             "key_file": "~/.anthropic.key",
+            "max_output_tokens": 16000,  # sent as max_tokens (Anthropic's API requires it); leave out to send none
             "context_tokens": None,      # optional: set to override; null = ask the API
             "requests_per_minute": None, # optional: cap, shared by every agent using this API, model and key
         },
@@ -224,7 +226,7 @@ DEFAULT_CONFIG = {
     "output_limit": 30000,     # characters of command output kept (head + tail)
     "compact_at": 0.8,         # compact when the context passes this share of the window, wherever it is
     # Past this share, compact at the next good moment instead: a checklist step ticked, or a task done
-    "compact_early": 0.5,
+    "compact_early": 0.75,
     # Treat the window as no bigger than this many tokens: models that advertise huge windows (1M) get
     # slow, expensive and forgetful long before they're full. null: the model's real window.
     "context_budget": 100000,
@@ -234,22 +236,20 @@ DEFAULT_CONFIG = {
     # Extra folders of skills (each skill a folder with SKILL.md), lowest priority first.
     # Always searched after these: _shared/skills, then the agent's own skills/.
     "skill_dirs": [],
-    # Sent as max_tokens only when set (some APIs refuse it). Anthropic's API requires one, so it gets
-    # 16000 (or less, if the model says so) when this is null.
-    "max_output_tokens": None,
 }
 
 
 CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "compact_early": (int, float),
-                "context_budget": (int, type(None)), "skill_dirs": list, "max_output_tokens": (int, type(None)),
+                "context_budget": (int, type(None)), "skill_dirs": list,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
                 "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
                 "break_glass": (dict, type(None)), "chores": (dict, type(None)), "chore_dirs": list,
-                "host": (str, type(None)), "ssh": (str, type(None)), "brownie": (dict, type(None))}
+                "host": (str, type(None)), "ssh": (str, type(None)), "brownie": (dict, type(None)),
+                "projects": (list, type(None))}
 
 
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
@@ -748,19 +748,6 @@ WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your repor
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
 
 
-CARRY_ON = ("[hobkin: you stopped mid-step: you said what you'd do next, or broke off mid-sentence, but didn't do "
-            "it. Carry on: make the call now. If you really are done, say so in a sentence.]")
-UNFINISHED = re.compile(r"(:|,|\b(and|then|so|but|to|the|with|for)"
-                        r"|\b(let me (?!know)|let's (now )?(check|look|see|run|try|fix|start)|i'll now|now i'll|next,? i'll"
-                        r"|i'm going to (now )?(check|look|run|try|fix|start))\b[^.!?\n]*[.…]?)\s*$", re.I)
-
-
-def looks_unfinished(text: str) -> bool:
-    """Does a reply break off mid-step? Its last line ends with ':' or ',', a dangling word, or an "I'll now..."."""
-    last = text.strip().splitlines()[-1].strip().rstrip("*_` ")
-    return bool(UNFINISHED.search(last))
-
-
 COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a hobkin: the verdict first, the "
              "specific things you saw, jokes allowed, filler out.]")
 
@@ -1077,7 +1064,10 @@ def config_warnings(cfg: dict) -> list[str]:
                     "null" if t is type(None) else t.__name__ for t in types[key])
                 want = getattr(want, "__name__", want)
                 out.append(f"setting '{where}{key}' should be {want}, not {json.dumps(val)}")
-    check("", cfg, CONFIG_TYPES)
+    if "max_output_tokens" in cfg:
+        out.append("max_output_tokens at the top level isn't used: put it in the model's own entry under \"models\" "
+                   "(only a model with it gets max_tokens sent)")
+    check("", {k: v for k, v in cfg.items() if k != "max_output_tokens"}, CONFIG_TYPES)
     for name, m in (cfg.get("models") or {}).items():
         if isinstance(m, dict):
             check(f"models.{name}.", m, MODEL_TYPES)
@@ -1149,7 +1139,8 @@ BUILTIN_CHORES = {
         "settings": {
             "url": {"about": "the board's URL", "env": "HEARTHBOARD_URL"},
             "token": {"about": "this agent's token on the board", "secret": True, "env": "HEARTHBOARD_TOKEN"},
-            "user": {"default": "", "about": "its username on the board"}},
+            "user": {"default": "", "about": "its username on the board"},
+            "projects": {"default": "", "about": "only these of its projects (slugs, comma-separated); empty: all"}},
         # the board's own skill, so it works by the board's current rules (in this agent's skills/: agents here
         # that aren't workers don't mistake the board for their work system)
         "fetch": {"skills/hearthboard/SKILL.md": {"url": "{{url}}/api/skill", "headers": {"authorization": "Bearer {{token}}"}}},
@@ -1158,13 +1149,16 @@ BUILTIN_CHORES = {
         "config": {
             "idle_prompt": None,
             # hobkin waits on the board while the agent's idle, and wakes it with what the board says
-            "wake": {"url": "{{url}}/api/wait?timeout=50", "headers": {"Authorization": "Bearer {{token}}"},
+            "wake": {"url": "{{url}}/api/wait?timeout=50&project={{projects}}", "headers": {"Authorization": "Bearer {{token}}"},
                      "quiet": {"reason": "timeout"}},
             # the board's chat, for the front desk: answered while the agent's busy running a command
             "inbox": {"url": "{{url}}/api/chat/inbox?flat=1", "reply": "{{url}}/api/chat/{thread}/messages",
                       "headers": {"Authorization": "Bearer {{token}}"}, "every": 15}}},
         "# Your work comes from the hearthboard at {{url}}\n\nYou're {{user}} there. Your hearthboard skill has the "
-        "board's rules: follow them, except for its wait loop. " + HEARTHBOARD_LISTENER),
+        "board's rules: follow them, except for its wait loop. " + HEARTHBOARD_LISTENER + "\n\nThe board has one "
+        "project per team, and you work in the ones you're a member of. Projects you're set to work here (empty: "
+        "all of yours): {{projects}}. When that names any, pass them as `project` to POST /api/next, and file "
+        "your proposals in one of them."),
 }
 
 
@@ -1866,9 +1860,11 @@ class Model:
             msgs = json.loads(json.dumps(messages))
             if msgs and isinstance(msgs[-1]["content"], list) and msgs[-1]["content"]:
                 msgs[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}  # prompt caching
-            body = {"model": self.model, "max_tokens": max_tokens, "messages": msgs,
+            body = {"model": self.model, "messages": msgs,
                     "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                     "tools": list(tools)}
+            if max_tokens:
+                body["max_tokens"] = max_tokens
             if tool_choice == "none":
                 body["tool_choice"] = {"type": "none"}
             thinking = self.cfg.get("thinking")
@@ -2022,7 +2018,6 @@ class Agent:
         self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.empty_replies = 0             # empty replies in a row (asked again, twice)
-        self.carry_ons = 0                 # false-stop nudges this turn (stopped_short)
         self.operator_cwd = None           # ...from this folder (their terminal's, not the agent's)
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.glass = None                  # break-glass mode, while it's on: the config entry
@@ -2172,6 +2167,8 @@ class Agent:
             name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
             entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
                      "model": wanted}
+            if entry.get("api") == "anthropic":   # its API requires max_tokens: say so in the entry, where it shows
+                entry["max_output_tokens"] = self.model.cfg.get("max_output_tokens") or 16000
             self.cfg["models"][name] = entry
         if name == self.model.name:
             return f"already on {self.model.describe()}"
@@ -2212,13 +2209,13 @@ class Agent:
         self.save_state()
 
     def max_output(self) -> int | None:
-        """The max_tokens to send: the configured one (capped at what the API says), else none at all, except
-        on Anthropic-style APIs, which require one: 16000, or the model's own limit if that's lower."""
-        want = self.model.cfg.get("max_output_tokens") or self.cfg.get("max_output_tokens")
-        if not want and self.model.api != "anthropic":
+        """The max_tokens to send: the model's own max_output_tokens (its entry under "models"), capped at what
+        the API says, else none at all, whatever the API style (Anthropic's own API needs the setting)."""
+        want = self.model.cfg.get("max_output_tokens")
+        if not want:
             return None
-        want, api = int(want or 16000), self.state.get("api_max_output")
-        return min(want, api) if api else want
+        api = self.state.get("api_max_output")
+        return min(int(want), api) if api else int(want)
 
     def output_reserve(self) -> int:
         """Room kept free in the context window for the reply (what's sent as max_tokens, else a guess)."""
@@ -2759,6 +2756,8 @@ class Agent:
         body = "\n".join(body).strip()
         if body:
             self.log(self.who, body)
+            if "\n" in body:                            # a paste: lines that came together are one message
+                self.log("hobkin", f"({body.count(chr(10)) + 1} lines, sent as one message)")
             self.pending.append(body)
             self.last_direct = time.time()
 
@@ -4185,18 +4184,6 @@ class Agent:
             return True
         return bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP)
 
-    def stopped_short(self, blocks: list) -> bool:
-        """A reply that ends mid-step (a false stop): it says what it'll do next, or breaks off mid-sentence,
-        with no tool call. Sends CARRY_ON (up to 3 times a turn, so it can't loop); True if it did."""
-        said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
-        if not said or self.carry_ons >= 3 or not looks_unfinished(said):
-            return False
-        self.carry_ons += 1
-        self.log("hobkin", "that reply stopped mid-step; nudging it on")
-        self.messages.append({"role": "user", "content": [{"type": "text", "text": CARRY_ON}]})
-        self.save_context()
-        return True
-
     def nudge_once(self, flag: str, text: str) -> bool:
         """Send a nudge as a user message, at most once per turn (flag), so it can never loop."""
         if getattr(self, flag):
@@ -4364,6 +4351,9 @@ class Agent:
             self.poll_input(wait)
             if self.stop:
                 raise ApiError(0, "stopping")
+            if self.switch_now():                     # /model while retrying: try the new one at once
+                delay, limited = 2, 15
+                continue
             delay = min(delay * 2, 300)
 
     def while_reading(self, call):
@@ -4386,6 +4376,17 @@ class Agent:
         if "e" in box:
             raise box["e"]
         return box["r"]
+
+    def answer_requests(self) -> bool:
+        """/limits, /models and /model, answered between steps, paused or not (a model that's failing is when you
+        most need to change it). True if the model changed."""
+        if self.limits_requested:
+            self.limits_requested = False
+            self.refresh_limits("/limits")
+        if self.models_requested:
+            self.models_requested = False
+            self.log("hobkin", models_text(self.model))
+        return self.switch_now()
 
     def switch_now(self) -> bool:
         """A /model that came in: switch now. True if the model changed."""
@@ -4542,7 +4543,9 @@ class Agent:
         ask = {"role": "user", "content": [{"type": "text", "text": (
             "Your conversation is about to be cleared to free up context. Write a handoff note to yourself: "
             "the task and its status, ids, file paths, decisions made, what you were about to do next, and "
-            "anything the operator asked for. Be complete but concise. Reply with the note only.")}]}
+            "anything the operator asked for. For each file you read, what you'll need from it later, in a few "
+            "lines (names, signatures, values, where things are), so you needn't read it again. Be complete but "
+            "concise. Reply with the note only.")}]}
         history = json.loads(json.dumps(self.messages))
         if history[-1]["role"] == "user":     # a user turn can't follow a user turn
             history[-1]["content"] = history[-1]["content"] + ask["content"]
@@ -4558,14 +4561,16 @@ class Agent:
                     return
                 history = self.shrink_history(history, attempt)
         note = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
-        # The newest turn isn't answered yet: carry it over as it is (results shortened)
+        # The newest turn isn't answered yet: carry it over (its text as it is), with the last two tool results
+        # (shortened), wherever they were: what it was just looking at, so it needn't look again
         carry = []
         if self.messages[-1]["role"] == "user":
-            for b in self.messages[-1]["content"]:
-                if b.get("type") == "text":
-                    carry.append(b["text"])
-                elif b.get("type") == "tool_result":
-                    carry.append(f"[Result of your last command]\n{clip(result_text(b['content']), 2000, 1500)}")
+            results = [b for m in self.messages if m["role"] == "user" for b in m["content"]
+                       if isinstance(b, dict) and b.get("type") == "tool_result"][-2:]
+            for i, b in enumerate(results):
+                which = "your last command" if i == len(results) - 1 else "the command before it"
+                carry.append(f"[Result of {which}]\n{clip(result_text(b['content']), 2000, 1500)}")
+            carry += [b["text"] for b in self.messages[-1]["content"] if b.get("type") == "text"]
         text = (f"[Your context was compacted. Your handoff note (written by you, so check it against the real "
                 f"thing before you trust it):]\n\n{note}\n\n")
         checklist = self.current_checklist()
@@ -4622,7 +4627,6 @@ class Agent:
         if record:                         # people's messages and hobkin's notices, in an incident's timeline
             self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
-        self.carry_ons = 0
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False
         block = {"type": "text", "text": text}
@@ -4710,8 +4714,6 @@ class Agent:
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
         if not calls:
-            if stop_reason not in ("max_tokens", "length") and self.stopped_short(blocks):
-                return
             if self.turn_end_nudge(blocks):
                 return
             self.working = False
@@ -4796,7 +4798,8 @@ class Agent:
         if (self.cfg.get("wake") or {}).get("command"):
             return f"on duty, watching (`{self.cfg['wake']['command']}` every {span_text(wake_every(self.cfg['wake']))})"
         if self.cfg.get("wake"):
-            return "on duty, waiting on the work system"
+            ps = self.cfg.get("projects")
+            return "on duty, waiting on the work system" + (f" (projects: {', '.join(ps)})" if ps else "")
         coming = []
         try:                                       # read-only: never logs from this thread
             items = json.loads(read(self.p("reminders.json"), "{}") or "{}").get("items", [])
@@ -4845,18 +4848,13 @@ class Agent:
                     self.save_state("paused (budget)" if self.budget_paused else "error" if self.error else "paused")
                     waiting = len(self.pending)
                     self.poll_input(60 if self.budget_paused else 3600)
-                    if self.error and len(self.pending) > waiting:
+                    if self.answer_requests() and self.error:  # another model, after this one failed: carry on
+                        self.paused = self.error = False
+                        self.log("hobkin", "on another model now: carrying on")
+                    elif self.error and len(self.pending) > waiting:
                         self.paused = self.error = False      # a message after an error: try again
                     continue
-                if self.limits_requested:
-                    self.limits_requested = False
-                    self.refresh_limits("/limits")
-                if self.models_requested:
-                    self.models_requested = False
-                    self.log("hobkin", models_text(self.model))
-                if self.model_wanted:
-                    wanted, self.model_wanted = self.model_wanted, None
-                    self.log("hobkin", self.switch_model(wanted))
+                self.answer_requests()
                 if self.compact_requested and not self.working:
                     self.compact_requested = False
                     self.compact("requested")
@@ -5283,10 +5281,9 @@ def cell_width(ch):
     return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
 
 
-def line_move(text, point, prompt_len, width, step):
-    """Where up (step -1) or down (+1) puts the cursor in an input that spans screen rows (pasted lines, or
-    one long line wrapped): the same column on the row above or below. None on the top or bottom row
-    (the arrows go through history there)."""
+def screen_cells(text, prompt_len, width):
+    """(row, column) on screen of each character of an input after a prompt, and of its end: rows count
+    from the prompt's, wrapping at `width` and at newlines, as readline draws it."""
     row, col, cells = 0, prompt_len, []
     for ch in text:
         w = cell_width(ch)
@@ -5300,6 +5297,14 @@ def line_move(text, point, prompt_len, width, step):
             if col >= width:
                 row, col = row + 1, 0
     cells.append((row, col))                          # the end of the input
+    return cells
+
+
+def line_move(text, point, prompt_len, width, step):
+    """Where up (step -1) or down (+1) puts the cursor in an input that spans screen rows (pasted lines, or
+    one long line wrapped): the same column on the row above or below. None on the top or bottom row
+    (the arrows go through history there)."""
+    cells = screen_cells(text, prompt_len, width)
     r, c = cells[point]
     want = r + step
     if want < 0 or want > cells[-1][0]:
@@ -5343,8 +5348,8 @@ def readline_arrows(readline, prompt_len):
 
 
 def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False):
-    """The interactive side of chat: input() with readline, output from a background thread
-    that clears the input line, prints, then redraws the prompt with what you'd typed."""
+    """The interactive side of chat: input() with readline; output and a status line (what the agent's doing)
+    drawn above the prompt from readline's input hook, then your input drawn again below them."""
     try:
         import readline
     except ImportError:              # no line editing then, but everything else works
@@ -5370,36 +5375,62 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
             return f"{agent_id} is {b['what']} ({span_text(time.time() - float(b['since']))})"
         return f"{agent_id} is {status}" if status.startswith(("working", "waiting")) else None
 
-    look = {"spinning": False, "turn": 0, "next": 0.0}
+    look = {"spinning": False, "status": False, "turn": 0, "next": 0.0}
+
+    def cursor_row(lib) -> int:
+        """Which screen row of the input the cursor is on (0: the prompt's), so we can find the prompt."""
+        typed = readline.get_line_buffer()
+        at = ctypes.c_int.in_dll(lib, "rl_point").value
+        chars = len(typed.encode("utf-8", "surrogateescape")[:at].decode("utf-8", "ignore"))
+        return screen_cells(typed, len(prompt), shutil.get_terminal_size().columns)[chars][0]
 
     def draw(lib=None):
-        """Print what's new above the input line, or the spinner on an empty one. With lib (in readline's
-        own thread, from its input hook) readline redraws its line, cursor where you left it."""
+        """Print what's new above the input, with what the agent's doing on a status line of its own just above
+        the prompt (the line you type on is never written over). With lib (in readline's own thread, from its
+        input hook) readline redraws your input, cursor where you left it; without it (no hook: libedit, say)
+        the spinner shows only on an empty input line, as it can't be put back above."""
         if time.time() < look["next"]:
             return
-        lines = new_lines()
-        typed = readline.get_line_buffer() if readline else ""
-        note = None if lines or typed else doing()
-        def put_back():
-            if lib:
-                sys.stdout.flush()
-                lib.rl_on_new_line()
-                lib.rl_forced_update_display()
-            else:
-                sys.stdout.write(prompt + typed)
-        if lines:
-            sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n")
-            put_back()
-        elif note:                           # only on an empty input line: it never gets in the way of typing
+        lines, note = new_lines(), doing()
+        spin = None
+        if note:
             look["turn"] += 1
-            spin = SPINNER[look["turn"] % len(SPINNER)] + " " + note
-            sys.stdout.write("\r\x1b[2K" + (ANSI["dim"] + spin + ANSI["off"] if short_color else spin))
-        elif look["spinning"]:
-            sys.stdout.write("\r\x1b[2K")
-            put_back()
-        look["spinning"] = bool(note)
+            spin = clip(SPINNER[look["turn"] % len(SPINNER)] + " " + note, shutil.get_terminal_size().columns - 2, 0)
+            spin = ANSI["dim"] + spin + ANSI["off"] if short_color else spin
         look["next"] = time.time() + (0.15 if note else 0.3)
+        if not lib:
+            typed = readline.get_line_buffer() if readline else ""
+            if lines:
+                sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n" + prompt + typed)
+            elif spin and not typed:
+                sys.stdout.write("\r\x1b[2K" + spin)
+            elif look["spinning"]:
+                sys.stdout.write("\r\x1b[2K" + prompt + typed)
+            look["spinning"] = bool(spin and not typed and not lines)
+            sys.stdout.flush()
+            return
+        row = cursor_row(lib)
+        if lines or bool(spin) != look["status"]:
+            # up to the prompt (and the status line over it), clear from there down, print what's new and the
+            # status line, then readline draws the prompt and your input again below them
+            up = row + (1 if look["status"] else 0)
+            sys.stdout.write((f"\x1b[{up}A" if up else "") + "\r\x1b[J" + "".join(l + "\n" for l in lines)
+                             + (spin + "\n" if spin else ""))
+            sys.stdout.flush()
+            look["status"] = bool(spin)
+            lib.rl_on_new_line()
+            lib.rl_forced_update_display()
+        elif spin:                             # just the spinner moving: the status line alone, cursor kept
+            sys.stdout.write(f"\x1b7\x1b[{row + 1}A\r\x1b[2K{spin}\x1b8")
         sys.stdout.flush()
+
+    def drop_status(rows_typed: int) -> None:
+        """Enter or Ctrl-D: take the status line out from above what was just typed (deleting the line, so the
+        input moves up into its place), so it doesn't stay behind in the scrollback."""
+        if look["status"]:
+            sys.stdout.write(f"\x1b[{rows_typed + 1}A\x1b[1M" + (f"\x1b[{rows_typed}B" if rows_typed else ""))
+            sys.stdout.flush()
+            look["status"] = False
 
     def printer():                           # without the hook: from a thread (fine unless you type mid-reply)
         while not done.is_set():
@@ -5416,7 +5447,10 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
             try:
                 line = input(prompt)
             except EOFError:
+                drop_status(0)               # still on the prompt's row: nothing was entered
                 break
+            # Enter moved to the line below the input: count its rows, then the status line over them goes
+            drop_status(screen_cells(line, len(prompt), shutil.get_terminal_size().columns)[-1][0] + 1)
             if line.strip():
                 os.write(fifo, (line + "\n").encode())
     except KeyboardInterrupt:
@@ -5700,12 +5734,16 @@ def cmd_setup(argv):
     """hobkin URL MODEL [KEY] [--chat] [--hearthboard URL TOKEN] ...: configure the model endpoint, start an
     agent on it, maybe join it to a hearthboard, maybe chat. With --hearthboard alone, the configured model."""
     pos, opts = split_args(argv, {"--chat", "--no-service", "--force", "--safe"}, {"--id", "--api", "--chore", "--host"},
-                           {"--hearthboard"}, {"--set", "--secret"})
+                           {"--hearthboard"}, {"--set", "--secret", "--project"})
     board = opts.get("--hearthboard")
+    projects = [p.strip().lower() for x in opts.get("--project") or [] for p in x.split(",") if p.strip()]
+    if projects and not board:
+        sys.exit("hobkin: --project goes with --hearthboard: which of the board's projects this worker serves")
     if len(pos) not in (2, 3) and not ((board or opts.get("--chore") or opts.get("--host") is not None) and not pos):
         sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--hearthboard BOARD_URL TOKEN] [--chore NAME [--set K=V]...] "
                  "[--secret K=V]... [--host user@host] [--id ID] [--safe] [--api anthropic|openai] [--no-service] [--force]\n"
-                 "       hobkin --hearthboard BOARD_URL TOKEN [--id ID] [--chat]   (another agent, on the configured model)\n"
+                 "       hobkin --hearthboard BOARD_URL TOKEN [--project SLUG]... [--id ID] [--chat]   (another agent, on the "
+                 "configured model)\n"
                  "       hobkin --chore NAME [--set K=V]... [--id ID] [--chat]      (likewise, with a chore)")
     if (opts.get("--set") or opts.get("--secret")) and not opts.get("--chore"):
         sys.exit("hobkin: --set and --secret are a chore's settings: give --chore NAME too")
@@ -5769,6 +5807,8 @@ def configure_model(pos, opts, agent_id):
     d = os.path.join(HOME, agent_id)
     os.makedirs(d, exist_ok=True)
     entry = {"api": m.api, "base_url": m.base, "model": model_id}
+    if m.api == "anthropic":                  # its API requires max_tokens: say so in the entry, where it shows
+        entry["max_output_tokens"] = 16000
     if key:
         keys = os.path.join(SHARED, "keys") if fresh else d
         os.makedirs(keys, mode=0o700, exist_ok=True)
@@ -5836,8 +5876,12 @@ def prepare_agent(agent_id, opts, board=None, board_user=None):
     if opts.get("--host") and opts.get("--safe"):
         print(f"{agent_id}: safe mode on {opts['--host']}: its limits are that account's own permissions there")
     if board:                               # --hearthboard URL TOKEN: the built-in hearthboard chore
-        _, given = install_chore(agent_id, "hearthboard", [f"url={board[0]}", f"user={board_user.get('username')}"],
-                                 [f"token={board[1]}"])
+        projects = [p.strip().lower() for x in opts.get("--project") or [] for p in x.split(",") if p.strip()]
+        _, given = install_chore(agent_id, "hearthboard", [f"url={board[0]}", f"user={board_user.get('username')}",
+                                                          f"projects={','.join(projects)}"], [f"token={board[1]}"])
+        if projects:                        # which of the board's projects it serves: this agent's own config only
+            path = os.path.join(d, "config.json")
+            write_json(path, {**read_json(path, {}), "projects": projects})
         print(f"{agent_id}: joined {board[0]} as {board_user.get('username')} (the board's skill is in "
               f"{os.path.join(d, 'skills', 'hearthboard')}, its token in {os.path.join(d, 'secrets.env')})")
         queue_message(d, given)

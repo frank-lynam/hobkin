@@ -4,7 +4,7 @@ HTTPS host that requires a client certificate.
 
     fake_web.py HTTP_PORT HTTPS_PORT CERT_DIR      (CERT_DIR holds ca.pem, server.pem, server.key)
 """
-import json, os, ssl, sys, threading, urllib.parse
+import json, os, ssl, sys, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
@@ -23,6 +23,7 @@ DDG = """<html><body>
 
 
 POSTED = []      # replies posted to the board's chat
+WAITS = []       # the board's /api/wait requests, as asked (path and query)
 
 
 class H(BaseHTTPRequestHandler):
@@ -68,6 +69,17 @@ class H(BaseHTTPRequestHandler):
             msgs = [] if POSTED else [{"id": 5, "thread": 7, "thread_name": "frank", "from": "frank",
                                        "text": "is the build done?", "needs_reply": True}]
             return self.send(200, json.dumps({"messages": msgs}), "application/json")
+        if path == "/board/api/wait":                         # a worker set to some projects gets a ticket in one
+            WAITS.append(self.path)
+            wanted = [p for p in q.get("project", [""])[0].split(",") if p]
+            if wanted:
+                return self.send(200, json.dumps({"reason": "ready", "tickets": [
+                    {"id": "amber-otter", "title": "File the records", "status": "ready", "project": wanted[0]}]}),
+                    "application/json")
+            time.sleep(1)
+            return self.send(200, json.dumps({"reason": "timeout", "tickets": []}), "application/json")
+        if path == "/board/waits":
+            return self.send(200, json.dumps(WAITS), "application/json")
         if path == "/board/posted":
             return self.send(200, json.dumps(POSTED), "application/json")
         if path in ("/board/api/me", "/board/api/skill"):     # a hearthboard, for hobkin --hearthboard

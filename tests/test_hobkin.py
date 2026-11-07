@@ -243,6 +243,28 @@ try:
           "compacting context (a checklist step is done" in why, why[-400:])
     check("[context] the checklist goes over word for word", "Your checklist, as it is now" in first and "- [x] count" in first
           and "- [ ] report" in first, first[:600])
+    check("[context] mid-task, the last two command results come over (what it was just looking at)",
+          "[Result of the command before it]" in first and "9000" in first and "[Result of your last command]" in first,
+          first[-1500:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # The default compact_early is 0.75: the same work, past half but under three quarters, isn't compacted on a tick
+    h = home("ctxdefault", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
+                            "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000})
+    p, aid, d = start(h)
+    say(d, 'call: write_file {"path": "CHECKLIST.md", "content": "# goal\\n- [ ] count\\n- [ ] report\\n"}')
+    wait_for(d, "Created")
+    for _ in range(50):
+        if json.load(open(d + "/state.json")).get("status") == "idle": break
+        time.sleep(0.1)
+    say(d, 'multi-call: [["bash", {"command": "seq 1 9000"}], ["edit_file", {"path": "CHECKLIST.md", "old_text": "- [ ] count", "new_text": "- [x] count"}]]')
+    for _ in range(100):
+        if "Edited" in open(d + "/context.jsonl").read() and json.load(open(d + "/state.json")).get("status") == "idle": break
+        time.sleep(0.1)
+    time.sleep(1)
+    st = json.load(open(d + "/state.json"))
+    share = (st.get("last_input_tokens") or 0) / 24000
+    check("[context] by default, past half but under 0.75: a ticked step doesn't compact",
+          "compacting" not in open(d + "/out").read() and not os.path.isdir(d + "/archive"), (share, open(d + "/out").read()[-400:]))
     p.send_signal(signal.SIGTERM); p.wait(10)
     # Between tasks: past half, it compacts while idle, and doesn't wake itself up for it
     h = home("ctxidle", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
@@ -724,6 +746,10 @@ try:
         if "paused" in open(os.path.join(BASE, "alerts.txt")).read(): break
         time.sleep(0.1)
     check("[alert] no fallback left: the pause is announced", "hobkin lonely paused: model" in open(os.path.join(BASE, "alerts.txt")).read())
+    say(d, "/model n2"); wait_for(d, "echo: anyone?", 30)
+    out = open(d + "/out").read()
+    check("[model] paused on a refused model, /model switches and it carries on, no other message needed",
+          "on another model now: carrying on" in out and json.load(open(d + "/state.json"))["model"].startswith("n2"), out[-600:])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # /limits: the context window asked for again on demand
@@ -851,6 +877,36 @@ try:
           and "/api/wait" in json.load(open(hs + "/s3/config.json"))["wake"]["url"]
           and "You're now a worker on the hearthboard at http://127.0.0.1:48790/board, as worker.7" in c3, r.stdout + r.stderr)
     run("send", "s3", "/stop")
+    # Projects: --project narrows a worker to some of its board projects, in its own config only; the board wait
+    # asks for them, the wake names the ticket's project, and the heartbeat says which it serves
+    shared_before = open(hs + "/_shared/config.json").read()
+    r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-good", "--project", "records", "--id", "s4", "--no-service")
+    s4 = json.load(open(hs + "/s4/config.json"))
+    check("[hearthboard] --project: the worker's own config says which projects; the shared config is untouched",
+          r.returncode == 0 and s4.get("projects") == ["records"] and "project=records" in s4["wake"]["url"]
+          and open(hs + "/_shared/config.json").read() == shared_before, r.stdout + r.stderr + json.dumps(s4))
+    told = lambda: "".join(json.dumps(m["content"], ensure_ascii=False) for m in ctx(hs + "/s4"))
+    for _ in range(100):
+        if 'File the records' in told(): break
+        time.sleep(0.2)
+    waits = json.loads(urllib.request.urlopen("http://127.0.0.1:48790/board/waits").read())
+    check("[hearthboard] the board wait asks for its projects, and the wake names the ticket's project",
+          any("project=records" in w for w in waits) and 'File the records' in told()
+          and '\\"project\\": \\"records\\"' in told(), told()[-600:])
+    from types import SimpleNamespace
+    import hobkin as hbk
+    idle = lambda cfg: hbk.Agent.duty(SimpleNamespace(paused=False, stop=False, waiting_note=None, working=False, state={},
+                                                      cfg=cfg))
+    check("[hearthboard] the heartbeat says which projects it serves",
+          idle({"wake": {"url": "x"}, "projects": ["records", "legal"]}) == "on duty, waiting on the work system (projects: records, legal)"
+          and idle({"wake": {"url": "x"}}) == "on duty, waiting on the work system")
+    check("[hearthboard] without --project, the wait covers all its projects (as before)",
+          "project=" in json.load(open(ad + "/config.json"))["wake"]["url"]
+          and not any(w.endswith("project=records") and "worker" in w for w in waits)
+          and "projects" not in json.load(open(ad + "/config.json")))
+    check("[hearthboard] the board's skill is saved byte for byte",
+          open(hs + "/s4/skills/hearthboard/SKILL.md").read() == "---\nname: hearthboard\ndescription: Work with the board\n---\n# Board skill\n")
+    run("send", "s4", "/stop")
     run("send", "worker-7", "/stop")
     for _ in range(50):
         if json.load(open(ad + "/state.json")).get("status") == "stopped": break
@@ -1089,6 +1145,11 @@ try:
         c = ctx(rd)
         check("[pack] the restored copy starts with its memory, told it's a copy of the one in its old folder",
               "the orders db" in c[0]["content"] and any(d in json.dumps(m) and "started from a bundle" in json.dumps(m) for m in c[1:]), r.stdout + r.stderr)
+        made = [m for f in (rd + "/config.json", top + "/home/_shared/config.json") if os.path.exists(f)
+                for m in (json.load(open(f)).get("models") or {}).values()
+                if m.get("api") == "anthropic" and str(m.get("key_file", "")).startswith(top + "/home/")]   # setup's own
+        check("[max_tokens] setup writes max_output_tokens into a new Anthropic-style model entry, where it shows",
+              made and all(m.get("max_output_tokens") == 16000 for m in made), made)
     finally:
         subprocess.run([sys.executable, top + "/hobkin.py", "send", aid, "/stop"], env={**os.environ, "HOBKIN_HOME": top + "/home"})
 
@@ -1150,20 +1211,25 @@ try:
     check("[watch] with no one named: whoever is in break-glass mode", "fixer" in r.stdout and " SALVAGE " not in r.stdout, r.stdout)
     pf.send_signal(signal.SIGTERM); ps.send_signal(signal.SIGTERM); pf.wait(10); ps.wait(10)
 
-    # max_tokens is sent only when it's set (some APIs refuse it), except to Anthropic-style APIs, which require it
-    for api, port, extra, want in (("openai", 48702, {}, False), ("openai", 48702, {"max_output_tokens": 3000}, True),
-                                   ("anthropic", 48701, {}, True)):
+    # max_tokens is sent only when the model's own entry sets max_output_tokens, whatever the API style;
+    # a top-level max_output_tokens isn't used, and says so
+    for api, port, extra, top, want in (("openai", 48702, {}, {}, False), ("openai", 48702, {"max_output_tokens": 3000}, {}, True),
+                                        ("anthropic", 48701, {}, {}, False), ("anthropic", 48701, {"max_output_tokens": 3000}, {}, True),
+                                        ("anthropic", 48701, {}, {"max_output_tokens": 3000}, False)):
         base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
-        h = home(f"maxtok-{api}-{bool(extra)}", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", **extra},
-                 {"idle_prompt": None})
+        h = home(f"maxtok-{api}-{bool(extra)}-{bool(top)}", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", **extra},
+                 {"idle_prompt": None, **top})
         p, aid, d = start(h)
         say(d, f"maxtok {aid}"); wait_for(d, f"echo: maxtok {aid}")
         body = [json.loads(l)["body"] for l in open(LOG) if f"maxtok {aid}" in l][-1]
-        check(f"[max_tokens] {api}{' with max_output_tokens set' if extra else ''}: " + ("sent" if want else "not sent"),
-              ("max_tokens" in body) == want and (not extra or body["max_tokens"] == 3000), {k: v for k, v in body.items() if k != "messages" and k != "tools" and k != "system"})
+        how = " with max_output_tokens in the model's entry" if extra else " with it only at the top level" if top else ""
+        check(f"[max_tokens] {api}{how}: " + ("sent" if want else "not sent"),
+              ("max_tokens" in body) == want and (not extra or body["max_tokens"] == 3000)
+              and (not top or "max_output_tokens at the top level isn't used" in open(d + "/out").read()),
+              {k: v for k, v in body.items() if k != "messages" and k != "tools" and k != "system"})
         p.send_signal(signal.SIGTERM); p.wait(10)
 
-    # an empty reply is asked again, never shown as "(no reply)"; a reply that stops mid-step is nudged on
+    # an empty reply is asked again, never shown as "(no reply)"
     h = home("replies", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"idle_prompt": None})
     p, aid, d = start(h)
@@ -1175,12 +1241,13 @@ try:
     say(d, "and now?"); wait_for(d, "echo: always-empty please")
     check("[replies] three empty in a row: it waits, and the next message carries on (roles still alternate)",
           "INVALID" not in open(LOG).read())
-    say(d, "falsestop: go"); wait_for(d, "All done now.")
+    # a paste: lines that arrive together are one message, and it says so; a line that's exactly a command still runs
+    say(d, "pasted one\npasted two\n/status\npasted three"); wait_for(d, "echo: pasted one")
     out = open(d + "/out").read()
-    check("[replies] a reply that stops mid-step is nudged on", "agent> Let me check the logs." in out
-          and "stopped mid-step; nudging it on" in out, out[-600:])
-    check("[replies] 'Let me know...' and a finished sentence aren't false stops", not hbk.looks_unfinished("Let me know if you need more!")
-          and not hbk.looks_unfinished("Done! All 12 tests pass.") and hbk.looks_unfinished("Now I'll run the tests:"))
+    check("[paste] several lines at once: one message, noted; a command among them still runs",
+          "(3 lines, sent as one message)" in out and "command /status" in out and out.count("echo: pasted one") == 1
+          and any("pasted one" in json.dumps(m) and "pasted three" in json.dumps(m) and "/status" not in json.dumps(m)
+                  for m in ctx(d) if m["role"] == "user"), out[-800:])
     # commands work while the model thinks (the call runs in a thread), and chat shows a spinner meanwhile
     say(d, "slow:4 think hard"); wait_for(d, "operator> slow:4 think hard"); time.sleep(0.5)
     say(d, "/status"); wait_for(d, "echo: slow:4 think hard", 20)
@@ -1205,6 +1272,15 @@ try:
     pump(lambda b: b"echo: slow:3 spin for me" in b)
     check("[chat] no name: the only running hobkin", f"chatting with {aid}".encode() in buf, buf[-300:])
     check("[chat] a spinner while it thinks", f"{aid} is thinking (".encode() in buf, buf[-600:])
+    os.write(fd, b"abc"); time.sleep(0.3); mark = len(buf)              # typing while it thinks: the status line is
+    subprocess.Popen([sys.executable, HOB, "send", aid, "slow:3 under typing"], env={**os.environ, "HOBKIN_HOME": h},
+                     stdout=subprocess.DEVNULL)                          # drawn above the prompt, the typing left be
+    pump(lambda b: b"echo: slow:3 under typing" in b[mark:])
+    later = buf[mark:]
+    check("[chat] the spinner has its own line above the prompt, and shows while you type",
+          f"{aid} is thinking (".encode() in later and b"\x1b7" in later and b"> abc" in later.split(b"echo: slow:3 under typing")[-1],
+          later[-600:])
+    os.write(fd, b"\x15")                                                # clear the line for what comes next
     for ch in "hello world":                                   # typing while a reply lands, then editing mid-line
         os.write(fd, ch.encode()); time.sleep(0.05)
         if ch == "o":
