@@ -1275,7 +1275,8 @@ try:
     os.write(fd, b"abc"); time.sleep(0.3); mark = len(buf)              # typing while it thinks: the status line is
     subprocess.Popen([sys.executable, HOB, "send", aid, "slow:3 under typing"], env={**os.environ, "HOBKIN_HOME": h},
                      stdout=subprocess.DEVNULL)                          # drawn above the prompt, the typing left be
-    pump(lambda b: b"echo: slow:3 under typing" in b[mark:])
+    pump(lambda b: b"echo: slow:3 under typing" in b[mark:]          # the reply, then the prompt drawn again below it
+         and b"> abc" in b[mark:].split(b"echo: slow:3 under typing")[-1])
     later = buf[mark:]
     check("[chat] the spinner has its own line above the prompt, and shows while you type",
           f"{aid} is thinking (".encode() in later and b"\x1b7" in later and b"> abc" in later.split(b"echo: slow:3 under typing")[-1],
@@ -1299,13 +1300,18 @@ try:
           f" ({'libedit' if 'libedit' in (rl.__doc__ or '') else 'GNU'})")
     moved = hbk.line_move("line one\nline two", 17, 2, 80, -1)
     check("[chat] up from the end of a second row lands on the first, at its column", moved == 6, f"got {moved!r}")
-    os.write(fd, b"\x1b[200~line one\nline two\x1b[201~\x1b[AY\r")   # a pasted two-line message; up, then type
-    wait_for(d, "operator> line oYne")
-    os.write(fd, b"\x1b[A\x1b[A\x1b[A\r")      # history: that message (cursor on its last row), its top row, the one before
-    end = time.time() + 20
-    while time.time() < end and open(d + "/out").read().count("operator> hello woXrld") < 2: time.sleep(0.2)
-    check("[chat] up moves between the rows of what you're typing, then through history",
-          open(d + "/out").read().count("operator> hello woXrld") == 2, open(d + "/out").read()[-600:])
+    if sys.version_info < (3, 10):
+        # Python 3.9's readline keeps bracketed paste off, so a pasted block arrives line by line (still sent as one
+        # message) and there are no rows to move between; the arrows go through history as usual.
+        print("INFO [chat] Python 3.9: moving between the rows of a pasted block isn't available; skipped")
+    else:
+        os.write(fd, b"\x1b[200~line one\nline two\x1b[201~\x1b[AY\r")   # a pasted two-line message; up, then type
+        wait_for(d, "operator> line oYne")
+        os.write(fd, b"\x1b[A\x1b[A\x1b[A\r")  # history: that message (cursor on its last row), its top row, the one before
+        end = time.time() + 20
+        while time.time() < end and open(d + "/out").read().count("operator> hello woXrld") < 2: time.sleep(0.2)
+        check("[chat] up moves between the rows of what you're typing, then through history",
+              open(d + "/out").read().count("operator> hello woXrld") == 2, open(d + "/out").read()[-600:])
     check("[chat] the rows of a long line wrapped on screen count too",
           hbk.line_move("a" * 30, 30, 2, 10, -1) == 20 and hbk.line_move("a" * 30, 3, 2, 10, 1) == 13
           and hbk.line_move("a" * 30, 3, 2, 10, -1) is None and hbk.line_move("界" * 6, 6, 2, 10, -1) == 1)

@@ -5360,10 +5360,6 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
     except ImportError:              # no line editing then, but everything else works
         readline = None
     history = os.path.join(d, ".chat_history")
-    if readline and "libedit" not in (readline.__doc__ or ""):
-        # A pasted block stays one multi-row input (the arrows move between its rows) only with bracketed paste,
-        # which Python's readline module turns off; on 3.9 it stays off unless asked for (bpo-42819).
-        readline.parse_and_bind("set enable-bracketed-paste on")
     if readline:
         try:
             readline.read_history_file(history)

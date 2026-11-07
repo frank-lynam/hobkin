@@ -139,7 +139,8 @@ cursor where you left it, even mid-edit. You get the usual line
 editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
 ←/→, Ctrl-R to search. In a message that spans rows (a pasted block, or a long
 line wrapped on screen), ↑/↓ move between its rows first, and go through history
-from its top or bottom row (GNU readline; with libedit they only do history). Piped, it sends the
+from its top or bottom row (GNU readline; with libedit they only do history; on Python 3.9 a pasted
+block arrives line by line, still sent as one message, so only a wrapped long line has rows to move between). Piped, it sends the
 input, prints the reply and exits: `echo "status?" | hobkin chat bodkin`.
 
 Or with plain files:
