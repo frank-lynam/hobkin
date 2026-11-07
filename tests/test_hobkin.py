@@ -1295,6 +1295,10 @@ try:
           unhook is not None)
     if unhook: unhook()
     # up and down: between the rows of a multi-row input first, through history only from its top or bottom
+    print(f"INFO [env] python {sys.version.split()[0]}, readline {getattr(rl, '_READLINE_LIBRARY_VERSION', '?')}"
+          f" ({'libedit' if 'libedit' in (rl.__doc__ or '') else 'GNU'})")
+    moved = hbk.line_move("line one\nline two", 17, 2, 80, -1)
+    check("[chat] up from the end of a second row lands on the first, at its column", moved == 6, f"got {moved!r}")
     os.write(fd, b"\x1b[200~line one\nline two\x1b[201~\x1b[AY\r")   # a pasted two-line message; up, then type
     wait_for(d, "operator> line oYne")
     os.write(fd, b"\x1b[A\x1b[A\x1b[A\r")      # history: that message (cursor on its last row), its top row, the one before
