@@ -32,8 +32,9 @@ jobs:
         run: |
           set -o pipefail
           python tests/test_hobkin.py 2>&1 | tee test-output.txt || {
-            # The step log needs a GitHub login; annotations are public. On a failure, the end of the output goes in one.
-            tail -n 60 test-output.txt | python3 -c "import sys; t = sys.stdin.read(); print('::error title=Tests failed::' + t.replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A'))"
+            # The step log needs a GitHub login; annotations are public. On a failure, every failing line (FAIL,
+            # FAILED, ERROR), then the end of the output, go in one.
+            { grep -E '^(FAIL|ERROR)' test-output.txt | head -n 30; echo ...; tail -n 40 test-output.txt; } | python3 -c "import sys; t = sys.stdin.read(); print('::error title=Tests failed::' + t.replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A'))"
             exit 1
           }
 
