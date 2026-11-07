@@ -100,7 +100,8 @@ import urllib.parse
 from datetime import date, datetime, timedelta
 import urllib.request
 
-# ---- map: `grep -n '^# ----' hobkin.py` lists these sections; the Agent's own parts are marked '    # --- '.
+# ---- map: `grep -n '^# ----' hobkin.py` lists these sections; `grep -n '# --- ' hobkin.py` lists their parts (the
+#      Agent's, Model's, and the command line's).
 #   settings      defaults, the config.json types, and the default AGENTS.md
 #   tools         what the model can call (TOOLS, the hold tool, the agent's own), the saved-shell script, operator commands
 #   nudges        the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
@@ -109,9 +110,11 @@ import urllib.request
 #   safe mode     Landlock: commands write only in the workspace, no TCP, no signals (what the kernel allows)
 #   web           pages as text, client certificates, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
-#   agent         the Agent: setup, limits, safe mode, break glass, context file, input, tools, jobs, files, reminders, nudges, the web, the model, compaction, the loop
+#   agent         the Agent: setup, limits, the host, safe mode, break glass, shared incidents, context file, output, input,
+#                 the front desk, tools, bash and jobs, sessions, brownies, files, the goal, reminders, nudges, the web,
+#                 the model, compaction, the loop
 #   service       systemd user services
-#   command line  send, chat, the watch screen, list, breakglass, pack, main
+#   command line  send, chat (the terminal), list, the watch screen, models and setup, pack, purge, breakglass, main
 
 
 # ---- settings: defaults, the config.json types, and the default AGENTS.md
@@ -5058,6 +5061,7 @@ def valid_id(agent_id):
     return agent_id
 
 
+# --- send: a message into an agent's FIFO (or its offline queue)
 def cmd_send(agent_id, text):
     d = os.path.join(HOME, valid_id(agent_id))
     if not os.path.isdir(d):
@@ -5079,6 +5083,7 @@ def cmd_send(agent_id, text):
     print(f"{agent_id} isn't running; queued for when it starts")
 
 
+# --- chat: the view of the out log, colour, and the terminal (readline hooks, arrows, the status line)
 # Out-log entries that are tool calls (chat shows them as one line): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full.
 TOOL_WHO = ({"$", "=", "job", "reminder", "hold", "notify"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
@@ -5469,6 +5474,7 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
         os.close(fifo)
 
 
+# --- list
 def cmd_list():
     if not os.path.isdir(HOME):
         return print("no agents yet")
@@ -5482,6 +5488,7 @@ def cmd_list():
         print(f"{name:10} {status:8} {services.get(name, ''):18} {st.get('model', '')[:40]:40} {last[0][:60] if last else ''}")
 
 
+# --- watch: one screen for every agent on an incident
 # The watch screen (hobkin watch): one terminal for every agent on an incident, each in its own hobkin colour
 # (256-colour: amber, teal, violet, rose, lime, sky, sand, orchid), with risky-looking commands flagged. Bash
 # commands' effects can't be seen from here, so their flags are guesses from the command line ("looks like").
@@ -5650,6 +5657,7 @@ def cmd_watch(argv):
         sys.stdout.flush()
 
 
+# --- models and setup: endpoints, arguments, the board user, configuring a model, names, starting agents
 def models_text(model: Model) -> str:
     """What `hobkin models` and /models print: every model the API offers, the current one starred."""
     try:
@@ -5934,6 +5942,7 @@ def start_agent(agent_id, opts):
     print(f"talk: hobkin chat {agent_id}")
 
 
+# --- pack, purge, break glass
 # A packed agent (hobkin pack): what's left out, and what it's told when it's started from the bundle
 PACK_SKIP = {"secrets.env", "keys", "in", "lock", "shell", "shell.sh", ".cwd", "last-output.log", ".tmp"}
 PACK_BIG = 2 * 1024 * 1024          # bigger files in its workspace stay out (salvaged copies went elsewhere)
@@ -6175,6 +6184,7 @@ def cmd_breakglass(argv):
             print(f"{t}: already on incident {incident}")
 
 
+# --- main
 def main(argv):
     if argv[:1] == ["__sandbox"]:          # safe mode's helper: restrict itself, then run the command
         return run_sandboxed(argv[1:])
