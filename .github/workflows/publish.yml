@@ -13,16 +13,29 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false    # one version failing shouldn't hide what the others say
       matrix:
-        python: ["3.9", "3.12", "3.14"]
+        include:
+          # 3.9 is the oldest Python hobkin and hearthboard support (RHEL 9's); ubuntu-latest (26.04) no longer has it
+          - {python: "3.9", os: ubuntu-24.04}
+          - {python: "3.12", os: ubuntu-latest}
+          - {python: "3.14", os: ubuntu-latest}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python tests/test_hobkin.py
+      - name: Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python tests/test_hobkin.py 2>&1 | tee test-output.txt || {
+            # The step log needs a GitHub login; annotations are public. On a failure, the end of the output goes in one.
+            tail -n 60 test-output.txt | python3 -c "import sys; t = sys.stdin.read(); print('::error title=Tests failed::' + t.replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A'))"
+            exit 1
+          }
 
   build:
     needs: test
