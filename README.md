@@ -264,7 +264,7 @@ line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
-| `/model [NAME]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
+| `/model [NAME [anthropic\|openai]]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Add `anthropic` or `openai` to ask for it in that API style on the same host: `anthropic` drops a trailing `/v1` from the URL (its paths carry it), `openai` puts it back. Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
 | `/models` | List the models the agent's API offers (the one in use starred), with their context windows. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
 | `/hello [FOLDER]` | Sent by `hobkin chat` as it opens (not logged): the agent says hello, and is told the folder you opened the chat in. |
@@ -302,11 +302,11 @@ are; if it's left out and there's only one model, that one is used.
   `key_file`. It's removed from the agent's shell environment.
 - `headers` (optional): extra HTTP headers.
 - `max_output_tokens` (optional): sent as `max_tokens` on every request to this
-  model (capped at the model's own limit, if the API reports one). Without it, no
-  `max_tokens` is sent at all, whatever the API style, since some endpoints
-  refuse it. Anthropic's own Messages API requires it: setup and `/model` write
-  `16000` into new Anthropic-style entries, and if one of your older entries gets
-  a 400 about a missing `max_tokens`, add it there. It belongs to the model's
+  model (capped at the model's own limit, if the API reports one). Without it, an
+  OpenAI-style model gets no `max_tokens` at all, since some endpoints refuse it;
+  an Anthropic-style one gets `16000` (capped the same way), since the Messages
+  API requires it. Setup and `/model` write `16000` into new Anthropic-style
+  entries, so it shows. It belongs to the model's
   entry only: a top-level `max_output_tokens` isn't used (you get a config
   warning).
 - `thinking` (optional): `"adaptive"`, a token budget (`8000`), or the API's own

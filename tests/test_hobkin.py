@@ -829,6 +829,20 @@ try:
           and json.load(open(hs + "/s1/state.json"))["model"].startswith("fake-costly"), r.stdout + json.dumps(acfg))
     r = run("chat", "s1", input="/model\n")
     check("[model] /model alone lists the configured ones", re.search(r"configured \(\* = in use\):.* fake, \*fake-costly$", r.stdout, re.M), r.stdout)
+    r = run("chat", "s1", input="/model fake anthropic\nstyle switch hi\n")
+    acfg = json.load(open(hs + "/s1/config.json"))
+    sent = [json.loads(l) for l in open(LOG) if "style switch hi" in l]
+    check("[model] /model NAME anthropic: the same host in Anthropic style, /v1 dropped from the URL, its own entry",
+          acfg["model"] == "fake-anthropic" and acfg["models"]["fake-anthropic"]["api"] == "anthropic"
+          and acfg["models"]["fake-anthropic"]["base_url"] == "http://127.0.0.1:48702"
+          and cfg["models"]["fake"]["base_url"] == "http://127.0.0.1:48702/v1"
+          and sent and sent[-1]["path"] == "/v1/messages" and "echo: style switch hi" in r.stdout, r.stdout + json.dumps(acfg))
+    r = run("chat", "s1", input="/model fake-costly openai\n")
+    acfg = json.load(open(hs + "/s1/config.json"))
+    check("[model] /model NAME openai from Anthropic style puts /v1 back",
+          acfg["model"] == "fake-costly" and acfg["models"]["fake-costly"]["base_url"] == "http://127.0.0.1:48702/v1", r.stdout)
+    r = run("chat", "s1", input="/model fake sideways\n")
+    check("[model] /model with a second word that isn't a style says how it goes", "/model NAME [anthropic|openai]" in r.stdout, r.stdout)
     run("send", "s1", "/stop")
     # --hearthboard: join a board (the fake web server plays one); a bad token is refused before anything's written
     r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-bad", "--no-service")
@@ -1211,20 +1225,21 @@ try:
     check("[watch] with no one named: whoever is in break-glass mode", "fixer" in r.stdout and " SALVAGE " not in r.stdout, r.stdout)
     pf.send_signal(signal.SIGTERM); ps.send_signal(signal.SIGTERM); pf.wait(10); ps.wait(10)
 
-    # max_tokens is sent only when the model's own entry sets max_output_tokens, whatever the API style;
-    # a top-level max_output_tokens isn't used, and says so
-    for api, port, extra, top, want in (("openai", 48702, {}, {}, False), ("openai", 48702, {"max_output_tokens": 3000}, {}, True),
-                                        ("anthropic", 48701, {}, {}, False), ("anthropic", 48701, {"max_output_tokens": 3000}, {}, True),
-                                        ("anthropic", 48701, {}, {"max_output_tokens": 3000}, False)):
-        base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
+    # OpenAI style: max_tokens is sent only when the model's own entry sets max_output_tokens. Anthropic style
+    # always sends it (the API requires it): the entry's, else 16000, capped at what the API says (the fake: 4096).
+    # A top-level max_output_tokens isn't used, and says so. An Anthropic base_url ending in /v1 has it dropped.
+    for api, port, extra, top, want in (("openai", 48702, {}, {}, None), ("openai", 48702, {"max_output_tokens": 3000}, {}, 3000),
+                                        ("anthropic", 48701, {}, {}, 4096), ("anthropic", 48701, {"max_output_tokens": 3000}, {}, 3000),
+                                        ("anthropic", 48701, {}, {"max_output_tokens": 3000}, 4096)):
+        base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" or not extra else "")
         h = home(f"maxtok-{api}-{bool(extra)}-{bool(top)}", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", **extra},
                  {"idle_prompt": None, **top})
         p, aid, d = start(h)
         say(d, f"maxtok {aid}"); wait_for(d, f"echo: maxtok {aid}")
         body = [json.loads(l)["body"] for l in open(LOG) if f"maxtok {aid}" in l][-1]
         how = " with max_output_tokens in the model's entry" if extra else " with it only at the top level" if top else ""
-        check(f"[max_tokens] {api}{how}: " + ("sent" if want else "not sent"),
-              ("max_tokens" in body) == want and (not extra or body["max_tokens"] == 3000)
+        check(f"[max_tokens] {api}{how}: " + (f"sent as {want}" if want else "not sent"),
+              body.get("max_tokens") == want
               and (not top or "max_output_tokens at the top level isn't used" in open(d + "/out").read()),
               {k: v for k, v in body.items() if k != "messages" and k != "tools" and k != "system"})
         p.send_signal(signal.SIGTERM); p.wait(10)

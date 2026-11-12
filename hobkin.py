@@ -1732,6 +1732,9 @@ def listed_context(m: dict) -> int | None:
     return int(ctx) if ctx else None
 
 
+ANTHROPIC_MAX_TOKENS = 16000   # max_tokens for an Anthropic-style model with no max_output_tokens (the API requires one)
+
+
 class Model:
     """One configured model. Messages are kept in Anthropic's shape (content blocks:
     text, tool_use, tool_result) and converted for OpenAI-style APIs."""
@@ -1740,6 +1743,8 @@ class Model:
         self.name, self.cfg = name, cfg
         self.api = cfg.get("api", "openai")
         self.base = cfg["base_url"].rstrip("/")
+        if self.api == "anthropic":
+            self.base = re.sub(r"/v1$", "", self.base)   # Anthropic's paths start with /v1 themselves
         self.model = cfg["model"]
         key = os.environ.get(cfg.get("key_env") or "", "") or read(os.path.expanduser(cfg.get("key_file") or "/nonexistent")).strip()
         self.key = key
@@ -1863,11 +1868,10 @@ class Model:
             msgs = json.loads(json.dumps(messages))
             if msgs and isinstance(msgs[-1]["content"], list) and msgs[-1]["content"]:
                 msgs[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}  # prompt caching
-            body = {"model": self.model, "messages": msgs,
+            # model, max_tokens and messages are all required by the Messages API (and Anthropic-style hosts)
+            body = {"model": self.model, "max_tokens": max_tokens or ANTHROPIC_MAX_TOKENS, "messages": msgs,
                     "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                     "tools": list(tools)}
-            if max_tokens:
-                body["max_tokens"] = max_tokens
             if tool_choice == "none":
                 body["tool_choice"] = {"type": "none"}
             thinking = self.cfg.get("thinking")
@@ -2155,23 +2159,39 @@ class Agent:
         self.save_state()
 
     def switch_model(self, wanted: str) -> str:
-        """/model NAME: a configured model, else a model the current API offers (it gets a config entry
-        like the current one's). Saved in this agent's config.json, so it lasts; returns what happened."""
-        name, entry = wanted, None
-        if wanted not in self.cfg["models"]:
+        """/model NAME [anthropic|openai]: a configured model, else a model the current API offers (it gets a
+        config entry like the current one's). With a style, the model is asked for in that API style on the
+        same host: anthropic drops a trailing /v1 from the URL (its paths carry it), openai puts it back.
+        Saved in this agent's config.json, so it lasts; returns what happened."""
+        parts, api = wanted.split(), None
+        if len(parts) == 2 and parts[1].lower() in ("anthropic", "openai"):
+            wanted, api = parts[0], parts[1].lower()
+        elif len(parts) != 1:
+            return f"/model takes a name and, if you like, an API style: /model NAME [anthropic|openai] (not {wanted!r})"
+        name, entry, configured = wanted, None, self.cfg["models"].get(wanted)
+        if configured is None or (api and configured.get("api", "openai") != api):
+            entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
+                     "model": wanted}
+            if api and api != self.model.api:
+                base = self.model.base
+                entry["base_url"] = re.sub(r"/v1$", "", base) if api == "anthropic" else \
+                    base if re.search(r"/v\d+$", base) else base + "/v1"
+                entry["api"] = api
+            if entry.get("api") == "anthropic":   # its API requires max_tokens: say so in the entry, where it shows
+                entry["max_output_tokens"] = self.model.cfg.get("max_output_tokens") or ANTHROPIC_MAX_TOKENS
+            target = Model(wanted, entry)
             try:
-                offered = [i for i, _ in self.model.list_models()]
+                offered = [i for i, _ in target.list_models()]
             except (urllib.error.URLError, OSError, ValueError):
                 offered = None
             if offered is not None and wanted not in offered:
                 near = difflib.get_close_matches(wanted, list(self.cfg["models"]) + offered, n=5, cutoff=0.4)
-                return (f"no model {wanted!r}: it's not in your config, and {self.model.base} doesn't offer it"
+                return (f"no model {wanted!r}: it's not in your config, and {target.base} doesn't offer it"
+                        + (f" ({target.api} style)" if api else "")
                         + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
             name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
-            entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
-                     "model": wanted}
-            if entry.get("api") == "anthropic":   # its API requires max_tokens: say so in the entry, where it shows
-                entry["max_output_tokens"] = self.model.cfg.get("max_output_tokens") or 16000
+            if name in self.cfg["models"] and self.cfg["models"][name].get("api", "openai") != entry.get("api", "openai"):
+                name += "-" + entry["api"]    # the same model in the other style gets its own entry
             self.cfg["models"][name] = entry
         if name == self.model.name:
             return f"already on {self.model.describe()}"
@@ -2213,10 +2233,12 @@ class Agent:
 
     def max_output(self) -> int | None:
         """The max_tokens to send: the model's own max_output_tokens (its entry under "models"), capped at what
-        the API says, else none at all, whatever the API style (Anthropic's own API needs the setting)."""
+        the API says; with none set, nothing for OpenAI-style APIs and ANTHROPIC_MAX_TOKENS for Anthropic-style ones."""
         want = self.model.cfg.get("max_output_tokens")
         if not want:
-            return None
+            if self.model.api != "anthropic":
+                return None
+            want = ANTHROPIC_MAX_TOKENS       # the Messages API requires max_tokens: never send a request without it
         api = self.state.get("api_max_output")
         return min(int(want), api) if api else int(want)
 
@@ -2751,7 +2773,7 @@ class Agent:
             elif cmd == "/hello":                      # `hobkin chat` opening, with the folder it was opened in
                 self.operator_cwd = line.strip().split(" ", 1)[1].strip() if " " in line.strip() else None
                 self.command(cmd)
-            elif cmd == "/model":                      # the other command with an argument: /model NAME
+            elif cmd == "/model":                      # the other command with an argument: /model NAME [STYLE]
                 self.model_wanted = line.strip().split(" ", 1)[1].strip()   # switched between steps
                 self.log("hobkin", f"command /model {self.model_wanted}")
             else:
@@ -2783,7 +2805,8 @@ class Agent:
         elif cmd == "/model":
             names = ", ".join(("*" if n == self.model.name else "") + n for n in self.cfg["models"])
             self.log("hobkin", f"model: {self.model.describe()}\nconfigured (* = in use): {names}\n"
-                     "/model NAME switches to one of those, or to any model this API offers (/models lists them)")
+                     "/model NAME switches to one of those, or to any model this API offers (/models lists them);\n"
+                     "/model NAME anthropic (or openai) asks for it in that API style on the same host")
         elif cmd == "/models":
             self.models_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/limits":
@@ -5816,7 +5839,7 @@ def configure_model(pos, opts, agent_id):
     os.makedirs(d, exist_ok=True)
     entry = {"api": m.api, "base_url": m.base, "model": model_id}
     if m.api == "anthropic":                  # its API requires max_tokens: say so in the entry, where it shows
-        entry["max_output_tokens"] = 16000
+        entry["max_output_tokens"] = ANTHROPIC_MAX_TOKENS
     if key:
         keys = os.path.join(SHARED, "keys") if fresh else d
         os.makedirs(keys, mode=0o700, exist_ok=True)

@@ -95,7 +95,9 @@ class H(BaseHTTPRequestHandler):
                              if self.path == "/v1/messages" else
                              {"id": "gen-1", "error": {"message": "Upstream idle timeout exceeded", "code": 504}})
         if self.path == "/v1/messages":
-            assert self.headers.get("x-api-key") == "test-key", "missing key"
+            assert self.headers.get("x-api-key"), "missing key"
+            missing = [k for k in ("model", "max_tokens", "messages") if k not in body]
+            assert not missing, f"the Messages API requires {', '.join(missing)}"
             msgs = body["messages"]; prev_calls = set()
             for i, m in enumerate(msgs):
                 assert m["role"] == ("user" if i % 2 == 0 else "assistant"), f"roles must alternate at {i}"
