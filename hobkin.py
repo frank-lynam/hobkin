@@ -5392,7 +5392,7 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
     prompt, lock, done = "> ", threading.Lock(), threading.Event()
     print("\n".join(short(line) for line in recent))
     print(f"-- chatting with {agent_id}: type and press Enter to send (up arrow for history); "
-          "/stop, /pause, /interrupt work; Ctrl-D to leave --", flush=True)
+          "/stop, /pause, /interrupt work; Ctrl-C drops what you've typed; Ctrl-D to leave --", flush=True)
     os.write(fifo, f"/hello {os.getcwd()}\n".encode())      # the agent says hi first (and knows where you are)
 
     def doing():
@@ -5403,7 +5403,7 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
             return f"{agent_id} is {b['what']} ({span_text(time.time() - float(b['since']))})"
         return f"{agent_id} is {status}" if status.startswith(("working", "waiting")) else None
 
-    look = {"spinning": False, "status": False, "turn": 0, "next": 0.0}
+    look = {"spinning": False, "status": False, "turn": 0, "next": 0.0, "cancel": False}
 
     def cursor_row(lib) -> int:
         """Which screen row of the input the cursor is on (0: the prompt's), so we can find the prompt."""
@@ -5417,6 +5417,8 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
         the prompt (the line you type on is never written over). With lib (in readline's own thread, from its
         input hook) readline redraws your input, cursor where you left it; without it (no hook: libedit, say)
         the spinner shows only on an empty input line, as it can't be put back above."""
+        if lib and look["cancel"]:
+            cancel_line(lib)
         if time.time() < look["next"]:
             return
         lines, note = new_lines(), doing()
@@ -5460,6 +5462,23 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
             sys.stdout.flush()
             look["status"] = False
 
+    def cancel_line(lib) -> None:
+        """Ctrl-C, as in a shell: what was typed is dropped (^C shown after it), and a fresh prompt below."""
+        look["cancel"] = False
+        typed = readline.get_line_buffer()
+        rows = screen_cells(typed, len(prompt), shutil.get_terminal_size().columns)[-1][0] + 1
+        down = rows - 1 - cursor_row(lib)
+        sys.stdout.write((f"\x1b[{down}B" if down > 0 else "") + "^C\r\n")
+        drop_status(rows)
+        lib.rl_replace_line.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.rl_replace_line(b"", 0)
+        ctypes.c_int.in_dll(lib, "rl_point").value = 0
+        if hasattr(lib, "using_history"):
+            lib.using_history()               # ↑ starts again from the newest message
+        lib.rl_on_new_line()
+        lib.rl_forced_update_display()
+        look["next"] = 0.0
+
     def printer():                           # without the hook: from a thread (fine unless you type mid-reply)
         while not done.is_set():
             with lock:
@@ -5470,6 +5489,9 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
     arrows = readline_arrows(readline, len(prompt))   # noqa: F841 (the callbacks must stay alive while input() runs)
     if not unhook:
         threading.Thread(target=printer, daemon=True).start()
+    # Ctrl-C mostly lands in the input hook (a ctypes callback, where a KeyboardInterrupt is only printed as
+    # "Exception ignored"): with the hook it's caught here instead, and the hook drops the line, like a shell
+    old_sigint = signal.signal(signal.SIGINT, lambda *_: look.update(cancel=True)) if unhook else None
     try:
         while True:
             try:
@@ -5485,6 +5507,8 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
         pass
     finally:
         done.set()
+        if old_sigint is not None:
+            signal.signal(signal.SIGINT, old_sigint)
         if unhook:
             unhook()
         print()

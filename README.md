@@ -131,7 +131,8 @@ read, a failed exit status), without its output; `hobkin chat ID --full` shows t
 output too, as the `out` file has it. Each line you type is sent; lines you paste
 arrive together and become one message (the chat says "(5 lines, sent as one
 message)"), though a pasted line that's exactly a command, such as `/stop`, still
-runs as one. `/stop` and the other commands work, and Ctrl-D leaves. What the
+runs as one. `/stop` and the other commands work, Ctrl-C drops what you've typed
+(as in a shell: a fresh prompt, and the chat stays), and Ctrl-D leaves. What the
 agent's doing ("bodkin is thinking (12s)") shows on a status line of its own just
 above your prompt, so it never sits where you type. Output never wipes out what
 you're typing: it's printed above, and your input is redrawn below it, with the

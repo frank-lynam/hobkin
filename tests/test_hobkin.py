@@ -149,6 +149,14 @@ try:
         os.write(fd, b"\x15\x1b[A\r")                 # Ctrl-U clears, up arrow recalls, Enter sends
         again = pump(lambda b: b"echo: typed in a terminal" in b)
         check(f"[{api}] chat (terminal) up arrow resends from history", b"echo: typed in a terminal" in again, again[-300:])
+        import readline as rl_
+        if "libedit" not in (rl_.__doc__ or ""):     # GNU readline: Ctrl-C drops the line, no traceback, chat stays
+            os.write(fd, b"dropped-by-ctrl-c"); time.sleep(0.3); os.write(fd, b"\x03"); time.sleep(0.5)
+            os.write(fd, b"after ctrl-c\r")
+            cc = pump(lambda b: b"echo: after ctrl-c" in b)
+            check(f"[{api}] chat (terminal) Ctrl-C drops the typed line and stays, no KeyboardInterrupt",
+                  b"echo: after ctrl-c" in cc and b"^C" in cc and b"KeyboardInterrupt" not in cc
+                  and "echo: dropped-by-ctrl-c" not in open(d + "/out").read(), cc[-400:])
         os.write(fd, b"\x04")   # Ctrl-D leaves
         _, status = os.waitpid(pid, 0)
         check(f"[{api}] chat (terminal) round trip and Ctrl-D", b"echo: typed in a terminal" in buf and status == 0, buf[-400:])
