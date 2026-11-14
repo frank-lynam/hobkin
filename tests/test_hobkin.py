@@ -1559,6 +1559,7 @@ try:
                                                       capture_output=True, text=True).stdout)
     say(d, 'call: brownie {"task": "REPORT: waited for this one", "wait": true}')
     wait_for(d, "brownie> #2 done", 60)
+    wait_for(d, "waited for this one", 20, file="context.jsonl")      # the result lands just after the log line
     check("[brownie] wait: true holds the step until its report", "waited for this one" in json.dumps(last_results(d)))
     p.send_signal(signal.SIGTERM); p.wait(10)
 
