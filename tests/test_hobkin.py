@@ -825,9 +825,10 @@ try:
     check("[prompt] the default personality tests lightly, asks before any test harness, hands validation over",
           "**YOLO on testing.**" in ctx_s1 and "Never build a test harness without asking" in ctx_s1
           and "**Team up on validation.**" in ctx_s1 and "verify the whole result" not in ctx_s1, ctx_s1[:300])
-    check("[prompt] handing off validation means a HANDOFF.md kept out of git, read first by whoever picks it up",
-          "**Handoff notes travel with the code.**" in ctx_s1 and "`.git/info/exclude`" in ctx_s1
-          and "`HANDOFF.md`, if it has one" in ctx_s1, ctx_s1[:300])
+    check("[prompt] a handoff is a gitignored HANDOFF.md next to the code: a paste-ready check for the human, then notes for a hobkin",
+          "**Handoff notes travel with the code.**" in ctx_s1 and "right next to the code you worked on" in ctx_s1
+          and "**The human, at the top:**" in ctx_s1 and "**A fresh hobkin, below a `---`,**" in ctx_s1
+          and "`HANDOFF.md` next to it, if there is one" in ctx_s1, ctx_s1[:300])
     # Opening a chat asks the agent to say hello first
     run("send", "s1", "/hello /home/frank/projects/site")
     for _ in range(50):
