@@ -179,6 +179,9 @@ DEFAULT_CONFIG = {
     "alert_command": None,
     # Pause for the day once this much is spent (where the API reports cost, e.g. OpenRouter)
     "daily_budget_usd": None,
+    # Drive mode (/drive, or "drive": true on a model that stops too early): how many times hobkin pushes the
+    # agent on, per goal, when it stops with steps unticked, before it gives up and says so
+    "drive_max_pushes": 30,
     # Safe mode, for systems people depend on: the agent's commands can read but only write in its
     # workspace, and can't open network connections or signal other processes (as far as this kernel's
     # Landlock goes; hobkin won't start if it can't sandbox at all). true, or {"network": true} to let
@@ -247,7 +250,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "output_limit": int, "compact_at": (int, float), "compact_early": (int, float),
                 "context_budget": (int, type(None)), "skill_dirs": list,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
-                "daily_budget_usd": (int, float, type(None)), "web": dict,
+                "daily_budget_usd": (int, float, type(None)), "web": dict, "drive_max_pushes": int,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
                 "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
                 "break_glass": (dict, type(None)), "chores": (dict, type(None)), "chore_dirs": list,
@@ -258,7 +261,8 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
 MODEL_TYPES = {"api": str, "base_url": str, "model": str, "key_env": (str, type(None)), "key_file": (str, type(None)),
                "context_tokens": (int, type(None)), "requests_per_minute": (int, float, type(None)), "headers": dict,
                "max_output_tokens": (int, type(None)), "prompt_cache": (bool, type(None)),
-               "thinking": (str, int, dict, type(None)), "effort": (str, type(None)), "extra_body": dict}
+               "thinking": (str, int, dict, type(None)), "effort": (str, type(None)), "extra_body": dict,
+               "drive": (bool, type(None))}
 
 
 DEFAULT_AGENTS_MD = """# How you are
@@ -632,7 +636,9 @@ TOOLS = [
          "before_step": {"type": "integer", "description": "subgoal: the goal's step it must come before (default: the next unfinished one)."},
          "revise": {"type": "object", "description": "Change the shape of what you're on (the sub-goal, if any), keeping what's done: "
                     "{\"add\": [steps], \"after\": N, \"drop\": [unfinished step numbers], \"goal\": \"new wording\"}."},
-         "replace": {"type": "boolean", "description": "goal: replace an open goal outright (rarely right: a subgoal or revise usually is)."}}}},
+         "replace": {"type": "boolean", "description": "goal: replace an open goal outright (rarely right: a subgoal or revise usually is)."},
+         "waiting": {"type": "string", "description": "You can't go on until someone or something else acts: say what for "
+                     "(a human's answer, a validation run). hobkin stops pushing you on until a message arrives."}}}},
     {"name": "session",
      "description": ("An interactive program that keeps running between calls: a debugger (gdb, lldb, radare2), a REPL "
                      "(python3 -q, node, irb), a database shell, nc or socat to a service. `start` it with a command; "
@@ -732,7 +738,7 @@ shopt -s expand_aliases
 
 
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits",
-            "/models", "/model", "/hello")
+            "/models", "/model", "/hello", "/drive")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
@@ -778,6 +784,16 @@ WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your repor
            "(4) does what you did match what you said? Check the files, names and claims in your report with ls "
            "or read_file; if they don't match, fix whichever is wrong. "
            "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
+
+
+KEEP_GOING = ("[hobkin: you stopped, but your goal isn't done: next is step {n}. {step}. Carry on now and make the "
+              "call it needs. Truly waiting on someone or something? Call goal with {{\"waiting\": \"what for\"}}. "
+              "Plan changed? Revise the goal.]")
+
+
+DRIVE = ("[hobkin: drive mode: keep working until every step of your goal is ticked. Next: step {n}. {step}. "
+         "This reply must make a tool call. Truly waiting on someone or something? goal {{\"waiting\": \"what for\"}}. "
+         "Plan wrong? goal with revise. ({left} pushes left.)]")
 
 
 COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a hobkin: the verdict first, the "
@@ -1906,6 +1922,8 @@ class Model:
                     "tools": list(tools)}
             if tool_choice == "none":
                 body["tool_choice"] = {"type": "none"}
+            elif tool_choice == "required":              # drive mode: this reply must act
+                body["tool_choice"] = {"type": "any"}
             thinking = self.cfg.get("thinking")
             if thinking is not None:          # "adaptive", a budget in tokens, or the API's own object
                 body["thinking"] = thinking if isinstance(thinking, dict) else \
@@ -1936,8 +1954,8 @@ class Model:
                                                             "parameters": t["input_schema"]}} for t in tools]}
         if max_tokens:
             body["max_tokens"] = max_tokens
-        if tool_choice == "none":
-            body["tool_choice"] = "none"
+        if tool_choice in ("none", "required"):
+            body["tool_choice"] = tool_choice
         if "openrouter.ai" in self.base:
             body["usage"] = {"include": True}        # OpenRouter then reports each call's cost
         if self.cfg.get("effort"):                   # OpenRouter's name for it, else OpenAI's
@@ -2057,6 +2075,7 @@ class Agent:
         self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.empty_replies = 0             # empty replies in a row (asked again, twice)
+        self.force_tool = False            # drive mode: the next reply must make a tool call
         self.operator_cwd = None           # ...from this folder (their terminal's, not the agent's)
         self.safe = None                   # safe mode's sandbox spec (setup_safe_mode), or None
         self.glass = None                  # break-glass mode, while it's on: the config entry
@@ -2076,6 +2095,7 @@ class Agent:
         self.wake_last = ("", 0.0)         # the last answer delivered, and when (the same one isn't sent twice soon)
         self.wrap_up_sent = False
         self.voice_sent = False
+        self.continue_sent = False         # the one "carry on" a turn gets without drive
         self.pending = []          # operator messages not yet given to the model
         self.fifo_buf = b""
         self.fifo_last = 0.0
@@ -2755,7 +2775,7 @@ class Agent:
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
         before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested, self.model_wanted, self.greet_wanted)
+                  self.models_requested, self.model_wanted, self.greet_wanted, self.working)   # working: /drive got it going
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -2780,7 +2800,7 @@ class Agent:
                 self.fifo_buf = b""
             self._drain_queue()
             if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested, self.model_wanted, self.greet_wanted) != before:
+                  self.models_requested, self.model_wanted, self.greet_wanted, self.working) != before:
                 return
 
     def _drain_queue(self):
@@ -2805,6 +2825,9 @@ class Agent:
             elif cmd == "/hello":                      # `hobkin chat` opening, with the folder it was opened in
                 self.operator_cwd = line.strip().split(" ", 1)[1].strip() if " " in line.strip() else None
                 self.command(cmd)
+            elif cmd == "/drive" and line.strip().lower() in ("/drive on", "/drive off"):
+                self.log("hobkin", f"command {line.strip().lower()}")
+                self.set_drive(line.strip().lower().endswith("on"))
             elif cmd == "/model":                      # the other command with an argument: /model NAME [STYLE]
                 self.model_wanted = line.strip().split(" ", 1)[1].strip()   # switched between steps
                 self.log("hobkin", f"command /model {self.model_wanted}")
@@ -2858,8 +2881,11 @@ class Agent:
             data, _ = self.load_reminders()
             self.log("hobkin", "\n".join(self.reminder_lines(data["items"])) or "no reminders")
         elif cmd == "/status":
-            self.log("hobkin", json.dumps({k: self.state.get(k) for k in
-                                           ("status", "model", "context_tokens", "last_input_tokens", "compactions")}))
+            self.log("hobkin", json.dumps({**{k: self.state.get(k) for k in
+                                              ("status", "model", "context_tokens", "last_input_tokens", "compactions")},
+                                           "drive": self.drive_status()}))
+        elif cmd == "/drive":
+            self.set_drive(None)
 
     # --- the front desk and wake-ups: answering mid-command, the board's inbox, the waker
     def front_desk_reply(self, who: str, text: str, where: str = "") -> str | None:
@@ -3925,9 +3951,15 @@ class Agent:
         """Set the task's goal (writes CHECKLIST.md, shows the thinking, opens file changes) or tick steps."""
         g = self.state.get("goal") or {}
         write = lambda: self.fs_write(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g).encode())
-        if (inp.get("subgoal") or inp.get("revise") or inp.get("done") is not None) and not inp.get("goal") \
-                and not g.get("open"):
+        if (inp.get("subgoal") or inp.get("revise") or inp.get("done") is not None or inp.get("waiting")) \
+                and not inp.get("goal") and not g.get("open"):
             return "No goal is set. Set one first (goal, what_would, steps).", True
+        if inp.get("waiting") and not inp.get("goal") and inp.get("done") is None:
+            g["waiting"] = {"for": str(inp["waiting"]), "at": time.time()}
+            self.save_state()
+            self.log("goal", f"waiting for: {g['waiting']['for']}")
+            return (f"Noted: waiting for {g['waiting']['for']}. hobkin won't push you on until a message or "
+                    "reminder comes in. Say where you're waiting, and end your turn."), False
         if inp.get("subgoal"):                        # a detour inside the goal, which stays as it was
             steps = [str(t) for t in inp.get("steps") or []]
             if not steps:
@@ -3975,6 +4007,7 @@ class Agent:
                 return f"No step {bad[0]}: the steps are 1 to {len(target['steps'])}" + \
                     (" (of the sub-goal you're on)." if target is not g else "."), True
             target["done"] = sorted(set(target["done"]) | set(done))
+            g.pop("waiting", None)                     # moving again
             self.step_done = True                      # a good moment to compact, if it's due
             self.log("goal", "ticked " + ", ".join(f"{n}. {target['steps'][n - 1]}" for n in done))
             left = [i + 1 for i in range(len(target["steps"])) if i + 1 not in target["done"]]
@@ -3987,6 +4020,7 @@ class Agent:
                 return f"Sub-goal done. Back to your goal: {g['goal']}. Next: {nxt}", False
             if target is g and not left and not self.active_sub(g):
                 g["open"] = False
+                self.drive_finished("the goal's steps are all ticked")
                 write()
                 self.save_state()
                 return f"All {len(g['steps'])} steps done: the goal is closed. Report what you did.", False
@@ -4240,7 +4274,83 @@ class Agent:
         said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
             return True
+        if self.push_on():                          # stopped with the goal unfinished
+            return True
         return bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP)
+
+    # --- drive: keep going until the goal is done (stopping early is a model's habit, not a decision)
+    def goal_left(self) -> tuple[int, str] | None:
+        """The next unticked step of the goal (or the sub-goal it's on), unless it's waiting or closed."""
+        g = self.state.get("goal") or {}
+        if not g.get("open") or g.get("waiting"):
+            return None
+        target = self.active_sub(g) or g
+        n = self.next_step(target)
+        return (n, target["steps"][n - 1]) if n <= len(target["steps"]) else None
+
+    def driving(self) -> bool:
+        d = self.state.get("drive") or {}
+        return bool(d.get("on")) if "on" in d else bool(self.model.cfg.get("drive"))
+
+    def drive_status(self) -> dict:
+        d = self.state.get("drive") or {}
+        return {"on": self.driving(), "pushes": d.get("pushes", 0), "max": int(self.cfg.get("drive_max_pushes") or 30),
+                "from": "/drive" if "on" in d else ("the model's config" if self.model.cfg.get("drive") else None)}
+
+    def set_drive(self, on: bool | None) -> None:
+        """/drive (toggle), /drive on, /drive off. On with a goal open, it gets going at once."""
+        on = (not self.driving()) if on is None else on
+        self.state["drive"] = {"on": on, "pushes": 0}
+        self.save_state()
+        left = self.goal_left()
+        if not on:
+            self.log("hobkin", "drive mode off")
+            return
+        self.log("hobkin", f"drive mode on: when {self.id} stops with its goal unfinished, it's pushed on, and its "
+                 f"next reply must make a tool call (at most {self.drive_status()['max']} pushes; /drive off stops it)"
+                 + ("" if left else ". No goal open: it starts with the next one"))
+        if left and not self.working:
+            self.add_user(DRIVE.format(n=left[0], step=left[1], left=self.drive_status()["max"]), record=False)
+            self.force_tool = True
+
+    def drive_finished(self, why: str) -> None:
+        d = self.state.get("drive") or {}
+        if self.driving() or d:
+            self.log("hobkin", f"drive: {why}" + (" (drive mode off)" if d.get("on") else ""))
+        if d.get("on"):                              # /drive was for this goal; a model's own drive stays on
+            self.state["drive"] = {"on": False, "pushes": 0}
+        elif d:
+            d["pushes"] = 0
+
+    def push_on(self) -> bool:
+        """The agent stopped with steps unticked: push it on. Without drive, once a turn ("carry on");
+        with drive, every time, and the next reply must make a tool call, up to drive_max_pushes."""
+        left = self.goal_left()
+        if not left or self.scheduled() or self.owe_reply:
+            return False
+        if not self.driving():
+            return self.nudge_once("continue_sent", KEEP_GOING.format(n=left[0], step=left[1]))
+        d = self.state.setdefault("drive", {})
+        cap = int(self.cfg.get("drive_max_pushes") or 30)
+        if d.get("pushes", 0) >= cap:
+            self.log("hobkin", f"drive: pushed {cap} times and the goal still isn't done; stopping here")
+            self.alert(f"hobkin {self.id}: drive mode gave up after {cap} pushes; the goal's next step is {left[0]}. {left[1]}")
+            self.drive_finished(f"gave up after {cap} pushes")
+            d.update(pushes=0)
+            return False
+        d["pushes"] = d.get("pushes", 0) + 1
+        self.push(DRIVE.format(n=left[0], step=left[1], left=cap - d["pushes"]))
+        self.force_tool = self.state.get("no_forced_tool") != self.model.describe()
+        return True
+
+    def push(self, text: str) -> None:
+        """A hobkin hint as the next user message (or onto the one waiting, so roles still alternate)."""
+        block = {"type": "text", "text": text}
+        if self.messages and self.messages[-1]["role"] == "user":
+            self.messages[-1]["content"].append(block)
+        else:
+            self.messages.append({"role": "user", "content": [block]})
+        self.save_context()
 
     def nudge_once(self, flag: str, text: str) -> bool:
         """Send a nudge as a user message, at most once per turn (flag), so it can never loop."""
@@ -4684,7 +4794,8 @@ class Agent:
     def add_user(self, text: str, record: bool = True) -> None:
         if record:                         # people's messages and hobkin's notices, in an incident's timeline
             self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
-        self.turn_used_tools = self.wrap_up_sent = self.voice_sent = False   # a new turn
+        self.turn_used_tools = self.wrap_up_sent = self.voice_sent = self.continue_sent = False   # a new turn
+        (self.state.get("goal") or {}).pop("waiting", None)                 # someone's said something: on we go
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False
         block = {"type": "text", "text": text}
@@ -4722,10 +4833,16 @@ class Agent:
             self.refresh_limits("context nearly full")     # it may have grown
             if self.needs_compaction():
                 self.compact("context nearly full")
+        forced, self.force_tool = self.force_tool, False
         try:
-            blocks, stop_reason = self.ask(self.messages)
+            blocks, stop_reason = self.ask(self.messages, tool_choice="required" if forced else None)
         except ApiError as e:
             if self.stop:
+                return
+            if forced and e.status in (400, 422) and not is_too_long(e):   # this API won't take "a tool call is
+                self.state["no_forced_tool"] = self.model.describe()        # required": push on without it
+                self.log("hobkin", f"drive: {self.model.describe()} refused a required tool call ({e.status}); "
+                         "pushing on without it")
                 return
             if is_too_long(e):
                 limit = context_limit_from_error(e.text)
@@ -4750,6 +4867,10 @@ class Agent:
                        "A message or /resume makes it try again.")
             return
         blocks = [b for b in blocks if b.get("type") != "text" or b.get("text", "").strip()]
+        if not blocks and self.driving() and self.goal_left():   # nothing at all, mid-goal: drive pushes on
+            self.empty_replies = 0
+            if self.push_on():
+                return
         if not blocks:                                 # nothing at all: ask again (a stop token, a glitch)
             self.empty_replies += 1
             if self.empty_replies <= 2:

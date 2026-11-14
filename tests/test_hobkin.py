@@ -1720,6 +1720,78 @@ try:
             subprocess.run(["systemctl", "--user", "daemon-reload"])
     else:
         print("SKIP [service] no systemd user session here")
+    # A model that stops early (says what it'll do next, then stops): without drive it gets one "carry on"; /drive
+    # pushes it on every time with a tool call required, until the goal's steps are all ticked, then turns off
+    def st_of(d): return json.load(open(d + "/state.json"))
+    def until(cond, t=30):
+        end = time.time() + t
+        while time.time() < end:
+            try:
+                if cond(): return True
+            except (OSError, ValueError, KeyError): pass
+            time.sleep(0.2)
+        return False
+    for api, port in (("anthropic", 48701), ("openai", 48702)):
+        base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
+        h = home(f"drive-{api}", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY"}, {"idle_prompt": None})
+        p, aid, d = start(h)
+        say(d, "lazy-goal: 3")
+        wait_for(d, "you stopped, but your goal isn't done: next is step 1", 20, file="context.jsonl")
+        until(lambda: st_of(d).get("status") == "idle", 15)
+        st, c = st_of(d), open(d + "/context.jsonl").read()
+        check(f"[drive] {api}: without drive, a model that stops mid-goal gets one carry-on (not the wrap-up's 'all done?'), no more",
+              st["goal"]["open"] and st["goal"]["done"] == [] and c.count("you stopped, but your goal isn't done") == 1, st.get("goal"))
+        is_forced = lambda l: "lazy-goal" in l and ('"tool_choice": {"type": "any"}' in l or '"tool_choice": "required"' in l)
+        before = sum(1 for l in open(LOG) if is_forced(l))
+        say(d, "/drive on")
+        ok = until(lambda: "drive: the goal's steps are all ticked (drive mode off)" in open(d + "/out").read())
+        st = st_of(d)
+        forced = sum(1 for l in open(LOG) if is_forced(l)) - before
+        check(f"[drive] {api}: /drive on pushes it through every step, each push requiring a tool call, then turns itself off",
+              ok and not st["goal"]["open"] and st["goal"]["done"] == [1, 2, 3] and st["drive"]["on"] is False and forced == 3,
+              (forced, st.get("goal"), st.get("drive"), open(d + "/out").read()[-800:]))
+        p.send_signal(signal.SIGTERM); p.wait(10)
+    # "drive": true on the model: no command needed; the cap stops a hopeless one, and says so
+    base = "http://127.0.0.1:48701"
+    h = home("drive-cap", {"api": "anthropic", "base_url": base, "model": "fake", "key_env": "TESTKEY", "drive": True},
+             {"idle_prompt": None, "drive_max_pushes": 2})
+    p, aid, d = start(h)
+    say(d, "lazy-goal: 5")
+    ok = until(lambda: "drive: pushed 2 times and the goal still isn't done" in open(d + "/out").read())
+    check("[drive] a model with \"drive\": true in its config is driven with no command; the cap stops it, and says so",
+          ok and st_of(d)["goal"]["done"] == [1, 2] and st_of(d)["goal"]["open"], (st_of(d).get("goal"), open(d + "/out").read()[-600:]))
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # an API that won't take "a tool call is required": noticed once, remembered for that model, pushed on without it
+    h = home("drive-noforce", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake-noforce",
+                               "key_env": "TESTKEY", "drive": True}, {"idle_prompt": None, "drive_max_pushes": 3})
+    p, aid, d = start(h)
+    say(d, "lazy-goal: 4")
+    ok = until(lambda: "drive: pushed 3 times" in open(d + "/out").read())
+    out = open(d + "/out").read()
+    check("[drive] an API that refuses a required tool call: said once, remembered, and drive pushes on without it",
+          ok and out.count("refused a required tool call") == 1 and "fake-noforce" in (st_of(d).get("no_forced_tool") or ""),
+          out[-700:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # waiting: the agent says it's waiting on someone, and isn't pushed until a message comes in
+    h = home("drive-wait", {"api": "anthropic", "base_url": base, "model": "fake", "key_env": "TESTKEY", "drive": True},
+             {"idle_prompt": None, "drive_max_pushes": 1})
+    p, aid, d = start(h)
+    say(d, 'call: goal {"goal": "g", "how_it_works": "x", "why_it_doesnt": "y", "what_would": "z", "steps": ["a", "b"]}')
+    until(lambda: "pushed 1 times" in open(d + "/out").read())
+    say(d, 'call: goal {"waiting": "the human to run the staging check"}')
+    until(lambda: st_of(d)["goal"].get("waiting") and st_of(d).get("status") == "idle")
+    n_drive = open(d + "/context.jsonl").read().count("drive mode: keep working")
+    time.sleep(1.5)
+    check("[drive] waiting on someone (goal waiting): no pushing while it waits",
+          st_of(d)["goal"]["waiting"]["for"] == "the human to run the staging check"
+          and open(d + "/context.jsonl").read().count("drive mode: keep working") == n_drive, st_of(d).get("goal"))
+    say(d, "the check passed")
+    ok = until(lambda: open(d + "/context.jsonl").read().count("drive mode: keep working") > n_drive)
+    check("[drive] a message ends the wait, and the pushing starts again", ok and "waiting" not in st_of(d)["goal"], st_of(d).get("goal"))
+    r = subprocess.run([sys.executable, HOB, "chat", aid], input="/status\n", env={**os.environ, "HOBKIN_HOME": h},
+                       capture_output=True, text=True, timeout=30)
+    check("[drive] /status says whether it's driving, and why", '"drive": {"on": true' in r.stdout and "the model's config" in r.stdout, r.stdout[-400:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
     check("no invalid requests at all", "INVALID" not in open(LOG).read(), [l for l in open(LOG) if "INVALID" in l][:3])
 finally:
     for p in procs:

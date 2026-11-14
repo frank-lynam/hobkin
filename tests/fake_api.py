@@ -33,6 +33,21 @@ def decide(last_user_texts, tool_results, summary):
     m = re.search(r"run:\s*(.+)", t, re.S)
     if m: return ("tool", ("bash", {"command": m.group(1).strip()}))
     return ("text", "echo: " + (t.strip()[:80] or "(nothing)"))
+def lazy(all_user_text, calls, forced):
+    """A model that stops early, like some do: given "lazy-goal: N", it sets a goal of N steps, then after every
+    step says what it'll do next and stops, without doing it. Only a required tool call makes it tick the next
+    step. calls: its own earlier tool calls, as (name, input)."""
+    m = re.search(r"lazy-goal: (\d+)", all_user_text)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if not any(c[0] == "goal" and c[1].get("steps") for c in calls):
+        return ("tool", ("goal", {"goal": "lazy work", "how_it_works": "looked", "why_it_doesnt": "not done yet",
+                                  "what_would": "doing each step", "steps": [f"step {i + 1}" for i in range(n)]}))
+    ticked = sum(1 for c in calls if c[0] == "goal" and c[1].get("done"))
+    if ticked >= n:
+        return None
+    return ("tool", ("goal", {"done": [ticked + 1]})) if forced else ("text", f"Next I'll do step {ticked + 1}.")
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def send(self, code, obj, headers=None):
@@ -58,6 +73,9 @@ class H(BaseHTTPRequestHandler):
     def _post(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         LOG.write(json.dumps({"path": self.path, "body": body}) + "\n"); LOG.flush()
+        tc = body.get("tool_choice")
+        if body.get("model") == "fake-noforce" and (tc == "required" or isinstance(tc, dict) and tc.get("type") == "any"):
+            return self.send(400, {"error": {"message": "tool_choice 'required' is not supported by this endpoint"}})
         if body.get("model") == "fake-gone":         # a model that's been withdrawn
             return self.send(404, {"error": {"message": "No endpoints found for fake-gone.", "code": 404}})
         size = len(json.dumps(body)) // 4
@@ -113,6 +131,11 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"prompt is too long: {size} tokens > {CTX} maximum"}})
             last = msgs[-1]["content"]
             kind, val = decide(last_text(last), [flat(b["content"]) for b in last if b["type"] == "tool_result"], body.get("tool_choice", {}).get("type") == "none")
+            lz = lazy("\n".join(last_text(m["content"]) for m in msgs if m["role"] == "user"),
+                      [(b["name"], b["input"]) for m in msgs if m["role"] == "assistant" for b in m["content"] if b["type"] == "tool_use"],
+                      body.get("tool_choice", {}).get("type") == "any")
+            if lz:
+                kind, val = lz
             if kind == "multi":
                 content = [{"type": "text", "text": "**What would:** these."}] + [
                     {"type": "tool_use", "id": f"toolu_{len(msgs)}_{i}", "name": n, "input": inp} for i, (n, inp) in enumerate(val)]
@@ -135,6 +158,11 @@ class H(BaseHTTPRequestHandler):
                 tail.insert(0, m)
             texts = "\n".join(flat(m["content"]) for m in tail if m["role"] == "user")
             kind, val = decide(texts, [m["content"] for m in tail if m["role"] == "tool"], body.get("tool_choice") == "none")
+            lz = lazy("\n".join(flat(m["content"]) for m in msgs if m["role"] == "user"),
+                      [(c["function"]["name"], json.loads(c["function"]["arguments"])) for m in msgs if m["role"] == "assistant"
+                       for c in m.get("tool_calls") or []], body.get("tool_choice") == "required")
+            if lz:
+                kind, val = lz
             msg = {"role": "assistant", "content": val} if kind == "text" else {"role": "assistant", "content": None if kind == "silent" else ("Running it." if kind == "noplan" else "**What would:** running it."), "tool_calls": [{"id": f"call_{len(msgs)}", "type": "function", "function": {"name": val[0], "arguments": json.dumps(val[1])}}]}
             return self.send(200, {"choices": [{"message": msg, "finish_reason": "tool_calls" if kind == "tool" else "stop"}], "usage": {"prompt_tokens": size, **({"cost": 0.4} if body.get("model") == "fake-costly" else {})}})
         self.send(404, {})

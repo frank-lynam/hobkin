@@ -267,6 +267,7 @@ line that is just one of these is a command instead:
 | `/status` | Write its status to `out`. |
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
+| `/drive [on\|off]` | Drive mode, for a model that stops before it's done. Each time the agent stops with its goal's steps unticked, it's pushed on, and its next reply must make a tool call (`tool_choice` required). It keeps going until every step is ticked, then drive turns itself off. It stops early at `drive_max_pushes` (30) pushes, or when the agent says it's waiting on someone (`goal` `waiting`). Alone, `/drive` toggles. `"drive": true` in a model's entry makes it permanent for that model. |
 | `/model [NAME [anthropic\|openai]]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Add `anthropic` or `openai` to ask for it in that API style on the same host: `anthropic` drops a trailing `/v1` from the URL (its paths carry it), `openai` puts it back. Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
 | `/models` | List the models the agent's API offers (the one in use starred), with their context windows. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
@@ -320,6 +321,11 @@ are; if it's left out and there's only one model, that one is used.
   OpenAI-style APIs as `reasoning_effort`.
 - `extra_body` (optional): anything else your provider takes, merged into every
   request as is.
+- `drive` (optional): `true` for a model that keeps stopping mid-task (some
+  self-hosted or gateway models emit end-of-turn too early). It's always driven,
+  as with `/drive`: pushed on whenever it stops with its goal unfinished, with a
+  tool call required. If the API won't take a required tool call, hobkin says so
+  once and pushes without it. `drive_max_pushes` (30, per goal) caps it.
 - `prompt_cache` (optional): on OpenAI-style APIs, mark the system prompt and the
   newest message for caching. It's on by default for Claude models (e.g. on
   OpenRouter), where re-reading the conversation then costs about 5% of the
@@ -453,6 +459,12 @@ default; the agent can ask for any longer timeout on a command),
   `{"done": [N]}`. File changes (other than `CHECKLIST.md` and `NOTES.md`) aren't
   made until there's a goal (or the agent has said **What would:**), once per
   turn: a second try goes through.
+  - **Stopping early:** if a turn ends with steps unticked, hobkin says "carry
+    on with step N" once, not the wrap-up check. The wrap-up's "all done?" is
+    for a finished goal. Under drive, hobkin pushes every time (see `/drive`).
+  - **Waiting:** `{"waiting": "the staging check"}` says it can't go on until
+    someone or something acts. Nothing pushes it until a message or reminder
+    arrives.
   - **Sub-goals:** when you ask for something mid-task, the agent doesn't drop
     its goal: `{"subgoal": ..., "why": ..., "steps": [...]}` (optionally
     `"before_step": N`) adds a sub-goal it works on first, shown in the checklist
