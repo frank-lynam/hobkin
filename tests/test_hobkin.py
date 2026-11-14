@@ -822,6 +822,9 @@ try:
           hb.clip("running `" + "x" * 80 + "`", 20, 0) == "running `xxxxxxxxxx…", hb.clip("x" * 80, 20, 0))
     ctx_s1 = open(hs + "/s1/context.jsonl").read()
     check("[chat] agents are asked to backtick file names and paths", "put file names, paths, commands, ids" in ctx_s1)
+    check("[prompt] the default personality tests lightly, asks before any test harness, hands validation over",
+          "**YOLO on testing.**" in ctx_s1 and "Never build a test harness without asking" in ctx_s1
+          and "**Team up on validation.**" in ctx_s1 and "verify the whole result" not in ctx_s1, ctx_s1[:300])
     # Opening a chat asks the agent to say hello first
     run("send", "s1", "/hello /home/frank/projects/site")
     for _ in range(50):
