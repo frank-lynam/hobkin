@@ -154,6 +154,8 @@ try:
             os.write(fd, b"dropped-by-ctrl-c"); time.sleep(0.3); os.write(fd, b"\x03"); time.sleep(0.5)
             os.write(fd, b"after ctrl-c\r")
             cc = pump(lambda b: b"echo: after ctrl-c" in b)
+            check(f"[{api}] chat (terminal) a rule above each message you send",
+                  "─".encode() * 10 in cc.split(b"> after ctrl-c")[-1].split(b"echo: after ctrl-c")[0], cc[-400:])
             check(f"[{api}] chat (terminal) Ctrl-C drops the typed line and stays, no KeyboardInterrupt",
                   b"echo: after ctrl-c" in cc and b"^C" in cc and b"KeyboardInterrupt" not in cc
                   and "echo: dropped-by-ctrl-c" not in open(d + "/out").read(), cc[-400:])
@@ -793,19 +795,31 @@ try:
     r = run("chat", "s1", input="/models\n")
     check("[setup] /models lists them in a chat, the one in use starred", re.search(r"\* fake +100k context", r.stdout), r.stdout)
     r = run("chat", "s1", input="run: echo hidden-out-$((40+2))\n")
-    check("[chat] tool calls show as one line, their output hidden", "$> echo hidden-out-$((40+2))" in r.stdout
+    check("[chat] tool calls are hidden, the reply shown", "$>" not in r.stdout and "=>" not in r.stdout
           and "    hidden-out-42" not in r.stdout and "s1> Done. Output was: hidden-out-42" in r.stdout, r.stdout)
     check("[chat] piped chat stays plain text (no colour codes)", "\x1b[" not in r.stdout, repr(r.stdout[:200]))
     sys.path.insert(0, os.path.join(HERE, ".."))
     import hobkin as hb
     painted = "\n".join(hb.chat_view(["2026-10-24 10:00:00 agent> **Done.** Fixed `parse()` in tests/a.py, see https://x.io/y.",
-                                       "2026-10-24 10:00:01 => (exit code 1; now in ~/w)"], "frank> ", False, {}, True, "s1"))
+                                       "2026-10-24 10:00:01 => (exit code 1; now in ~/w)"], "frank> ", True, {}, True, "s1"))
     check("[chat] colour on a terminal: code and file paths green, bold, links underlined, failures red",
           "\x1b[32mparse()\x1b[0m" in painted and "\x1b[32mtests/a.py\x1b[0m" in painted and "\x1b[1mDone.\x1b[0m" in painted
           and "\x1b[4mhttps://x.io/y\x1b[0m." in painted and "\x1b[31m=> (exit code 1" in painted
           and "s1>" in painted and "agent>" not in painted, repr(painted))
     r = run("chat", "s1", "--full", input="run: echo shown-out-$((40+3))\n")
-    check("[chat] --full shows tool output too", "    shown-out-43" in r.stdout, r.stdout)
+    check("[chat] --full shows tool calls and their output", "$> echo shown-out-$((40+3))" in r.stdout
+          and "    shown-out-43" in r.stdout, r.stdout)
+    view = hb.chat_view(["2026-10-24 10:00:00 hobkin> compacting context (full)",
+                         "2026-10-24 10:00:05 hobkin> compacted; note:", "    the secret handoff note",
+                         "2026-10-24 10:00:06 frank> what now?", "2026-10-24 10:00:07 agent> carrying on"],
+                        "\0", False, {}, False, "s1", ("frank", "-----"))
+    check("[chat] compaction's note is hidden (that it's compacting shows); a rule above your messages",
+          view == ["10:00:00 hobkin> compacting context (full)", "-----", "10:00:06 frank> what now?",
+                   "10:00:07 s1> carrying on"], view)
+    full_view = hb.chat_view(["2026-10-24 10:00:05 hobkin> compacted; note:", "    the secret handoff note"], "\0", True, {})
+    check("[chat] --full shows compaction's note", "    the secret handoff note" in full_view, full_view)
+    check("[chat] a one-line clip is the start and …, not the whole text again",
+          hb.clip("running `" + "x" * 80 + "`", 20, 0) == "running `xxxxxxxxxx…", hb.clip("x" * 80, 20, 0))
     ctx_s1 = open(hs + "/s1/context.jsonl").read()
     check("[chat] agents are asked to backtick file names and paths", "put file names, paths, commands, ids" in ctx_s1)
     # Opening a chat asks the agent to say hello first
@@ -819,7 +833,7 @@ try:
           and "from /home/frank/projects/site (their terminal's folder" in c1, c1[-400:])
     # Four steps out loud: a file change before a plan's been said isn't run (once); planning files always are
     r = run("chat", "s1", input='noplan-call: write_file {"path": "fix.txt", "content": "x"}\n')
-    check("[steps] a file change before **What would:** is said isn't run, and says why", "not run: no plan said yet" in r.stdout
+    check("[steps] a file change before **What would:** is said isn't run, and says why", "not run: no plan said yet" in open(hs + "/s1/out").read()
           and not os.path.exists(hs + "/s1/work/fix.txt"), r.stdout)
     r = run("chat", "s1", input='noplan-call: write_file {"path": "CHECKLIST.md", "content": "- [ ] x"}\n')
     check("[steps] the checklist (part of planning) can always be written", os.path.exists(hs + "/s1/work/CHECKLIST.md"), r.stdout)

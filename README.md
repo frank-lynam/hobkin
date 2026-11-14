@@ -124,11 +124,13 @@ there but not write.
 
 In a terminal it's in colour, so things are easy to find when you scroll back:
 its name in magenta, file names, paths and `code` in green, **bold** in
-bold, links underlined, tool calls dimmed and failed commands in red (agents are
-asked to put names of things in backticks for this). Piped, or with `NO_COLOR`
-set, it's plain text. Its replies appear as they come, and each tool call as one line (a command, a file
-read, a failed exit status), without its output; `hobkin chat ID --full` shows the
-output too, as the `out` file has it. Each line you type is sent; lines you paste
+bold, links underlined (agents are asked to put names of things in backticks
+for this). Piped, or with `NO_COLOR` set, it's plain text. Its replies appear as
+they come; tool calls are hidden (the status line says what it's running), and
+so is the handoff note compaction writes. `hobkin chat ID --full` shows them
+all, tool calls dimmed with their output and failed commands in red, as the
+`out` file has it. A line is drawn above each message you send, so yours stand
+out when you scroll back. Each line you type is sent; lines you paste
 arrive together and become one message (the chat says "(5 lines, sent as one
 message)"), though a pasted line that's exactly a command, such as `/stop`, still
 runs as one. `/stop` and the other commands work, Ctrl-C drops what you've typed

@@ -977,9 +977,12 @@ def result_text(content) -> str:
 
 
 def clip(text: str, head: int, tail: int) -> str:
-    """Text with its middle cut out if it's longer than head + tail characters."""
+    """Text with its middle cut out if it's longer than head + tail characters. With tail 0, just its first
+    head characters and "…" (for one-line uses: a status, a log line)."""
     if len(text) <= head + tail:
         return text
+    if not tail:
+        return text[:max(head - 1, 0)] + "…"
     return f"{text[:head]}\n...[{len(text) - head - tail} characters cut]...\n{text[-tail:]}"
 
 
@@ -5107,8 +5110,8 @@ def cmd_send(agent_id, text):
 
 
 # --- chat: the view of the out log, colour, and the terminal (readline hooks, arrows, the status line)
-# Out-log entries that are tool calls (chat shows them as one line): bash's command and result, every
-# other tool by name, finished jobs, reminders. Everything else is talk: shown in full.
+# Out-log entries that are tool calls (chat hides them unless --full): bash's command and result, every
+# other tool by name, finished jobs, reminders. Everything else is talk: shown in full (but compaction's note).
 TOOL_WHO = ({"$", "=", "job", "reminder", "hold", "notify"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
 
 
@@ -5153,28 +5156,36 @@ def paint_header(line: str, who: str, text: str, own: str, name: str | None = No
     return f'{a["dim"]}{clock}{a["off"]} {label}{name if who == "agent" and name else who}>{a["off"]} {body}'
 
 
-def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False, name: str | None = None) -> list[str]:
+def chat_rule(color: bool = False) -> str:
+    """The line chat draws above each message you send, so yours stand out among the agent's."""
+    rule = "─" * max(min(shutil.get_terminal_size().columns - 1, 100), 10)
+    return ANSI["dim"] + rule + ANSI["off"] if color else rule
+
+
+def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False, name: str | None = None,
+              rule_for: tuple[str, str] | None = None) -> list[str]:
     """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's (under its
-    `name`, so you know which hobkin it is) and hobkin's in full, and each tool call as one line, its output
-    hidden (a failed command's status stays). `full` shows everything; `color` adds terminal colours. `st`
-    carries the current entry between calls."""
+    `name`, so you know which hobkin it is) and hobkin's in full; tool calls and compaction's handoff note
+    hidden. `full` shows everything (each tool call with its output); `color` adds terminal colours. With
+    `rule_for` (who, rule), each message from `who` gets `rule` above it. `st` carries the current entry
+    between calls."""
     shown = []
     for line in lines:
         if not line.startswith("    "):
             who, _, text = line[20:].partition("> ")
             st["who"] = who
             st["mine"] = line[20:].startswith(own)
-            if full or who not in TOOL_WHO:
+            if full:
                 st["keep"] = "all"
-            elif who == "=":
-                st["keep"] = "none" if text.startswith("(exit code 0;") else "head"
+            elif who in TOOL_WHO or (who == "hobkin" and text.startswith("compacted; note:")):
+                st["keep"] = "none"
             else:
-                st["keep"] = "head"
+                st["keep"] = "all"
             if st["mine"] or st["keep"] == "none":
                 continue
+            if rule_for and who == rule_for[0]:
+                shown.append(rule_for[1])
             line = line[11:]                                     # drop the date
-            if st["keep"] == "head" and len(line) > 110:
-                line = line[:109] + "…"
             if color:
                 who_, _, text_ = line[9:].partition("> ")
                 line = paint_header(line, who_, text_, own, name)
@@ -5212,7 +5223,7 @@ def cmd_chat(agent_id, full=False):
     """Talk to a running agent in one terminal: its output appears as it comes, and each line
     you type (or paste) is sent. In a terminal, readline gives line editing and history (up
     arrow), and output never overwrites what you're typing. Piped input: send it all, print
-    the reply, exit. Tool calls show as one line each unless `full`."""
+    the reply, exit. Tool calls are hidden unless `full`."""
     d = os.path.join(HOME, valid_id(agent_id))
     if not os.path.isdir(d) or not is_running(d):
         sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin {agent_id})")
@@ -5224,7 +5235,9 @@ def cmd_chat(agent_id, full=False):
         raw = f.read().decode(errors="replace").splitlines()
         pos = f.tell()
     color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-    recent = chat_view(raw[-400:], "\0", full, {}, color, agent_id)[-12:]     # the recent past, your own lines included
+    me = own[:-2]
+    recent = chat_view(raw[-400:], "\0", full, {}, color, agent_id,      # the recent past, your own lines included
+                       (me, chat_rule(color)) if sys.stdin.isatty() else None)[-12:]
     st = {}
     short = lambda line: line                                  # chat_view has already shaped the lines
 
@@ -5479,6 +5492,18 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
         lib.rl_forced_update_display()
         look["next"] = 0.0
 
+    def rule_above(rows_typed: int) -> None:
+        """Enter: a rule above what was just typed, so your messages stand out. The status line over it becomes
+        the rule; with none, a row is opened above the input for it (a new line made below first, so the
+        input never gets pushed off the bottom of the screen)."""
+        rule = chat_rule(short_color)
+        if look["status"]:
+            sys.stdout.write(f"\x1b[{rows_typed + 1}A\r\x1b[2K{rule}\r\x1b[{rows_typed + 1}B")
+            look["status"] = False
+        else:
+            sys.stdout.write(f"\n\x1b[A\x1b[{rows_typed}A\r\x1b[1L{rule}\r\x1b[{rows_typed + 1}B")
+        sys.stdout.flush()
+
     def printer():                           # without the hook: from a thread (fine unless you type mid-reply)
         while not done.is_set():
             with lock:
@@ -5500,7 +5525,11 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False
                 drop_status(0)               # still on the prompt's row: nothing was entered
                 break
             # Enter moved to the line below the input: count its rows, then the status line over them goes
-            drop_status(screen_cells(line, len(prompt), shutil.get_terminal_size().columns)[-1][0] + 1)
+            rows = screen_cells(line, len(prompt), shutil.get_terminal_size().columns)[-1][0] + 1
+            if line.strip():
+                rule_above(rows)
+            else:
+                drop_status(rows)
             if line.strip():
                 os.write(fifo, (line + "\n").encode())
     except KeyboardInterrupt:
