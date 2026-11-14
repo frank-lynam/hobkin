@@ -62,7 +62,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 
 import email.utils
 import base64
