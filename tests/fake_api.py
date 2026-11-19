@@ -61,8 +61,9 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"rate_429s": RATE["count"]})
         if self.path.startswith("/v1/models/"):
             return self.send(200, {"id": self.path.split("/")[-1], "max_input_tokens": CTX, "max_tokens": 4096})
-        if self.path == "/v1/models":
-            return self.send(200, {"data": [{"id": m, **({"context_length": CTX} if LIST_CTX else {})} for m in ("fake", "fake-costly")]})
+        if self.path == "/v1/models":     # asked the Anthropic way, it also offers a model only served that way
+            ms = ("fake", "fake-costly") + (("fake-messages-only",) if self.headers.get("anthropic-version") else ())
+            return self.send(200, {"data": [{"id": m, **({"context_length": CTX} if LIST_CTX else {})} for m in ms]})
         self.send(404, {"error": "nope"})
     def do_POST(self):
         try:
@@ -76,6 +77,8 @@ class H(BaseHTTPRequestHandler):
         tc = body.get("tool_choice")
         if body.get("model") == "fake-noforce" and (tc == "required" or isinstance(tc, dict) and tc.get("type") == "any"):
             return self.send(400, {"error": {"message": "tool_choice 'required' is not supported by this endpoint"}})
+        if body.get("model") == "fake-messages-only" and self.path.endswith("/chat/completions"):
+            return self.send(404, {"error": {"message": "The model `fake-messages-only` does not exist", "code": "model_not_found"}})
         if body.get("model") == "fake-gone":         # a model that's been withdrawn
             return self.send(404, {"error": {"message": "No endpoints found for fake-gone.", "code": 404}})
         size = len(json.dumps(body)) // 4

@@ -876,7 +876,8 @@ try:
           and acfg["model"] == "fake-costly" and acfg["models"]["fake-costly"]["key_file"] == key_file
           and json.load(open(hs + "/s1/state.json"))["model"].startswith("fake-costly"), r.stdout + json.dumps(acfg))
     r = run("chat", "s1", input="/model\n")
-    check("[model] /model alone lists the configured ones", re.search(r"configured \(\* = in use\):.* fake, \*fake-costly$", r.stdout, re.M), r.stdout)
+    check("[model] /model alone lists the configured ones, each with its model and service",
+          re.search(r"configured \(\* = in use\):.* fake \(fake at 127\.0\.0\.1:48702\), \*fake-costly \(fake-costly at 127\.0\.0\.1:48702\)", r.stdout), r.stdout)
     r = run("chat", "s1", input="/model fake anthropic\nstyle switch hi\n")
     acfg = json.load(open(hs + "/s1/config.json"))
     sent = [json.loads(l) for l in open(LOG) if "style switch hi" in l]
@@ -1740,6 +1741,46 @@ try:
             subprocess.run(["systemctl", "--user", "daemon-reload"])
     else:
         print("SKIP [service] no systemd user session here")
+    # The same model on two services: /model NAME @SERVICE picks the service, and never mistakes one for the other
+    h = home("services", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    cfg = json.load(open(h + "/_shared/config.json"))
+    cfg["models"]["other"] = {"api": "openai", "base_url": "http://localhost:48702/v1", "model": "fake", "key_env": "TESTKEY"}
+    json.dump(cfg, open(h + "/_shared/config.json", "w"))
+    p, aid, d = start(h)
+    acfg = lambda: json.load(open(d + "/config.json")) if os.path.exists(d + "/config.json") else {}
+    say(d, "/model fake-costly @localhost"); wait_for(d, "switched from", 20)
+    e1 = acfg().get("models", {}).get("fake-costly", {})
+    say(d, "/model fake-costly @127.0.0.1"); wait_for(d, "to fake-costly@127.0.0.1", 20)
+    e2 = acfg().get("models", {}).get("fake-costly@127.0.0.1", {})
+    check("[model] /model NAME @SERVICE: the same model on another service gets its own entry, named for its host",
+          e1.get("base_url") == "http://localhost:48702/v1" and e2.get("base_url") == "http://127.0.0.1:48702/v1"
+          and acfg().get("model") == "fake-costly@127.0.0.1", acfg())
+    say(d, "/model fake-costly@localhost")
+    for _ in range(100):                                 # (the log already says this from the first switch)
+        if acfg().get("model") == "fake-costly": break
+        time.sleep(0.2)
+    check("[model] NAME@SERVICE works too, and an entry on the same service is reused, not duplicated",
+          acfg().get("model") == "fake-costly" and len([n for n in acfg()["models"] if n.startswith("fake-costly")]) == 2, acfg())
+    say(d, "/model fake @nowhere"); wait_for(d, "no service matches 'nowhere'", 20)
+    check("[model] a service that matches nothing says what there is", "localhost:48702" in open(d + "/out").read().split("no service matches")[-1])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+    # A model the OpenAI-style endpoint doesn't know (404): tried the Anthropic way on the same host, once
+    h = home("style404", {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake-messages-only", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    p, aid, d = start(h)
+    say(d, "hello by messages")
+    ok = True
+    try:
+        wait_for(d, "echo: hello by messages", 30)
+    except AssertionError:
+        ok = False
+    out = open(d + "/out").read()
+    check("[model] a 404 from the OpenAI-style endpoint: the Anthropic style on the same host is tried, and used",
+          ok and "doesn't know fake-messages-only (404), so trying the Anthropic style" in out
+          and json.load(open(d + "/config.json"))["models"][json.load(open(d + "/config.json"))["model"]]["api"] == "anthropic", out[-800:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # A model that stops early (says what it'll do next, then stops): without drive it gets one "carry on"; /drive
     # pushes it on every time with a tool call required, until the goal's steps are all ticked, then turns off
     def st_of(d): return json.load(open(d + "/state.json"))

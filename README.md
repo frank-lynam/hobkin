@@ -268,7 +268,7 @@ line that is just one of these is a command instead:
 | `/reminders` | Write its reminders to `out`. |
 | `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
 | `/drive [on\|off]` | Drive mode, for a model that stops before it's done. Each time the agent stops with its goal's steps unticked, it's pushed on, and its next reply must make a tool call (`tool_choice` required). It keeps going until every step is ticked, then drive turns itself off. It stops early at `drive_max_pushes` (30) pushes, or when the agent says it's waiting on someone (`goal` `waiting`). Alone, `/drive` toggles. `"drive": true` in a model's entry makes it permanent for that model. |
-| `/model [NAME [anthropic\|openai]]` | Alone: the model in use and the ones configured. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). Add `anthropic` or `openai` to ask for it in that API style on the same host: `anthropic` drops a trailing `/v1` from the URL (its paths carry it), `openai` puts it back. Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
+| `/model [NAME [@SERVICE] [anthropic\|openai]]` | Alone: the model in use and the ones configured, each with its service. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). `@SERVICE` (or `NAME@SERVICE`) asks a particular service for it, named by a configured model or part of its host (`@gov`, `@openrouter`), for when several services offer models with the same name. A new entry whose name another service already uses gets `@host` added. Add `anthropic` or `openai` to ask for it in that API style on the same host: `anthropic` drops a trailing `/v1` from the URL (its paths carry it), `openai` puts it back. Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
 | `/models` | List the models the agent's API offers (the one in use starred), with their context windows. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
 | `/hello [FOLDER]` | Sent by `hobkin chat` as it opens (not logged): the agent says hello, and is told the folder you opened the chat in. |
@@ -321,6 +321,9 @@ are; if it's left out and there's only one model, that one is used.
   OpenAI-style APIs as `reasoning_effort`.
 - `extra_body` (optional): anything else your provider takes, merged into every
   request as is.
+- **A model the OpenAI-style endpoint doesn't know** (a 404) is tried once the Anthropic way on the same host
+  (`/v1` dropped). If the host offers it there, the agent switches and says so; otherwise it goes on to
+  `fallback_models`, or pauses.
 - `drive` (optional): `true` for a model that keeps stopping mid-task (some
   self-hosted or gateway models emit end-of-turn too early). It's always driven,
   as with `/drive`: pushed on whenever it stops with its goal unfinished, with a

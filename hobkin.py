@@ -2216,41 +2216,84 @@ class Agent:
         self.discover_limits()
         self.save_state()
 
+    CONNECTION = ("api", "base_url", "key_env", "key_file", "headers")
+
+    def service_of(self, where: str):
+        """A connection (a model entry's api, URL and key) by an entry's name, or by part of its host. Returns
+        (entry, None), or (None, why not)."""
+        if where in self.cfg["models"]:
+            return self.cfg["models"][where], None
+        hits = {}
+        for n, e in self.cfg["models"].items():
+            host = urllib.parse.urlparse(e.get("base_url", "")).netloc
+            if where.lower() in host.lower():
+                hits.setdefault(e.get("base_url"), e)
+        if len(hits) == 1:
+            return next(iter(hits.values())), None
+        if not hits:
+            return None, (f"no service matches {where!r}: name a configured model, or part of a host ("
+                          + ", ".join(sorted({urllib.parse.urlparse(e.get('base_url', '')).netloc for e in self.cfg['models'].values()}))
+                          + ")")
+        return None, f"{where!r} matches several services ({', '.join(sorted(hits))}): be more specific"
+
     def switch_model(self, wanted: str) -> str:
-        """/model NAME [anthropic|openai]: a configured model, else a model the current API offers (it gets a
-        config entry like the current one's). With a style, the model is asked for in that API style on the
-        same host: anthropic drops a trailing /v1 from the URL (its paths carry it), openai puts it back.
+        """/model NAME [@WHERE] [anthropic|openai]: a configured model, else a model a service offers (it gets a
+        config entry with that service's connection). WHERE picks the service, by a configured model's name or part
+        of its host (also NAME@WHERE); without it, the current one. With a style, the model is asked for in that API
+        style on the same host: anthropic drops a trailing /v1 from the URL (its paths carry it), openai puts it back.
         Saved in this agent's config.json, so it lasts; returns what happened."""
-        parts, api = wanted.split(), None
-        if len(parts) == 2 and parts[1].lower() in ("anthropic", "openai"):
-            wanted, api = parts[0], parts[1].lower()
-        elif len(parts) != 1:
-            return f"/model takes a name and, if you like, an API style: /model NAME [anthropic|openai] (not {wanted!r})"
-        name, entry, configured = wanted, None, self.cfg["models"].get(wanted)
+        parts, api, where = wanted.split(), None, None
+        if parts and parts[-1].lower() in ("anthropic", "openai"):
+            api, parts = parts[-1].lower(), parts[:-1]
+        if len(parts) == 2 and parts[1].startswith("@"):
+            parts, where = parts[:1], parts[1][1:]
+        elif len(parts) == 1 and "@" in parts[0] and parts[0] not in self.cfg["models"]:
+            m, _, w = parts[0].rpartition("@")
+            parts, where = [m], w
+        if len(parts) != 1 or where == "":
+            return ("/model takes a name, and if you like a service and an API style: /model NAME [@SERVICE] "
+                    f"[anthropic|openai] (not {wanted!r})")
+        wanted = parts[0]
+        base_entry = self.model.cfg
+        if where is not None:
+            base_entry, why = self.service_of(where)
+            if base_entry is None:
+                return why
+        configured = self.cfg["models"].get(wanted) if where is None else None
+        name, entry = wanted, None
         if configured is None or (api and configured.get("api", "openai") != api):
-            entry = {**{k: v for k, v in self.model.cfg.items() if k in ("api", "base_url", "key_env", "key_file", "headers")},
-                     "model": wanted}
-            if api and api != self.model.api:
-                base = self.model.base
+            entry = {**{k: v for k, v in base_entry.items() if k in self.CONNECTION}, "model": wanted}
+            if api and api != entry.get("api", "openai"):
+                base = entry["base_url"].rstrip("/")
                 entry["base_url"] = re.sub(r"/v1$", "", base) if api == "anthropic" else \
                     base if re.search(r"/v\d+$", base) else base + "/v1"
                 entry["api"] = api
             if entry.get("api") == "anthropic":   # its API requires max_tokens: say so in the entry, where it shows
-                entry["max_output_tokens"] = self.model.cfg.get("max_output_tokens") or ANTHROPIC_MAX_TOKENS
-            target = Model(wanted, entry)
-            try:
-                offered = [i for i, _ in target.list_models()]
-            except (urllib.error.URLError, OSError, ValueError):
-                offered = None
-            if offered is not None and wanted not in offered:
-                near = difflib.get_close_matches(wanted, list(self.cfg["models"]) + offered, n=5, cutoff=0.4)
-                return (f"no model {wanted!r}: it's not in your config, and {target.base} doesn't offer it"
-                        + (f" ({target.api} style)" if api else "")
-                        + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
-            name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
-            if name in self.cfg["models"] and self.cfg["models"][name].get("api", "openai") != entry.get("api", "openai"):
-                name += "-" + entry["api"]    # the same model in the other style gets its own entry
-            self.cfg["models"][name] = entry
+                entry["max_output_tokens"] = base_entry.get("max_output_tokens") or ANTHROPIC_MAX_TOKENS
+            same = next((n for n, e in self.cfg["models"].items()   # this model on this service is configured already
+                         if e.get("model") == wanted and e.get("base_url", "").rstrip("/") == entry["base_url"].rstrip("/")
+                         and e.get("api", "openai") == entry.get("api", "openai")), None)
+            if same:
+                name, entry = same, None
+            else:
+                target = Model(wanted, entry)
+                try:
+                    offered = [i for i, _ in target.list_models()]
+                except (urllib.error.URLError, OSError, ValueError):
+                    offered = None
+                if offered is not None and wanted not in offered:
+                    near = difflib.get_close_matches(wanted, list(self.cfg["models"]) + offered, n=5, cutoff=0.4)
+                    return (f"no model {wanted!r}: it's not in your config, and {target.base} doesn't offer it"
+                            + (f" ({target.api} style)" if api else "")
+                            + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
+                name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
+                taken = self.cfg["models"].get(name)
+                if taken and (taken.get("base_url", "").rstrip("/") != entry["base_url"].rstrip("/")
+                              or taken.get("api", "openai") != entry.get("api", "openai")):
+                    host = urllib.parse.urlparse(entry["base_url"]).netloc.split(":")[0].split(".")
+                    host = host[-2] if len(host) > 1 and not host[-1].isdigit() else ".".join(host)
+                    name = f"{name}@{host}" + ("-" + entry["api"] if f"{name}@{host}" in self.cfg["models"] else "")
+                self.cfg["models"][name] = entry
         if name == self.model.name:
             return f"already on {self.model.describe()}"
         path = self.p("config.json")
@@ -2267,6 +2310,23 @@ class Agent:
         self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in self.cfg["models"] and f != name]
         return (f"switched from {old} to {self.model.describe()}, context {self.state.get('context_tokens') or 'unknown'} "
                 f"(saved in {path})")
+
+    def try_other_style(self) -> bool:
+        """The OpenAI-style endpoint doesn't know this model (404): some services offer a model only the Anthropic
+        way, on the same host. Tried once per model and host; True if it switched."""
+        if self.model.api != "openai":
+            return False
+        key = f"{self.model.base}|{self.model.model}"
+        tried = self.state.setdefault("style_tried", [])
+        if key in tried:
+            return False
+        tried.append(key)
+        said = self.switch_model(f"{self.model.model} anthropic")
+        if not said.startswith("switched"):
+            return False
+        self.log("hobkin", f"the OpenAI-style endpoint doesn't know {self.model.model} (404), so trying the Anthropic "
+                 f"style on the same host: {said}")
+        return True
 
     def refresh_limits(self, why: str) -> None:
         """Ask the API for the limits again: windows can change (a local server restarted with another
@@ -2867,9 +2927,12 @@ class Agent:
         elif cmd == "/compact":
             self.compact_requested = True   # done between steps, never mid-command
         elif cmd == "/model":
-            names = ", ".join(("*" if n == self.model.name else "") + n for n in self.cfg["models"])
+            names = ", ".join(("*" if n == self.model.name else "") + n
+                              + f" ({e.get('model')} at {urllib.parse.urlparse(e.get('base_url', '')).netloc})"
+                              for n, e in self.cfg["models"].items())
             self.log("hobkin", f"model: {self.model.describe()}\nconfigured (* = in use): {names}\n"
                      "/model NAME switches to one of those, or to any model this API offers (/models lists them);\n"
+                     "/model NAME @SERVICE asks a particular service for it (a configured model's name, or part of its host);\n"
                      "/model NAME anthropic (or openai) asks for it in that API style on the same host")
         elif cmd == "/models":
             self.models_requested = True    # asked between steps (it's an HTTP call)
@@ -4862,6 +4925,8 @@ class Agent:
                 else:
                     self.refresh_limits("model said the context is too long")     # it may have shrunk
                 self.compact("model said the context is too long")
+                return
+            if e.status == 404 and self.try_other_style():     # a model some services offer only the Anthropic way
                 return
             hint = (f"\nThe API refused the key for model {self.model.describe()}: "
                     "check it, and check \"model\" in config.json picks the API you meant.") if e.status in (401, 403) else ""
