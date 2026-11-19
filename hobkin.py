@@ -465,7 +465,8 @@ When you mess up (wrong folder, wrong flag, a test you broke, a misread task),
 add one line: `- ` then what happened, told for laughs, then `Lesson:` and
 what you'll do differently.
 It's comedy, but it's also how you stop making the same mistake twice, so
-keep it to your best (most useful) 30 or so.
+keep it to your best (most useful) 40 or so. Past 60, hobkin asks you to cut it back to
+about 36 in one go; it's a rough number, so don't spend effort trimming to the line.
 
 ## Keeping organized
 
@@ -485,7 +486,8 @@ keep it to your best (most useful) 30 or so.
   get lost. If you'll need it later, write it down.
 - It's a sketch of where you were, not the truth: use it to know where to
   look, then look. Anything that's changed since, fix it here.
-- Keep it short (under 40 lines) and true: the current task and step, facts
+- Keep it short (aim for under 80 lines; past 160, hobkin asks you to cut it back to about 96
+  in one go, roughly, not to the line) and true: the current task and step, facts
   you'll need again (paths, ids, decisions, what people prefer), and
   lessons learned ("tests need `make deps` first").
 - Update it when you start a task, finish an important step, or learn
@@ -742,7 +744,10 @@ COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
-LINE_LIMITS = {"MEMORY.md": ("memory", 80), "BLOOPERS.md": ("blooper reel", 30)}
+LINE_LIMITS = {"MEMORY.md": ("memory", 160), "BLOOPERS.md": ("blooper reel", 60)}
+# Hysteresis: past its limit, a file is cut back to this share of it in one go, so a line or two more doesn't bring
+# the nudge straight back (and nobody spends tokens trimming to the exact line)
+PRUNE_TO = 0.6
 # After a direct message, idle prompts wait this long: someone's talking with it (the tests shorten it)
 CHAT_QUIET = float(os.environ.get("HOBKIN_CHAT_QUIET", 5 * 60))
 KEEP_DAYS = 30            # old archives (contexts, out logs) and finished jobs' folders are deleted after this
@@ -806,8 +811,9 @@ COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehens
                    "enterprise-grade", "paradigm", "actionable insight", "going forward", "in conclusion")
 
 
-PRUNE = ("[hobkin: your {what} is {n} lines, over its {limit}-line limit. Prune it: keep what still earns its "
-         "place, merge repeats, cut what's stale or fixed. Then carry on.]")
+PRUNE = ("[hobkin: your {what} is {n} lines, past its {limit}-line limit. Cut it back to about {target} lines in one "
+         "go (roughly: no need to count): keep what still earns its place, merge repeats, cut what's stale or fixed. "
+         "Then carry on; it won't come up again until it's past {limit}.]")
 
 
 PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: **How it works:** what you "
@@ -2711,7 +2717,7 @@ class Agent:
             data, ok = self.load_reminders()
             if ok and data["items"]:
                 parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
-        over = {f: PRUNE.format(what=w, n=n, limit=lim) + "\n\n" for f, w, n, lim in self.over_limit()}
+        over = {f: PRUNE.format(what=w, n=n, limit=lim, target=int(lim * PRUNE_TO)) + "\n\n" for f, w, n, lim in self.over_limit()}
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\nA sketch of where you were, not the truth: check the "
                      f"real thing before you act on it, and enjoy catching it out.\n\n{over.get('MEMORY.md', '')}"
@@ -2722,12 +2728,15 @@ class Agent:
         return "\n\n---\n\n".join(parts)
 
     def over_limit(self) -> list[tuple[str, str, int, int]]:
-        """(file, what, lines, limit) for each always-shown file that's grown past its limit."""
-        out = []
+        """(file, what, lines, limit) for each always-shown file that's grown past its limit. A file that's back
+        under it is forgotten, so the next time it grows past, it's flagged afresh."""
+        out, flagged = [], self.state.setdefault("prune_nudged", [])
         for f, (what, limit) in LINE_LIMITS.items():
             n = len([l for l in read(self.p(f)).splitlines() if l.strip()])
             if n > limit:
                 out.append((f, what, n, limit))
+            elif f in flagged:
+                flagged.remove(f)
         return out
 
     def load_context(self):
@@ -4245,9 +4254,11 @@ class Agent:
                 and len(committee_speak(str(prose))) >= 3:
             content += f"\n{COMMITTEE}"                    # writing for people that lost its voice
         said = json.dumps(inp)
-        for f, what, n, limit in self.over_limit():     # working on a file that's grown too long
-            if f in said or f.split(".")[0] in said:
-                content += "\n" + PRUNE.format(what=what, n=n, limit=limit)
+        flagged = self.state.setdefault("prune_nudged", [])
+        for f, what, n, limit in self.over_limit():     # working on a file that's grown too long: said once a
+            if (f in said or f.split(".")[0] in said) and f not in flagged:          # time, not on every edit
+                content += "\n" + PRUNE.format(what=what, n=n, limit=limit, target=int(limit * PRUNE_TO))
+                flagged.append(f)
         return content
 
     def reply_check(self, blocks: list) -> str | None:

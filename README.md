@@ -165,8 +165,8 @@ tmux, or a systemd user service.
 | `in` | A named pipe. `echo text > in` sends a message. A write waits until the agent is running; `hobkin send ID text` queues it instead. |
 | `out` | Everything it says and does since the last compaction, with timestamps: messages, commands, output. At each compaction it's moved to `archive/` and starts afresh. `tail -F out` |
 | `context.jsonl` | Exactly what the model is sent: line 1 is the system prompt, then one message per line. Rewritten after every change. |
-| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 80 lines, it's told to prune. |
-| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 30 lines, it's told to keep the best. |
+| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 160 lines, it's told to cut it back to about 96 in one go (a 40% margin, so it isn't nagged again for a line or two; told once, not on every edit). |
+| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 60 lines, it's told to keep the best, about 36, in one go. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. `work/tools/` holds tools it made itself (see "Its tools"); in break-glass mode, `work/incident-*.md` is the incident's timeline. |
 | `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |

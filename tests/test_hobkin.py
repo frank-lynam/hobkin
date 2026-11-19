@@ -713,7 +713,7 @@ try:
     json.dump(cfg, open(h + "/_shared/config.json", "w"))
     d = os.path.join(h, "longlived"); os.makedirs(d + "/archive"); os.makedirs(d + "/jobs/1")
     json.dump({"last_step": time.time() - 3 * 86400 - 7200}, open(d + "/state.json", "w"))
-    open(d + "/BLOOPERS.md", "w").write("".join(f"- slip {i}\n" for i in range(40)))
+    open(d + "/BLOOPERS.md", "w").write("".join(f"- slip {i}\n" for i in range(70)))
     old = time.time() - 40 * 86400
     for n in ("context-20200101-000000.jsonl", "out-20200101-000000.log", "context-20200102-000000.jsonl"):
         open(f"{d}/archive/{n}", "w").write("{}\n"); os.utime(f"{d}/archive/{n}", (old, old))
@@ -733,10 +733,29 @@ try:
           and json.load(open(d + "/state.json"))["model"].startswith("n2"), out[-600:])
     alerts = open(os.path.join(BASE, "alerts.txt")).read()
     check("[alert] the switch is announced through alert_command", "model m (fake-gone via" in alerts and "switched to n2" in alerts, alerts)
-    check("[limits] an overgrown blooper reel is flagged in the prompt", "your blooper reel is 40 lines, over its 30-line limit"
+    check("[limits] an overgrown blooper reel is flagged in the prompt, with a target 40% under the limit (hysteresis)",
+          "your blooper reel is 70 lines, past its 60-line limit. Cut it back to about 36 lines in one go (roughly"
           in ctx(d)[0]["content"] and "your memory is" not in ctx(d)[0]["content"])
     say(d, 'call: read_file {"path": "$HOBKIN_BLOOPERS"}'); wait_for(d, "BLOOPERS.md:     1|")
-    check("[limits] and nudged when it opens it", "over its 30-line limit. Prune it" in last_results(d)["content"][0]["content"])
+    check("[limits] and nudged when it opens it", "past its 60-line limit. Cut it back to about 36"
+          in last_results(d)["content"][0]["content"])
+    n_results = lambda: len([m for m in ctx(d) if m["role"] == "user" and any(b.get("type") == "tool_result" for b in m["content"])])
+    before = n_results()
+    say(d, 'call: read_file {"path": "$HOBKIN_BLOOPERS"}')
+    for _ in range(100):                                 # the second read's result (the log already has the first)
+        if n_results() > before: break
+        time.sleep(0.2)
+    check("[limits] said once while it's over, not on every touch (no trimming to the line)",
+          "Cut it back" not in last_results(d)["content"][0]["content"])
+    open(d + "/BLOOPERS.md", "w").write("".join(f"- slip {i}\n" for i in range(40)))     # cut back
+    before = n_results()
+    say(d, 'call: read_file {"path": "$HOBKIN_BLOOPERS"}')
+    for _ in range(100):
+        if n_results() > before: break
+        time.sleep(0.2)
+    check("[limits] cut back under the limit: no nudge, and nothing comes back until it's past the limit again",
+          "Cut it back" not in last_results(d)["content"][0]["content"] and "Cut it back" not in ctx(d)[0]["content"]
+          and "BLOOPERS.md" not in json.dumps(json.load(open(d + "/state.json")).get("prune_nudged")), last_results(d)["content"][0]["content"][-300:])
     say(d, "run: echo $PPID > pid-before && echo /restart > $HOBKIN_DIR/in"); wait_for(d, "restarting")
     for _ in range(100):
         if open(d + "/out").read().count("up:") >= 2 and json.load(open(d + "/state.json")).get("status") == "idle": break
