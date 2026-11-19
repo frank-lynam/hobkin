@@ -798,7 +798,7 @@ try:
     run = lambda *a, **k: subprocess.run([sys.executable, HOB, *a], env=env, capture_output=True, text=True, timeout=60, **k)
     r = run("models", "http://127.0.0.1:48702/v1", "sk-x")
     check("[setup] hobkin models lists an endpoint's models", "2 models at http://127.0.0.1:48702/v1" in r.stdout
-          and re.search(r"^  fake +100k context$", r.stdout, re.M), r.stdout + r.stderr)
+          and re.search(r"^ +1 +fake +100k context$", r.stdout, re.M), r.stdout + r.stderr)
     r = run("http://127.0.0.1:48702/v1", "fakr", "sk-x", "--no-service", "--id", "s1")
     check("[setup] a model the endpoint doesn't offer is refused, with the close ones", r.returncode != 0
           and "doesn't offer 'fakr'. Close: fake" in r.stderr and not os.path.exists(hs + "/s1"), r.stderr)
@@ -812,7 +812,7 @@ try:
     check("[setup] starts the agent and --chat talks to it", r.returncode == 0 and "s1> echo: hello setup" in r.stdout,
           r.stdout + r.stderr)
     r = run("chat", "s1", input="/models\n")
-    check("[setup] /models lists them in a chat, the one in use starred", re.search(r"\* fake +100k context", r.stdout), r.stdout)
+    check("[setup] /models lists them in a chat, numbered, > in use, ★ configured", re.search(r"^ +\d+ >★ fake +100k context", r.stdout, re.M), r.stdout)
     r = run("chat", "s1", input="run: echo hidden-out-$((40+2))\n")
     check("[chat] tool calls are hidden, the reply shown", "$>" not in r.stdout and "=>" not in r.stdout
           and "    hidden-out-42" not in r.stdout and "s1> Done. Output was: hidden-out-42" in r.stdout, r.stdout)
@@ -877,13 +877,28 @@ try:
           and json.load(open(hs + "/s1/state.json"))["model"].startswith("fake-costly"), r.stdout + json.dumps(acfg))
     r = run("chat", "s1", input="/model\n")
     check("[model] /model alone lists the configured ones, each with its model and service",
-          re.search(r"configured \(\* = in use\):.* fake \(fake at 127\.0\.0\.1:48702\), \*fake-costly \(fake-costly at 127\.0\.0\.1:48702\)", r.stdout), r.stdout)
+          re.search(r"configured \(> in use\):\n(.*\n)* +\d+   fake +fake at 127\.0\.0\.1:48702\n +\d+ > fake-costly +fake-costly at 127\.0\.0\.1:48702", r.stdout), r.stdout)
+    r = run("chat", "s1", input="/models @48702\n")
+    check("[model] /models @SERVICE numbers that service's models, ★ the configured, > the one in use",
+          re.search(r"^ +1  ★ fake ", r.stdout, re.M) and re.search(r"^ +2 >★ fake-costly ", r.stdout, re.M), r.stdout)
+    r = run("chat", "s1", input="/models unstar 1 2\n")
+    check("[model] unstar won't take a shared entry or the one in use", "not this agent's to remove" in r.stdout
+          and "switch to another first" in r.stdout and "fake-costly" in json.load(open(hs + "/s1/config.json"))["models"], r.stdout)
+    n_fake = next(i for i, n in enumerate(json.load(open(hs + "/_shared/config.json"))["models"], 1) if n == "fake")
+    r = run("chat", "s1", input=f"/model {n_fake}\n")
+    check("[model] /model N switches to number N of the list", json.load(open(hs + "/s1/config.json"))["model"] == "fake", r.stdout)
+    r = run("chat", "s1", input="/models unstar 2\n")
+    check("[model] /models unstar N takes it out of the agent's config", "removed (fake-costly)" in r.stdout
+          and "fake-costly" not in json.load(open(hs + "/s1/config.json"))["models"], r.stdout)
+    r = run("chat", "s1", input="/models star 2\n")
+    check("[model] /models star N adds it to the agent's config", "added as fake-costly" in r.stdout
+          and json.load(open(hs + "/s1/config.json"))["models"]["fake-costly"]["model"] == "fake-costly", r.stdout)
     r = run("chat", "s1", input="/model fake anthropic\nstyle switch hi\n")
     acfg = json.load(open(hs + "/s1/config.json"))
     sent = [json.loads(l) for l in open(LOG) if "style switch hi" in l]
     check("[model] /model NAME anthropic: the same host in Anthropic style, /v1 dropped from the URL, its own entry",
-          acfg["model"] == "fake-anthropic" and acfg["models"]["fake-anthropic"]["api"] == "anthropic"
-          and acfg["models"]["fake-anthropic"]["base_url"] == "http://127.0.0.1:48702"
+          acfg["model"] == "fake@127.0.0.1" and acfg["models"]["fake@127.0.0.1"]["api"] == "anthropic"
+          and acfg["models"]["fake@127.0.0.1"]["base_url"] == "http://127.0.0.1:48702"
           and cfg["models"]["fake"]["base_url"] == "http://127.0.0.1:48702/v1"
           and sent and sent[-1]["path"] == "/v1/messages" and "echo: style switch hi" in r.stdout, r.stdout + json.dumps(acfg))
     r = run("chat", "s1", input="/model fake-costly openai\n")
@@ -891,7 +906,7 @@ try:
     check("[model] /model NAME openai from Anthropic style puts /v1 back",
           acfg["model"] == "fake-costly" and acfg["models"]["fake-costly"]["base_url"] == "http://127.0.0.1:48702/v1", r.stdout)
     r = run("chat", "s1", input="/model fake sideways\n")
-    check("[model] /model with a second word that isn't a style says how it goes", "/model NAME [anthropic|openai]" in r.stdout, r.stdout)
+    check("[model] /model with a second word that isn't a style says how it goes", "/model NAME [@SERVICE] [anthropic|openai]" in r.stdout, r.stdout)
     run("send", "s1", "/stop")
     # --hearthboard: join a board (the fake web server plays one); a bad token is refused before anything's written
     r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-bad", "--no-service")

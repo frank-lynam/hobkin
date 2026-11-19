@@ -2067,7 +2067,7 @@ class Agent:
         self.budget_paused = False
         self.restart_requested = False
         self.limits_requested = False
-        self.models_requested = False
+        self.models_requested = None       # /models [ARGS], answered between steps (an HTTP call)
         self.model_wanted = None           # /model NAME: switched between steps
         self.owe_reply = False             # a direct message hasn't been answered yet
         self.reply_nudged = False
@@ -2254,6 +2254,11 @@ class Agent:
             return ("/model takes a name, and if you like a service and an API style: /model NAME [@SERVICE] "
                     f"[anthropic|openai] (not {wanted!r})")
         wanted = parts[0]
+        if wanted.isdigit() and wanted not in self.cfg["models"] and where is None:      # /model N: from the list
+            names = list(self.cfg["models"])
+            if not 1 <= int(wanted) <= len(names):
+                return f"no number {wanted}: /model lists 1 to {len(names)}"
+            wanted = names[int(wanted) - 1]
         base_entry = self.model.cfg
         if where is not None:
             base_entry, why = self.service_of(where)
@@ -2286,13 +2291,7 @@ class Agent:
                     return (f"no model {wanted!r}: it's not in your config, and {target.base} doesn't offer it"
                             + (f" ({target.api} style)" if api else "")
                             + (f". Close: {', '.join(near)}" if near else "") + ". /models lists what it offers")
-                name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
-                taken = self.cfg["models"].get(name)
-                if taken and (taken.get("base_url", "").rstrip("/") != entry["base_url"].rstrip("/")
-                              or taken.get("api", "openai") != entry.get("api", "openai")):
-                    host = urllib.parse.urlparse(entry["base_url"]).netloc.split(":")[0].split(".")
-                    host = host[-2] if len(host) > 1 and not host[-1].isdigit() else ".".join(host)
-                    name = f"{name}@{host}" + ("-" + entry["api"] if f"{name}@{host}" in self.cfg["models"] else "")
+                name = self.entry_name(wanted, entry)
                 self.cfg["models"][name] = entry
         if name == self.model.name:
             return f"already on {self.model.describe()}"
@@ -2310,6 +2309,84 @@ class Agent:
         self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in self.cfg["models"] and f != name]
         return (f"switched from {old} to {self.model.describe()}, context {self.state.get('context_tokens') or 'unknown'} "
                 f"(saved in {path})")
+
+    def entry_name(self, wanted: str, entry: dict) -> str:
+        """A config name for a new entry: the model's id, with @host when another service already uses that name."""
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", wanted).strip("-") or "model"
+        taken = self.cfg["models"].get(name)
+        if taken and not same_service(taken, entry):
+            host = urllib.parse.urlparse(entry["base_url"]).netloc.split(":")[0].split(".")
+            host = host[-2] if len(host) > 1 and not host[-1].isdigit() else ".".join(host)
+            name = f"{name}@{host}" + ("-" + entry["api"] if f"{name}@{host}" in self.cfg["models"] else "")
+        return name
+
+    def models_command(self, args: str) -> str:
+        """/models [@SERVICE]: what a service offers, numbered, remembered for star/unstar. /models star|unstar
+        N|ID...: add those to this agent's own config.json, or take them out of it."""
+        words = args.split()
+        if words and words[0].lower() in ("star", "unstar"):
+            return self.star(words[0].lower() == "star", words[1:])
+        if len(words) > 1 or (words and not words[0].startswith("@")):
+            return "/models [@SERVICE], or /models star N... / unstar N... (numbers from the last list)"
+        base = self.model.cfg
+        if words:
+            base, why = self.service_of(words[0][1:])
+            if base is None:
+                return why
+        conn = {k: v for k, v in base.items() if k in self.CONNECTION}
+        m = Model("list", {**conn, "model": base.get("model", "")})
+        text, ids = models_listing(m, self.cfg["models"], self.model.model if same_service(self.model.cfg, conn) else None)
+        self.state["listed"] = {"conn": conn, "ids": ids}
+        self.save_state()
+        return text + ("\n/models star N... adds those to this agent's config; unstar N... takes them out; "
+                       "/model lists your configured ones, and /model N switches" if ids else "")
+
+    def star(self, on: bool, refs: list[str]) -> str:
+        listed = self.state.get("listed") or {}
+        if not listed.get("ids"):
+            return "list a service's models first: /models [@SERVICE]"
+        if not refs:
+            return f"/models {'star' if on else 'unstar'} N... (numbers from the last list)"
+        conn, ids, said = listed["conn"], listed["ids"], []
+        path = self.p("config.json")
+        try:
+            data = json.loads(read(path) or "{}")
+        except json.JSONDecodeError as e:
+            return f"can't: {path} isn't valid JSON ({e})"
+        mine = data.setdefault("models", {})
+        for ref in refs:
+            mid = ids[int(ref) - 1] if ref.isdigit() and 1 <= int(ref) <= len(ids) else ref if ref in ids else None
+            if mid is None:
+                said.append(f"{ref}: not in the last list (1 to {len(ids)}, or a model's id)")
+                continue
+            entry = {**conn, "model": mid}
+            if on:
+                have = next((n for n, e in self.cfg["models"].items() if e.get("model") == mid and same_service(e, entry)), None)
+                if have:
+                    said.append(f"{mid}: in your config already, as {have}")
+                    continue
+                if entry.get("api") == "anthropic":
+                    entry["max_output_tokens"] = conn.get("max_output_tokens") or ANTHROPIC_MAX_TOKENS
+                name = self.entry_name(mid, entry)
+                mine[name] = self.cfg["models"][name] = entry
+                said.append(f"★ {mid}: added as {name}")
+            else:
+                local = [n for n, e in mine.items() if e.get("model") == mid and same_service(e, entry)]
+                if not local:
+                    shared = [n for n, e in self.cfg["models"].items() if e.get("model") == mid and same_service(e, entry)]
+                    said.append(f"{mid}: " + (f"in the shared config ({', '.join(shared)}), not this agent's to remove"
+                                              if shared else "not in your config"))
+                    continue
+                for n in local:
+                    if n == self.model.name:
+                        said.append(f"{mid}: in use ({n}): switch to another first")
+                        continue
+                    del mine[n]
+                    self.cfg["models"].pop(n, None)
+                    said.append(f"☆ {mid}: removed ({n})")
+        write_json(path, data)
+        self.cfg["models"].update(load_config(self.dir)["models"])    # a shared entry of the same name shows again
+        return "\n".join(said)
 
     def try_other_style(self) -> bool:
         """The OpenAI-style endpoint doesn't know this model (404): some services offer a model only the Anthropic
@@ -2897,6 +2974,9 @@ class Agent:
             elif cmd == "/drive" and line.strip().lower() in ("/drive on", "/drive off"):
                 self.log("hobkin", f"command {line.strip().lower()}")
                 self.set_drive(line.strip().lower().endswith("on"))
+            elif cmd == "/models":                     # /models @SERVICE, /models star|unstar N...
+                self.models_requested = line.strip().split(" ", 1)[1].strip()
+                self.log("hobkin", f"command /models {self.models_requested}")
             elif cmd == "/model":                      # the other command with an argument: /model NAME [STYLE]
                 self.model_wanted = line.strip().split(" ", 1)[1].strip()   # switched between steps
                 self.log("hobkin", f"command /model {self.model_wanted}")
@@ -2927,15 +3007,16 @@ class Agent:
         elif cmd == "/compact":
             self.compact_requested = True   # done between steps, never mid-command
         elif cmd == "/model":
-            names = ", ".join(("*" if n == self.model.name else "") + n
-                              + f" ({e.get('model')} at {urllib.parse.urlparse(e.get('base_url', '')).netloc})"
-                              for n, e in self.cfg["models"].items())
-            self.log("hobkin", f"model: {self.model.describe()}\nconfigured (* = in use): {names}\n"
-                     "/model NAME switches to one of those, or to any model this API offers (/models lists them);\n"
+            width = min(40, max((len(n) for n in self.cfg["models"]), default=0))
+            names = "\n".join(f"{i:>4} {'>' if n == self.model.name else ' '} {n:<{width}}  {e.get('model')} at "
+                              f"{urllib.parse.urlparse(e.get('base_url', '')).netloc}"
+                              for i, (n, e) in enumerate(self.cfg["models"].items(), 1))
+            self.log("hobkin", f"model: {self.model.describe()}\nconfigured (> in use):\n{names}\n"
+                     "/model N (or NAME) switches to one of those, or to any model this API offers (/models lists them);\n"
                      "/model NAME @SERVICE asks a particular service for it (a configured model's name, or part of its host);\n"
                      "/model NAME anthropic (or openai) asks for it in that API style on the same host")
         elif cmd == "/models":
-            self.models_requested = True    # asked between steps (it's an HTTP call)
+            self.models_requested = ""      # asked between steps (it's an HTTP call)
         elif cmd == "/limits":
             self.limits_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/restart":
@@ -4625,9 +4706,9 @@ class Agent:
         if self.limits_requested:
             self.limits_requested = False
             self.refresh_limits("/limits")
-        if self.models_requested:
-            self.models_requested = False
-            self.log("hobkin", models_text(self.model))
+        if self.models_requested is not None:
+            args, self.models_requested = self.models_requested, None
+            self.log("hobkin", self.models_command(args))
         return self.switch_now()
 
     def switch_now(self) -> bool:
@@ -5960,21 +6041,33 @@ def cmd_watch(argv):
 
 
 # --- models and setup: endpoints, arguments, the board user, configuring a model, names, starting agents
-def models_text(model: Model) -> str:
-    """What `hobkin models` and /models print: every model the API offers, the current one starred."""
+def same_service(a: dict, b: dict) -> bool:
+    """Two model entries on the same service: the same URL and API style."""
+    return a.get("base_url", "").rstrip("/") == b.get("base_url", "").rstrip("/") and a.get("api", "openai") == b.get("api", "openai")
+
+
+def models_listing(model: Model, configured: dict | None = None, in_use: str | None = None) -> tuple[str, list[str]]:
+    """What `hobkin models` and /models print: every model the API offers, numbered (/models star N acts on the
+    numbers), ★ for those in the config, > for the one in use. Returns (text, the ids in order)."""
     try:
         found = sorted(model.list_models())
     except urllib.error.HTTPError as e:
-        return f"{model.base} won't list its models (HTTP {e.code})"
+        return f"{model.base} won't list its models (HTTP {e.code})", []
     except (urllib.error.URLError, OSError, ValueError) as e:
-        return f"can't list the models at {model.base}: {e}"
+        return f"can't list the models at {model.base}: {e}", []
     if not found:
-        return f"{model.base} lists no models"
+        return f"{model.base} lists no models", []
+    have = {e.get("model") for e in (configured or {}).values() if same_service(e, model.cfg)}
     k = lambda n: f"{round(n / 1000)}k" if n >= 10000 else str(n)
     width = min(60, max(len(i) for i, _ in found))
-    lines = [f"{'*' if i == model.model else ' '} {i:<{width}}  {k(ctx) + ' context' if ctx else ''}".rstrip()
-             for i, ctx in found]
-    return f"{len(found)} model{'' if len(found) == 1 else 's'} at {model.base} (* = in use):\n" + "\n".join(lines)
+    lines = [f"{n:>4} {'>' if i == in_use else ' '}{'★' if i in have else ' '} {i:<{width}}  {k(ctx) + ' context' if ctx else ''}".rstrip()
+             for n, (i, ctx) in enumerate(found, 1)]
+    return (f"{len(found)} model{'' if len(found) == 1 else 's'} at {model.base} (★ in your config, > in use):\n"
+            + "\n".join(lines)), [i for i, _ in found]
+
+
+def models_text(model: Model, configured: dict | None = None) -> str:
+    return models_listing(model, configured, model.model)[0]
 
 
 def endpoint_model(url: str, model: str, key: str | None, api: str | None) -> Model:
@@ -6026,7 +6119,7 @@ def cmd_models(argv):
     name = pos[0] if pos else cfg.get("model") or (next(iter(cfg["models"])) if len(cfg["models"]) == 1 else None)
     if name not in cfg["models"]:
         sys.exit(f"hobkin: no model {name!r} in your config (models: {', '.join(cfg['models']) or 'none'})")
-    print(models_text(Model(name, cfg["models"][name])))
+    print(models_text(Model(name, cfg["models"][name]), cfg["models"]))
 
 
 def hearthboard_user(url: str, token: str) -> dict:
