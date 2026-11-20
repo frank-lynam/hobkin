@@ -170,8 +170,8 @@ tmux, or a systemd user service.
 | `in` | A named pipe. `echo text > in` sends a message. A write waits until the agent is running; `hobkin send ID text` queues it instead. |
 | `out` | Everything it says and does since the last compaction, with timestamps: messages, commands, output. At each compaction it's moved to `archive/` and starts afresh. `tail -F out` |
 | `context.jsonl` | Exactly what the model is sent: line 1 is the system prompt, then one message per line. Rewritten after every change. |
-| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 160 lines, it's told to cut it back to about 96 in one go (a 40% margin, so it isn't nagged again for a line or two; told once, not on every edit). |
-| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 60 lines, it's told to keep the best, about 36, in one go. |
+| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 24 KB (`memory_bytes`; about 6k tokens), it's told to cut it back to about 14 KB in one go (a 40% margin, so it isn't nagged again for a line or two; told once, not on every edit). Limits are in bytes, not lines: bytes are what it costs in every call, and `wc -c` shows where it stands. |
+| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 8 KB (`bloopers_bytes`), it's told to keep the best, about 4.8 KB, in one go. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. `work/tools/` holds tools it made itself (see "Its tools"); in break-glass mode, `work/incident-*.md` is the incident's timeline. |
 | `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |
@@ -275,6 +275,7 @@ line that is just one of these is a command instead:
 | `/drive [on\|off]` | Drive mode, for a model that stops before it's done. Each time the agent stops with its goal's steps unticked, it's pushed on, and its next reply must make a tool call (`tool_choice` required). It keeps going until every step is ticked, then drive turns itself off. It stops early at `drive_max_pushes` (30) pushes, or when the agent says it's waiting on someone (`goal` `waiting`). Alone, `/drive` toggles. `"drive": true` in a model's entry makes it permanent for that model. |
 | `/model [N\|NAME [@SERVICE] [anthropic\|openai]]` | Alone: the configured models, numbered, each with its service (`>` marks the one in use); `/model N` switches to number N. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). `@SERVICE` (or `NAME@SERVICE`) asks a particular service for it, named by a configured model or part of its host (`@gov`, `@openrouter`), for when several services offer models with the same name. A new entry whose name another service already uses gets `@host` added. Add `anthropic` or `openai` to ask for it in that API style on the same host: `anthropic` drops a trailing `/v1` from the URL (its paths carry it), `openai` puts it back. Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
 | `/models [@SERVICE]`, `/models star\|unstar N...` | List the models the agent's API (or another configured service) offers, numbered, with their context windows: `★` for those in your config, `>` for the one in use. `star N...` adds those (by number from the last list, or id) to the agent's own `config.json`; `unstar N...` takes them out of it (not the one in use, and not entries from `_shared/config.json`). |
+| `/survey [PATH]` | A brownie surveys a code base (the folder you opened the chat in, if no PATH) for the field lore: its architecture, how it's built and tested, its conventions and gotchas. Its report comes back as a message. Needs lorewell. |
 | `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
 | `/hello [FOLDER]` | Sent by `hobkin chat` as it opens (not logged): the agent says hello, and is told the folder you opened the chat in. |
 | `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |
@@ -381,18 +382,31 @@ message.
 
 `context_tokens` on a model is optional: set it and that number is used as
 given; leave it out (or `null`) and it's detected. If the API doesn't say,
-set it. Failing that, hobkin
-learns the limit from the first "context too long" error and remembers it.
+set it. hobkin asks the Anthropic models API, OpenAI-style model lists (OpenRouter's
+`context_length`), LiteLLM's `/model/info` (the usual gateway in front of Bedrock),
+llama.cpp and Ollama. Failing that, hobkin
+learns the limit from the first "context too long" error and remembers it (and asks
+the API again a day later, in case the error was misread).
 Windows can change (a local server restarted with a different size): the API is
 asked again before each compaction, after a "too long" error that doesn't say the
 limit, and on `/limits`.
 `state.json` records where the number came from.
 
-**Compaction, at good moments.** The window it works within is the model's, capped
-at `context_budget` (100,000 tokens). Models that advertise 1M-token windows get slow,
-expensive and forgetful long before they fill one; `null` uses the model's full window.
-If a model with a big window compacts more often than you'd like mid-task, raise
-`context_budget` for that agent (in its own `config.json`), say to 200,000.
+**Compaction, at good moments.** The window it works within is the model's, within
+`context_budget`. The default, `"auto"`, uses the whole window up to 200,000 tokens,
+and 40% of a bigger one, never less than 200,000 (a 1M model works within 400,000;
+128,000 while the window isn't known yet). A number caps it instead; `null` uses the
+model's full window. Why not always the whole window: every step resends the whole
+context, so a bigger one is a slower start to every step; models get worse with very
+long contexts well before they're full (old output and stale plans compete with what
+matters now), and compaction is also a reset that often makes the agent sharper; it
+needs room of its own (the history plus the note); and one big command output can
+jump the context by tens of thousands of tokens. Where your limit is on requests
+rather than tokens, raising `context_budget` (in the agent's own `config.json`) trades
+a little speed for fewer compactions. On start, `/model` and `/limits`, hobkin says
+where its numbers come from: `context 1,000,000 (anthropic models API), working within
+400,000 (auto: 40% of a big window); instructions about 21,000 tokens (memory 5.1 KB,
+blooper reel 2 KB)`.
 - **Past `compact_early` (75%) of the room the conversation has** (the window less
   the instructions), the agent is told once to read narrowly and keep its checklist
   current. It's compacted at the next good moment: right after it ticks a step in
@@ -707,8 +721,8 @@ database's own way, not live files), then logs, config, and a snapshot of how
 things stand, gently (`nice`/`ionice`). It keeps a manifest (what's saved, where,
 size and checksum, and what couldn't be saved), deletes nothing of the system's,
 and posts a status after each step. It also saves itself: it writes its findings
-into `MEMORY.md`, runs `hobkin pack` (below) and uploads the bundle with the
-copies, early and again at the end. If the machine is lost, you can start that
+into `MEMORY.md`, stashes itself into a file (`hobkin stash ID DIR --keep-running
+--max-mb 2`: see "Stash") and uploads it with the copies, early and again at the end. If the machine is lost, you can start that
 bundle anywhere and ask it what it found. Extending it without a reason keeps it
 a salvage; giving a reason makes it an ordinary incident.
 
@@ -766,27 +780,21 @@ One terminal, redrawn every second, built from the files hobkin already writes
 Agents not in break-glass mode show their out log instead of a timeline.
 `NO_COLOR` is respected.
 
-### Packing an agent
+### Saving an agent from a dying machine
+
+A salvaging agent stashes itself into a file: `hobkin stash ops-1 DIR --keep-running --max-mb 2`
+(files over 2 MB in its workspace stay out: the salvaged copies went elsewhere). The stash file
+holds hobkin.py itself, so it starts on any machine; its `RESTORE.md` lists what was left out and
+says how:
 
 ```sh
-hobkin pack ops-1 [--to DIR]     # default: the agent's work/
+tar xzf 20261120-153527-oldbox.tar.gz hobkin.py
+python3 hobkin.py stash pop 20261120-153527-oldbox.tar.gz --no-start
+python3 hobkin.py URL MODEL [KEY] --id ops-1 --chat
 ```
 
-writes `hobkin-ops-1-<time>.tar.gz`. It holds hobkin.py itself, the shared
-instructions and skills, and the agent's folder: memory, conversation,
-`archive/`, out log, reminders, and its workspace notes (the manifest, the
-incident timeline). It leaves out `secrets.env`, API keys, model `headers`,
-shell state, and files over 2 MB in its workspace (salvaged copies went
-elsewhere). The `RESTORE.md` inside lists what was left out and says how to start it:
-
-```sh
-tar xzf hobkin-ops-1-<time>.tar.gz && cd hobkin-ops-1-<time>
-HOBKIN_HOME=$PWD/home python3 hobkin.py URL MODEL [KEY] --id ops-1 --no-service --chat
-```
-
-The copy starts out of break-glass mode. Its first message tells it it's a
-restored copy, which folder its old paths were in, and to answer questions from
-what it saved. Agents find the program as `$HOBKIN_SELF`.
+The copy starts out of break-glass mode. Its first message tells it it moved, and to answer
+questions from what it saved.
 
 Until it expires the agent works fully on its own:
 - **No brakes:** safe mode is lifted, and nothing is announced first or waits.
@@ -820,6 +828,85 @@ directly, which a non-safe-mode agent could do to itself. The agent sees its
 deadline: hiding it wouldn't stop it from reading its own config, and knowing
 when it's handing back helps it plan the hand-over. hobkin can't grant `sudo`: for a crisis account with more
 privileges, run the agent as that user.
+
+## The field lore: what your hobkins know about your world
+
+With [lorewell](https://github.com/frank-lynam/lorewell) installed (`pip install hobkin[lore]`, or
+`pip install lorewell` beside it), every hobkin on the machine shares a **field lore**,
+`~/.hobkins/_shared/field.lore.db`: long-term knowledge of the people they work with, their code
+bases, build systems and environments, kept across conversations, compactions and agents. hobkin
+needs lorewell for it; without it, there's no field lore and everything else works as before.
+
+- **What goes in: general understanding, not details.** People's preferences and ways of working
+  (`people/<login>/...`), what a code base's parts are for and how it's built and tested
+  (`repo/<name>/architecture`, `/build`, `/conventions`, `/gotchas`), environments, hosts, services
+  and tools (`env/...`, `tools/...`), how the team works. Not file paths, line numbers, today's bug,
+  or anything only true until the next commit: that's what `MEMORY.md` and the checklist are for.
+  The test: would it still be true and useful in a month, to a different hobkin, on a different task?
+- **Secrets never get in:** every write goes through a redaction floor (keys, tokens, passwords).
+- **Recall:** each message from a person, and each wake-up (the board, the inbox, a watch), is
+  searched against the lore; what bears on it comes along as a short `[hobkin: from the field lore ...]`
+  note (at most three topics, each once per context). Chatter brings up nothing, so it costs nothing.
+- **The `field_lore` tool:** the agent searches it, reads a topic, files what it learns (writing a topic
+  again updates it; the old version is kept in its history), and joins names that mean the same
+  person with `alias` (a hearthboard name and a login: looking one up finds the other).
+- **The librarian:** at each compaction, a brownie (on the brownie model: `hobkin URL MODEL KEY --brownie
+  MODEL`) is given the handoff note, the conversation's highlights and what the lore says on related
+  topics, and files what's durable: merging into existing topics, correcting what turned out wrong,
+  in a call or two. It works in the background (compaction never waits) and reports to the log only,
+  so it costs the agent nothing.
+- **`/survey [PATH]`** has a brownie read a code base and file its architecture, build and conventions.
+- Read and correct it yourself with lorewell: `lorewell living ~/.hobkins/_shared/field.lore.db topics`,
+  `... search build`, `... topic repo/NAME/build`, `... history TOPIC`, `... forget TOPIC`.
+- `"field_lore": false` in config turns it off.
+
+## Stash: moving between machines
+
+Machines come and go (ephemeral work boxes, autoscaling): stash a hobkin in a store and pop it on
+the next machine, and it carries on where it was: its conversation, memory, checklist, reminders,
+workspace, and the field lore.
+
+```sh
+hobkin stash bodkin s3://team-bucket/hobkins      # pack it up, upload it, stop it here (it's moving)
+hobkin stash pop bodkin s3://team-bucket/hobkins  # on the new machine: download, unpack, start; the chat carries on
+hobkin stash list s3://team-bucket/hobkins        # what's stashed, and where each one runs
+hobkin stash --all s3://team-bucket/hobkins       # every agent on this machine
+hobkin stash pop 20261120-153527-oldbox.tar.gz    # or from a stash file itself (it holds hobkin.py and RESTORE.md)
+```
+
+- **The store** is `s3://bucket/prefix` (through the AWS CLI, `aws`) or a folder (a mounted share).
+  One folder per agent: its last 10 stashes (`pop --from STAMP` rolls back) and `claim.json`, which
+  machine has it.
+- **No secrets travel:** keys, `secrets.env` and model headers stay behind; the new machine supplies
+  its own (pop says which key it's missing). Running jobs and shells don't travel either. In the
+  workspace, `.git` folders, caches and files over 50 MB are left out.
+- **Pop onto a machine that's set up:** its own shared config, instructions and skills are left as they
+  are (only what's missing is filled in); a copy of the agent already there is moved aside, not
+  overwritten; the field lore is merged by topic (newest wins, the other kept in the history). The
+  agent is told it moved, in case paths differ.
+- **Auto-stash** (`"stash": {"store": "s3://...", "every": "15m"}` in config): stashed on that timer and
+  when it stops cleanly, so a machine that vanishes takes at most a few minutes of work with it. Once
+  it's been popped elsewhere, the old machine's next auto-stash sees the claim has moved, doesn't
+  overwrite it, and stops the agent there: one hobkin, one place.
+- **The workspace stays tidy:** every `tidy_every` (24h), when the agent is idle, a brownie clears what's
+  clearly junk from its workspace (build outputs, caches, stale downloads and logs), never its spells,
+  tools, checklists or notes, and anything recent or uncommitted; its report goes to the log.
+
+## A hobkin knows its own setup
+
+The system prompt tells each agent where its files are and how its instructions work: the `.md`
+files in `_shared/` and in its own folder (its own replaces the shared one of the same name), read
+again for every step. Asked to "update your AGENTS.md", it edits the file in its own folder (asking
+first before touching `_shared/`, which changes every hobkin on the machine). In safe mode its
+instructions and config are read-only to it, so it hands you the exact edit instead. Any change to
+an instruction file, its own or a person's, is shown in the chat with the diff.
+
+It also knows hobkin's family: [lorewell](https://github.com/frank-lynam/lorewell) and
+[eaveswatch](https://github.com/frank-lynam/eaveswatch), what each is for and how to install them, to
+suggest when they'd help and to set up when asked. Without lorewell, it knows the field lore is there
+for the having: it tells you once, when it would help, and installs lorewell if you want it (in safe
+mode it gives you the command). hobkin notices within a minute and switches the field lore on, with no
+restart.
 
 ## Reminders
 
@@ -1150,7 +1237,7 @@ nothing and don't need a key. They cover both API styles:
 - chores (settings, secret settings, several per agent, a break-glass playbook,
   setting up, the watch staying quiet until there's work),
   safe mode's write folders, and the rate-limited `notify` tool;
-- the agent's own tools, `hobkin pack` and restoring a bundle, `hobkin purge`,
+- the agent's own tools, stashing and restoring an agent (a store, and a stash file), `hobkin purge`,
   safe mode (where the kernel has Landlock) and systemd services (where there's
   a user session).
 

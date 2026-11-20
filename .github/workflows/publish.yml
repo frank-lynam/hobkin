@@ -27,6 +27,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: lorewell (the field lore needs it)
+        run: python -m pip install "lorewell>=0.4" || python -m pip install "git+https://github.com/frank-lynam/lorewell@main"
       - name: Tests
         shell: bash
         run: |

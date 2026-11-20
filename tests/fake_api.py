@@ -22,6 +22,9 @@ def decide(last_user_texts, tool_results, summary):
     if tool_results: return ("text", "Done. Output was: " + tool_results[-1][:60].replace("\n", " ") + ".")
     t = re.sub(r"(?m)^\[(message from [^\]]*|from hobkin[^\]]*)\]\n", "", last_user_texts)   # sender labels
     t = re.sub(r"(?m)\n?^\[hobkin: [^\n]*\]$", "", t)                                          # nudges
+    t = re.sub(r"(?s)\n?\[hobkin: from the field lore.*$", "", t)                              # recall (it comes last)
+    if "You're the librarian of the field lore" in t:          # a librarian brownie: its brief quotes the chat
+        return ("text", "REPORT: nothing durable to file")
     m = re.search(r"multi-call:\s*(\[.*\])\s*$", t, re.S)        # several tool calls in one reply: [[TOOL, {input}], ...]
     if m: return ("multi", json.loads(m.group(1)))
     m = re.search(r"noplan-call:\s*(\w+)\s+(\{.*\})\s*$", t, re.S)   # a call without saying a plan first

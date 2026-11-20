@@ -22,7 +22,10 @@ line, or as a worker on hearthboard.
     hobkin breakglass ID ["what's wrong"] --with ID2,ID3   one incident, shared: they see each other's work and holds
     hobkin watch [ID ...]   one screen for an incident: every agent on it, what they're doing, risky-looking commands
     hobkin purge [--yes]   stop every agent, remove their services, delete ~/.hobkins (asks first)
-    hobkin pack ID [--to DIR]   a bundle of the agent (hobkin, memory, conversation, notes; no secrets) to restart elsewhere
+    hobkin stash ID STORE [--keep-running]   move it: pack it up into STORE (s3://bucket/prefix or a folder); it stops here
+    hobkin stash pop ID STORE   ...and carry on, on this machine (the conversation, memory, workspace, field lore)
+                                (or pop FILE.tar.gz: a stash file itself, which also holds hobkin.py and RESTORE.md)
+    hobkin stash list STORE     what's stashed, and where each one runs (--all stashes every agent here)
     hobkin --version
 
 Set up and go in one line (no config editing):
@@ -34,7 +37,8 @@ _shared/keys/, readable only by you; leave it out to be asked for it), checks th
 exists, starts a new agent as a systemd user service (or in the background where there's
 no systemd), and with --chat connects you to it. Also: --id ID (the agent's id), --safe (safe mode:
 it can read, but its commands write only in its workspace; see "safe_mode" in config),
---api anthropic|openai (else guessed from the URL), --no-service, --force (skip the check).
+--api anthropic|openai (else guessed from the URL), --brownie MODEL[@SERVICE] (what its brownies,
+its librarian among them, run on), --no-service, --force (skip the check).
 With --hearthboard BOARD_URL TOKEN it also joins that board: the board's skill, the token in
 the agent's secrets.env, and the board's wait loop as its idle prompt (named after its board
 user unless --id). Leave out URL MODEL KEY to use the model already set up. With the --id of an
@@ -57,12 +61,14 @@ Instructions are the .md files in ~/.hobkins/_shared/ and the agent's folder
 _shared/config.json, overridden per agent by ID/config.json. Environment variables
 for the agent's shell: _shared/secrets.env and ID/secrets.env (KEY=value lines).
 
-Standard library only. No ports: it only makes outgoing HTTP calls to the model API.
+Standard library only. No ports: it only makes outgoing HTTP calls to the model API. With
+lorewell installed (pip install hobkin[lore]), the field lore: what the hobkins here learn about
+their people, code bases, build systems and environments, recalled when it bears on a message.
 """
 
 from __future__ import annotations
 
-__version__ = "0.5.9"
+__version__ = "0.6.0"
 
 import email.utils
 import base64
@@ -113,10 +119,11 @@ import urllib.request
 #   web           pages as text, client certificates, SSO, search (for fetch_url, web_search)
 #   model api     HTTP, errors, rate-limit hints, and Model (the Anthropic and OpenAI styles)
 #   agent         the Agent: setup, limits, the host, safe mode, break glass, shared incidents, context file, output, input,
-#                 the front desk, tools, bash and jobs, sessions, brownies, files, the goal, reminders, nudges, the web,
+#                 the front desk, tools, bash and jobs, sessions, brownies, the field lore and housekeeping, auto-stash,
+#                 files, the goal, reminders, nudges, the web,
 #                 the model, compaction, the loop
 #   service       systemd user services
-#   command line  send, the banner (the agent's antler), chat (the terminal), list, the watch screen, models and setup, pack, purge, breakglass, main
+#   command line  send, the banner (the agent's antler), chat (the terminal), stash, list, the watch screen, models and setup, purge, breakglass, main
 
 
 # ---- settings: defaults, the config.json types, and the default AGENTS.md
@@ -235,9 +242,21 @@ DEFAULT_CONFIG = {
     "compact_at": 0.8,         # compact when the context passes this share of the window, wherever it is
     # Past this share, compact at the next good moment instead: a checklist step ticked, or a task done
     "compact_early": 0.75,
-    # Treat the window as no bigger than this many tokens: models that advertise huge windows (1M) get
-    # slow, expensive and forgetful long before they're full. null: the model's real window.
-    "context_budget": 100000,
+    # Treat the window as no bigger than this many tokens: models that advertise huge windows (1M) get slow and
+    # forgetful long before they're full. "auto": the whole window up to 200k, 40% of a bigger one (never under
+    # 200k: 1M -> 400k), 128k while the window isn't known. A number caps it; null: the model's real window.
+    "context_budget": "auto",
+    # The always-shown files' limits, in bytes (they're in every call): past one, the agent is told to cut it back
+    "memory_bytes": 24000,
+    "bloopers_bytes": 8000,
+    # The field lore (needs lorewell: pip install lorewell): what the hobkins here learn about their people, code
+    # bases, build systems and environments, recalled when it's relevant, kept by a librarian brownie at compaction
+    "field_lore": True,
+    # How often a brownie tidies the workspace, when the agent is idle (null: never)
+    "tidy_every": "24h",
+    # Auto-stash, for machines that come and go: {"store": "s3://bucket/prefix" or a folder, "every": "15m"}. The
+    # agent is stashed this often and when it stops cleanly, so `hobkin stash pop` on another machine carries on
+    "stash": None,
     # Not in a terminal (e.g. a systemd service): print "hobkin ID active: ..." to stdout this often
     # while on duty (working, or idle with a reminder or idle prompt coming). 0 turns it off.
     "heartbeat_seconds": 60,
@@ -250,7 +269,9 @@ DEFAULT_CONFIG = {
 CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, type(None)),
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "compact_early": (int, float),
-                "context_budget": (int, type(None)), "skill_dirs": list,
+                "context_budget": (int, str, type(None)), "memory_bytes": int, "bloopers_bytes": int,
+                "field_lore": bool, "tidy_every": (str, type(None)), "stash": (dict, type(None)),
+                "skill_dirs": list,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict, "drive_max_pushes": int,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
@@ -675,6 +696,31 @@ TOOLS = [
          "required": ["task"]}},
 ]
 
+# With lorewell installed (and field_lore on): the field lore, the long-term knowledge every hobkin here shares
+FIELD_LORE_TOOL = {
+    "name": "field_lore",
+    "description": ("The field lore: what the hobkins on this machine have learned about the people they work with, "
+                    "their code bases (architecture, conventions, gotchas), build systems and environments, kept across "
+                    "conversations, compactions and agents. Search it before you go digging for how things are done "
+                    "here, and read a topic in full. File what you learn that will still be true and useful in a month, "
+                    "to another hobkin, on another task: general understanding, never file paths, line numbers, today's "
+                    "bug, or anything secret. Writing a topic again updates it (the old version is kept). People go "
+                    "under people/<login name>/...; `alias` joins their other names (a board name, a full name). Your "
+                    "librarian also files what's worth keeping each time your context is compacted."),
+    "input_schema": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["search", "read", "topics", "remember", "forget", "alias"]},
+        "query": {"type": "string", "description": "search: what you're looking for"},
+        "topic": {"type": "string", "description": "read, remember, forget: the topic (people/frank/preferences, "
+                                                   "repo/NAME/build, env/NAME); topics: a prefix (repo/NAME)"},
+        "text": {"type": "string", "description": "remember: the whole topic as it should now read"},
+        "entries": {"type": "array", "description": "remember: several topics in one go",
+                    "items": {"type": "object", "properties": {"topic": {"type": "string"}, "text": {"type": "string"}},
+                              "required": ["topic", "text"]}},
+        "alias": {"type": "string", "description": "alias: another name for someone (their board name, full name)"},
+        "name": {"type": "string", "description": "alias: the name it means (their login name)"},
+        "why": {"type": "string", "description": "remember, forget: why it changed (kept in the history)"}},
+        "required": ["action"]}}
+
 # Only during a shared incident (`hobkin breakglass ... --with`): holds, so teammates don't undo each other's work
 HOLD_TOOL = {
     "name": "hold",
@@ -742,17 +788,55 @@ shopt -s expand_aliases
 
 
 COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits",
-            "/models", "/model", "/hello", "/drive")
+            "/models", "/model", "/hello", "/drive", "/survey")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
-LINE_LIMITS = {"MEMORY.md": ("memory", 160), "BLOOPERS.md": ("blooper reel", 60)}
+# The always-shown files' size limits, in bytes (config memory_bytes, bloopers_bytes): bytes track what they cost in
+# every call, where lines don't (a "line" can be a paragraph), and `wc -c` shows where you stand
+SIZE_LIMITS = {"MEMORY.md": ("memory", "memory_bytes"), "BLOOPERS.md": ("blooper reel", "bloopers_bytes")}
 # Hysteresis: past its limit, a file is cut back to this share of it in one go, so a line or two more doesn't bring
-# the nudge straight back (and nobody spends tokens trimming to the exact line)
+# the nudge straight back (and nobody spends tokens trimming to the exact byte)
 PRUNE_TO = 0.6
 # After a direct message, idle prompts wait this long: someone's talking with it (the tests shorten it)
 CHAT_QUIET = float(os.environ.get("HOBKIN_CHAT_QUIET", 5 * 60))
 KEEP_DAYS = 30            # old archives (contexts, out logs) and finished jobs' folders are deleted after this
+
+
+# The field lore: one living lore per machine, shared by every hobkin on it (a brownie is told its parent's)
+FIELD_LORE = os.environ.get("HOBKIN_FIELD_LORE") or os.path.join(SHARED, "field.lore.db")
+
+
+def open_field_lore():
+    """The field lore (lorewell's Living), or None when lorewell isn't installed: hobkin needs it for this. Looked
+    for again each time (an agent may have just installed it: `pip install --user` makes a folder that wasn't on
+    sys.path when hobkin started)."""
+    import importlib
+    import site
+    importlib.invalidate_caches()
+    try:
+        import lorewell
+    except ImportError:
+        user = site.getusersitepackages() if hasattr(site, "getusersitepackages") else ""
+        if not user or not os.path.isdir(user) or user in sys.path:
+            return None
+        sys.path.append(user)
+        try:
+            import lorewell
+        except ImportError:
+            return None
+    return lorewell.Living(FIELD_LORE) if hasattr(lorewell, "Living") else None
+
+
+def pip_install(pkg: str) -> str:
+    """The command that installs `pkg` for the Python hobkin runs on (--user outside a virtualenv)."""
+    venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    return f"{sys.executable} -m pip install {'' if venv else '--user '}{pkg}"
+
+
+# context_budget "auto": the whole window up to AUTO_FULL tokens; above that, AUTO_SHARE of it (never under
+# AUTO_FULL); AUTO_UNKNOWN while the window isn't known
+AUTO_FULL, AUTO_SHARE, AUTO_UNKNOWN = 200000, 0.4, 128000
 
 
 # ---- nudges: the [hobkin: ...] hints and their detectors (the Agent applies them: tool_nudges, turn_end_nudge)
@@ -813,9 +897,18 @@ COMMITTEE_WORDS = ("production-ready", "production ready", "robust", "comprehens
                    "enterprise-grade", "paradigm", "actionable insight", "going forward", "in conclusion")
 
 
-PRUNE = ("[hobkin: your {what} is {n} lines, past its {limit}-line limit. Cut it back to about {target} lines in one "
-         "go (roughly: no need to count): keep what still earns its place, merge repeats, cut what's stale or fixed. "
-         "Then carry on; it won't come up again until it's past {limit}.]")
+PRUNE = ("[hobkin: your {what} is {n} KB, past its {limit} KB limit. Cut it back to about {target} KB in one go "
+         "(roughly: no need to measure; `wc -c` shows its size): keep what still earns its place, merge repeats, cut "
+         "what's stale or fixed. Then carry on; it won't come up again until it's past {limit} KB.]")
+
+
+def kb(n: float) -> str:
+    """Bytes as KB for people: 8000 -> "8", 4800 -> "4.8"."""
+    return f"{n / 1000:.1f}".rstrip("0").rstrip(".")
+
+
+def prune_text(what: str, n: int, limit: int) -> str:
+    return PRUNE.format(what=what, n=kb(n), limit=kb(limit), target=kb(limit * PRUNE_TO))
 
 
 PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: **How it works:** what you "
@@ -890,9 +983,10 @@ SALVAGE = ("## No guidance given: salvage\n\n"
            "4. **Keep a manifest** in your workspace: each thing saved, where it went, its size and checksum, and "
            "what you couldn't save and why. Upload it with the copies.\n"
            "5. **Save yourself too,** so you can be started again elsewhere to answer questions about what you found: "
-           "put your findings in your MEMORY.md, then `python3 $HOBKIN_SELF pack $HOBKIN_ID` bundles this hobkin "
-           "with your memory, conversation, archive, timeline and notes (no secrets), and says where. Upload it with "
-           "the copies, early and again at the end.\n"
+           "put your findings in your MEMORY.md, then `python3 $HOBKIN_SELF stash $HOBKIN_ID $HOBKIN_WORK/stash "
+           "--keep-running --max-mb 2` bundles this hobkin (the program too) with your memory, conversation, archive, "
+           "timeline and notes (no secrets; the big copies went elsewhere), and says where. Upload it with the copies, "
+           "early and again at the end.\n"
            "- Delete nothing of the system's, not even to free space (only your own temporary copies).\n"
            "- Post a status after each step, and tell whoever turns up exactly where everything is.")
 PLAYBOOK = ("## Your playbook\n\nFor this incident, follow your **{name}** chore (CHORE-{name}.md), with its spells: it's "
@@ -940,6 +1034,71 @@ HOST_NOTE = ("# Where you work: {host}\n\nYou work on **{host}**, over ssh. Your
              "Your memory, blooper reel, conversation and notes stay with hobkin on {here} (the file tools still reach "
              "them as $HOBKIN_MEMORY and $HOBKIN_BLOOPERS). If {host} can't be reached, your commands fail with ssh's "
              "error: that's information too, so say what it means rather than retrying blindly.")
+OWN_FILES = ("# Your own files\n\nYou're files, and you can look at yourself. Your folder is {dir} ($HOBKIN_DIR):\n"
+             "- **Your instructions** are the `.md` files in {shared} (shared by every hobkin on this machine) and in your "
+             "folder (yours alone; one of yours replaces the shared file of the same name). Now: {files}. They're read "
+             "again for every step, so a change takes effect on your next one.\n"
+             "- **config.json** in your folder: your settings (models, safe mode, chores, wake-ups), over "
+             "{shared}/config.json. **MEMORY.md** and **BLOOPERS.md** are yours to keep. **context.jsonl** is this "
+             "conversation, **out** its log, **state.json** hobkin's own, **reminders.json** your reminders.\n"
+             "{editing}\n"
+             "- How hobkin works, all of it: `python3 $HOBKIN_SELF --help` and its README "
+             "(https://github.com/frank-lynam/hobkin).\n"
+             "{lore}\n{family}")
+FIELD_LORE_OFFER = ("- **The field lore is available, but not installed here.** With it, the hobkins on this machine share "
+                    "what they learn about the people, code bases, build systems and environments they work with: kept "
+                    "across conversations, compactions and machines, and recalled when it bears on a message. It needs "
+                    "lorewell: `{pip}`. Tell the person about it once, when it would help (they'd like you to remember "
+                    "things across conversations, or to know their setup), and if they want it, {how}. hobkin notices it "
+                    "within a minute and switches it on, no restart.")
+FAMILY = ("- **hobkin's family**, to suggest when someone needs one (set one up only when asked): **lorewell** (`{lorewell}`), "
+          "reference packs for languages and their tools, one SQLite file each, that you look things up in instead of "
+          "holding them in context (https://github.com/frank-lynam/lorewell); and **eaveswatch** (`{eaveswatch}`), AI "
+          "log review: it learns a system's logs, ships them redacted to S3, alerts by email and writes a findings "
+          "page, with a hobkin as its reviewer (https://github.com/frank-lynam/eaveswatch).")
+OWN_FILES_SAFE = ("- **In safe mode your instructions and config are read-only to you.** Asked to change them (\"update your "
+                  "AGENTS.md\"), give the person the exact edit: the file's path, and the text to add or change, ready to "
+                  "paste.")
+OWN_FILES_FREE = ("- **Asked to change your instructions** (\"update your AGENTS.md\"), edit the file in your folder (create "
+                  "it, from the shared one if you're changing that, so the change is yours alone). Changing a file in {shared} "
+                  "changes every hobkin here: ask first. Every change to an instruction file is shown in the chat.")
+RECALL = ("[hobkin: from the field lore (what hobkins here have learned; check it before you rely on it, and correct it "
+          "with field_lore if it's wrong):\n{items}]")
+LIBRARIAN = ("You're the librarian of the field lore (the field_lore tool): what the hobkins on this machine know about "
+             "their people, code bases, build systems and environments. {parent} just compacted its conversation; below are "
+             "its handoff note, the highlights of the conversation, and what the lore already says on related topics. "
+             "Work in as few steps as you can: aim for ONE field_lore call (action remember, all your entries), plus any "
+             "forget or alias calls, then your report. Don't explore files or run commands.\n"
+             "1. Pick out what's durable: would it still be true and useful in a month, to a different hobkin, on a "
+             "different task? People's preferences and ways of working (people/<login>/...); how a code base is laid out, "
+             "built and why (repo/<name>/architecture, /build, /conventions, /gotchas); environments, hosts, services and "
+             "tools (env/<name>, tools/<name>); how the team works (team/...).\n"
+             "2. Leave out file paths and line numbers, function bodies, today's task or bug, anything only true until the "
+             "next commit, anything the lore already says, and anything secret (keys, tokens, passwords: never).\n"
+             "3. Check it against the lore: fold it into an existing topic rather than starting a near-duplicate (write the "
+             "whole topic, keeping what's still true), correct what turned out wrong, and forget a topic only if it's "
+             "clearly false (say why).\n"
+             "4. People are filed under their login name; when the conversation shows two names are the same person (a "
+             "board name and a login), alias them.\n"
+             "Nothing durable? File nothing: that's a fine outcome. End with REPORT: one line per topic you added, updated "
+             "or forgot.\n\n## The handoff note\n\n{note}\n\n## Highlights of the conversation\n\n{highlights}\n\n"
+             "## What the lore says on related topics\n\n{related}")
+SURVEY = ("Survey the code base at {path} for the field lore (the field_lore tool). First see what it already says "
+          "(field_lore topics, prefix repo/<its name>). Then read its README, build files (Makefile, package.json, "
+          "pyproject.toml, pom.xml, build.gradle, Cargo.toml, go.mod, BUILD, ...), CI config (.github/workflows, "
+          ".gitlab-ci.yml, Jenkinsfile, ...), contributor docs, and the top two levels of its layout. File what a "
+          "newcomer would need, as general understanding, not listings or line numbers: repo/<name>/architecture (the "
+          "parts and what each is for), repo/<name>/build (build, test, run, deploy; what's slow), "
+          "repo/<name>/conventions, repo/<name>/gotchas. Update rather than duplicate, in one field_lore remember call "
+          "with all the entries. REPORT: the topics you filed, one line each.")
+TIDY = ("Tidy {parent}'s workspace, {work}, so it stays small and easy to find things in (it's carried along when the "
+        "hobkin moves machines). Look first (du -sh, ls -la, find with sizes and ages), then remove only what's clearly "
+        "junk: build outputs and caches (__pycache__, node_modules, .pytest_cache, dist/, build/, target/, *.pyc), "
+        "temporary and scratch files, downloads and clones it can fetch again and hasn't touched in a week, logs older "
+        "than a week. Never touch spells/, tools/, any CHECKLIST.md, NOTES.md or SPELLBOOK.md, anything those mention, "
+        "anything changed in the last two days, anything with uncommitted git changes, or anything you're unsure of "
+        "(list those in your report instead). A few steps at most. REPORT: what you removed and the space it freed, and "
+        "what looked like junk that you left.")
 REMOTE_CWD = "__HOBKIN_CWD__"
 BROWNIE_BRIEF = ("[from hobkin: you're a brownie (a helper agent, like the household spirit that does the chores unseen). {parent} handed you one well-scoped job and works on while you do it; you have a fresh "
                 "context, and you work fully on your own. Nobody will answer questions, so don't ask any: decide, and say what you assumed. Their "
@@ -1135,6 +1294,9 @@ def config_warnings(cfg: dict) -> list[str]:
     for name in cfg.get("fallback_models") or []:
         if name not in (cfg.get("models") or {}):
             out.append(f"fallback_models has {name!r}, which isn't one of the models defined (ignored)")
+    cb = cfg.get("context_budget")
+    if isinstance(cb, str) and cb != "auto":
+        out.append(f"context_budget is {cb!r}: it's \"auto\", a number of tokens, or null (the whole window)")
     ca = cfg.get("compact_at")
     if isinstance(ca, (int, float)) and not 0 < ca < 1:
         out.append(f"compact_at is {ca}: it's a share of the context window, between 0 and 1 (e.g. 0.8)")
@@ -1885,6 +2047,18 @@ class Model:
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             pass
         root = re.sub(r"/v1$", "", self.base)
+        for url in (f"{self.base}/model/info", f"{root}/model/info"):   # LiteLLM (a gateway, e.g. before Bedrock)
+            try:
+                for m in http_json("GET", url, h, timeout=15).get("data", []):
+                    info = m.get("model_info") or {}
+                    if self.model in (m.get("model_name"), (m.get("litellm_params") or {}).get("model")) \
+                            and (info.get("max_input_tokens") or info.get("max_tokens")):
+                        return (int(info.get("max_input_tokens") or info["max_tokens"]),
+                                info.get("max_output_tokens"), "LiteLLM /model/info")
+            except (urllib.error.URLError, OSError, ValueError, AttributeError):
+                pass
+            if url.startswith(root + "/model"):
+                break
         try:  # llama.cpp server
             props = http_json("GET", f"{root}/props", h, timeout=10)
             ctx = props.get("n_ctx") or (props.get("default_generation_settings") or {}).get("n_ctx")
@@ -2168,6 +2342,10 @@ class Agent:
         self.state.setdefault("created", now())
         self.messages = self.load_context()
         self.discover_limits()
+        self.brownie_of = self.cfg.get("_brownie_of")
+        self.moved = False                                 # popped elsewhere: stopping, and not stashed again
+        self.lore = open_field_lore() if self.cfg.get("field_lore", True) else None
+        self.lore_looked = time.time()
         self.repair_context()
         if self.glass_ended is not None:
             self.add_user(GLASS_ENDED.format(stamp=self.stamp(), how=self.glass_ended, log=self.glass_log,
@@ -2176,8 +2354,10 @@ class Agent:
             self.add_user(f"[from hobkin: restarted as asked, now hobkin {__version__}, at {when_text(time.time())}.]")
         self.prune()
         self.save_state("starting")
-        self.log("hobkin", f"{self.id} up: {self.model.describe()}, context "
-                 f"{self.state.get('context_tokens') or 'unknown'} ({self.state.get('context_source') or 'will learn from errors'})")
+        self.log("hobkin", f"{self.id} up: {self.model.describe()}, {self.limits_text()}")
+        if self.cfg.get("field_lore", True) and not self.brownie_of:
+            self.log("hobkin", f"field lore: {len(self.lore.topics())} topics in {FIELD_LORE}" if self.lore else
+                     "field lore: off (it needs lorewell 0.4 or later: pip install lorewell)")
         self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
 
     def _on_signal(self, signum, frame):
@@ -2199,13 +2379,15 @@ class Agent:
         """Context window and output limit: config override, else ask the API (cached per model)."""
         key = f"{self.model.api}|{self.model.base}|{self.model.model}"
         if self.state.get("limits_for") != key:
-            for k in ("context_tokens", "context_source", "api_max_output"):
+            for k in ("context_tokens", "context_source", "api_max_output", "context_learned_at"):
                 self.state.pop(k, None)
             self.state["limits_for"] = key
         if self.model.cfg.get("context_tokens"):
             self.state["context_tokens"], self.state["context_source"] = int(self.model.cfg["context_tokens"]), "config"
-        elif not self.state.get("context_tokens"):
-            ctx, out, src = self.model.query_limits()
+        elif not self.state.get("context_tokens") or (
+                self.state.get("context_source") == "learned from an error"
+                and time.time() - float(self.state.get("context_learned_at") or 0) > 86400):
+            ctx, out, src = self.model.query_limits()     # (an error's number is asked again a day later)
             if ctx:
                 self.state["context_tokens"], self.state["context_source"] = int(ctx), src
             if out:
@@ -2309,8 +2491,7 @@ class Agent:
         old = self.model.describe()
         self.use_model(name)
         self.fallbacks = [f for f in self.cfg.get("fallback_models") or [] if f in self.cfg["models"] and f != name]
-        return (f"switched from {old} to {self.model.describe()}, context {self.state.get('context_tokens') or 'unknown'} "
-                f"(saved in {path})")
+        return f"switched from {old} to {self.model.describe()}, {self.limits_text()} (saved in {path})"
 
     def entry_name(self, wanted: str, entry: dict) -> str:
         """A config name for a new entry: the model's id, with @host when another service already uses that name."""
@@ -2426,7 +2607,18 @@ class Agent:
         elif why == "/limits":
             self.log("hobkin", f"limits ({why}): context {old or 'unknown'} "
                      + (f"(unchanged; {src})" if ctx else f"(the API doesn't say; {self.state.get('context_source') or 'none'})"))
+        if why == "/limits":
+            self.log("hobkin", self.limits_text())
         self.save_state()
+
+    def limits_text(self) -> str:
+        """Where the numbers come from: the window and its source, the budget and why, what the instructions cost."""
+        ctx, src = self.state.get("context_tokens"), self.state.get("context_source") or "will learn from errors"
+        room, why = self.context_room()
+        f = lambda n: f"{n:,}" if n else "unknown"
+        mem, blo = (len(read(self.p(n)).strip().encode()) for n in ("MEMORY.md", "BLOOPERS.md"))
+        return (f"context {f(ctx)} ({src}), working within {f(room)} ({why}); instructions about "
+                f"{f(len(self.system_prompt()) // 4)} tokens (memory {kb(mem)} KB, blooper reel {kb(blo)} KB)")
 
     def max_output(self) -> int | None:
         """The max_tokens to send: the model's own max_output_tokens (its entry under "models"), capped at what
@@ -2784,7 +2976,7 @@ class Agent:
         for d in (SHARED, self.dir):
             names.update(f for f in os.listdir(d) if f.endswith(".md"))
         order = [n for n in ("SOUL.md", "AGENTS.md") if n in names]
-        order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md"})
+        order += sorted(names - {"SOUL.md", "AGENTS.md", "MEMORY.md", "BLOOPERS.md"})   # those two come at the end
         who = self.who if self.who != "operator" else "your operator"
         parts = [f"You are hobkin agent {self.id}: a relentlessly cheerful, gleefully work-greedy, cheeky little hobkin "
                  f"(see \"How you are\"). Your workspace is {self.work} ($HOBKIN_WORK). "
@@ -2797,6 +2989,18 @@ class Agent:
             text = read(own) if os.path.exists(own) else read(os.path.join(SHARED, n))
             if text.strip():
                 parts.append(text.strip())
+        safe = getattr(self, "safe", None) or getattr(self, "safe_remote", False)
+        if getattr(self, "lore", None):
+            lore = "- **The field lore is on:** the `field_lore` tool (see its description)."
+        elif self.cfg.get("field_lore", True) and not getattr(self, "brownie_of", None):
+            lore = FIELD_LORE_OFFER.format(pip=pip_install("lorewell"),
+                                           how="give them that command to run" if safe else "install it yourself")
+        else:
+            lore = ""
+        parts.append(OWN_FILES.format(
+            dir=self.dir, shared=SHARED, files=", ".join(order) or "none yet",
+            editing=OWN_FILES_SAFE if safe else OWN_FILES_FREE.format(shared=SHARED), lore=lore,
+            family=FAMILY.format(lorewell=pip_install("lorewell"), eaveswatch=pip_install("eaveswatch"))))
         parts.append(FORMATTING)
         parts.append(BATCHING)
         if hasattr(self, "work"):
@@ -2856,7 +3060,7 @@ class Agent:
             data, ok = self.load_reminders()
             if ok and data["items"]:
                 parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
-        over = {f: PRUNE.format(what=w, n=n, limit=lim, target=int(lim * PRUNE_TO)) + "\n\n" for f, w, n, lim in self.over_limit()}
+        over = {f: prune_text(w, n, lim) + "\n\n" for f, w, n, lim in self.over_limit()}
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\nA sketch of where you were, not the truth: check the "
                      f"real thing before you act on it, and enjoy catching it out.\n\n{over.get('MEMORY.md', '')}"
@@ -2867,11 +3071,12 @@ class Agent:
         return "\n\n---\n\n".join(parts)
 
     def over_limit(self) -> list[tuple[str, str, int, int]]:
-        """(file, what, lines, limit) for each always-shown file that's grown past its limit. A file that's back
+        """(file, what, bytes, limit) for each always-shown file that's grown past its limit. A file that's back
         under it is forgotten, so the next time it grows past, it's flagged afresh."""
         out, flagged = [], self.state.setdefault("prune_nudged", [])
-        for f, (what, limit) in LINE_LIMITS.items():
-            n = len([l for l in read(self.p(f)).splitlines() if l.strip()])
+        for f, (what, key) in SIZE_LIMITS.items():
+            limit = int(self.cfg.get(key) or DEFAULT_CONFIG[key])
+            n = len(read(self.p(f)).strip().encode())
             if n > limit:
                 out.append((f, what, n, limit))
             elif f in flagged:
@@ -2976,6 +3181,10 @@ class Agent:
             elif cmd == "/drive" and line.strip().lower() in ("/drive on", "/drive off"):
                 self.log("hobkin", f"command {line.strip().lower()}")
                 self.set_drive(line.strip().lower().endswith("on"))
+            elif cmd == "/survey":                     # /survey [PATH]: a brownie surveys a code base for the field lore
+                where = line.strip().split(" ", 1)[1].strip() if " " in line.strip() else ""
+                self.log("hobkin", f"command /survey {where}".rstrip())
+                self.log("hobkin", self.survey(where))
             elif cmd == "/models":                     # /models @SERVICE, /models star|unstar N...
                 self.models_requested = line.strip().split(" ", 1)[1].strip()
                 self.log("hobkin", f"command /models {self.models_requested}")
@@ -3019,6 +3228,8 @@ class Agent:
                      "/model NAME anthropic (or openai) asks for it in that API style on the same host")
         elif cmd == "/models":
             self.models_requested = ""      # asked between steps (it's an HTTP call)
+        elif cmd == "/survey":
+            self.log("hobkin", self.survey(""))
         elif cmd == "/limits":
             self.limits_requested = True    # asked between steps (it's an HTTP call)
         elif cmd == "/restart":
@@ -3238,6 +3449,7 @@ class Agent:
             "brownie": lambda: self.tool_brownie(s("task"), bool(inp.get("wait"))),
             **({"hold": lambda: self.tool_hold(inp)} if self.glass and self.glass.get("incident") else {}),
             **({"notify": lambda: self.tool_notify(s("message"))} if self.cfg.get("alert_command") else {}),
+            **({"field_lore": lambda: self.tool_field_lore(inp)} if self.lore else {}),
         }
         if name not in tools:
             runs = self.own_tools()[1]
@@ -3287,13 +3499,14 @@ class Agent:
         """What the model is offered: the built-in tools, then the agent's own."""
         team = [HOLD_TOOL] if getattr(self, "glass", None) and self.glass.get("incident") else []
         notify = [NOTIFY_TOOL] if self.cfg.get("alert_command") else []
-        return TOOLS + team + notify + self.own_tools()[0]
+        lore = [FIELD_LORE_TOOL] if getattr(self, "lore", None) else []
+        return TOOLS + team + notify + lore + self.own_tools()[0]
 
     def own_tools(self) -> tuple[list[dict], dict[str, str], list[str]]:
         """The tools the agent made itself (OWN_TOOLS): their definitions, {name: run path}, and what's wrong with
         any that can't be offered, read fresh each time so a new one is there from the next reply."""
         defs, runs, problems = [], {}, []
-        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL, NOTIFY_TOOL]}   # hold, notify: offered sometimes
+        builtin = {t["name"] for t in TOOLS + [HOLD_TOOL, NOTIFY_TOOL, FIELD_LORE_TOOL]}   # offered sometimes
         try:
             found = self.tool_listing()
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -3814,7 +4027,7 @@ class Agent:
                 return name
         return self.model.name
 
-    def brownie_start(self, task: str) -> tuple[int, str, str, subprocess.Popen]:
+    def brownie_start(self, task: str, write: list[str] | None = None) -> tuple[int, str, str, subprocess.Popen]:
         """A brownie: its own home in brownies/ (not one of your agents), the same host, safe mode, secrets and
         settings (and an open incident), none of this agent's chores, wake-ups or board. The task is its first message."""
         name = self.brownie_model()
@@ -3825,7 +4038,11 @@ class Agent:
         cfg = {k: v for k, v in self.cfg.items() if not k.startswith("_") and k not in (
             "idle_prompt", "wake", "inbox", "chores", "break_glass", "alert_command", "brownie", "operator",
             "front_desk")}
-        cfg.update({"model": name, "idle_prompt": None, "heartbeat_seconds": 0})
+        cfg.update({"model": name, "idle_prompt": None, "heartbeat_seconds": 0, "tidy_every": None,
+                    "_brownie_of": self.id})
+        if write and cfg.get("safe_mode"):           # folders of the parent's it may change (the tidy: its workspace)
+            sm = cfg["safe_mode"] if isinstance(cfg["safe_mode"], dict) else {}
+            cfg["safe_mode"] = {**sm, "write": list(sm.get("write") or []) + write}
         if self.glass:                               # in an incident, so is it (and safe mode is lifted for it too)
             cfg["break_glass"] = {k: v for k, v in self.glass.items() if k not in ("incident",)}
         write_json(os.path.join(home, "_shared", "config.json"), cfg)
@@ -3837,7 +4054,8 @@ class Agent:
         where = f" on {self.host()}" if self.host() else ""
         queue_message(cd, BROWNIE_BRIEF.format(parent=self.id, cwd=self.cwd(), where=where, task=task))
         log = open(os.path.join(cd, "hobkin.log"), "ab")
-        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), cid], env={**os.environ, "HOBKIN_HOME": home},
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), cid],
+                                env={**os.environ, "HOBKIN_HOME": home, "HOBKIN_FIELD_LORE": FIELD_LORE},
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         log.close()
         self.log("brownie", f"#{n} on {name}: {clip(' '.join(task.split()), 200, 0)}")
@@ -3890,7 +4108,7 @@ class Agent:
     def tool_brownie(self, task: str, wait: bool) -> ToolResult:
         conf = self.cfg.get("brownie") or {}
         running = self.state.setdefault("brownies", {})
-        if len(running) >= int(conf.get("max", 3)):
+        if len([c for c in running.values() if not c.get("quiet")]) >= int(conf.get("max", 3)):
             return (f"{len(running)} brownies are already on jobs (the limit is {conf.get('max', 3)}): let one finish, "
                     "or do this yourself."), True
         n, cd, name, proc = self.brownie_start(task)
@@ -3933,11 +4151,183 @@ class Agent:
                                                    else f"it ran out of time ({span_text(c['timeout'])})")
             text, _ = self.brownie_finish(int(key), c["dir"], c["model"], c["pid"], reason)
             del self.state["brownies"][key]
+            if c.get("quiet"):                       # housekeeping (the librarian, the tidy): logged, not a message
+                self.log("hobkin", f"{c['quiet']} (brownie #{key}): {clip(text.split(chr(10), 1)[-1].strip(), 1500, 0)}")
+                continue
             out.append(f"[from hobkin: a brownie you sent reports back, {self.stamp()}. You gave it: "
                        f"{clip(c['task'], 200, 0)}]\n{text}")
         if out:
             self.save_state()
         return out
+
+    # --- the field lore: recall, the tool, the librarian, the survey; and the tidy (housekeeping brownies)
+    def recall(self, text: str) -> str:
+        """What the field lore knows that bears on this message (and the current goal): a short reminder, or ""."""
+        if not getattr(self, "lore", None) or self.brownie_of:
+            return ""
+        g = self.state.get("goal") or {}
+        seen = self.state.setdefault("recalled", [])
+        try:
+            hits = self.lore.recall(f"{text}\n{g.get('goal', '') if g.get('open') else ''}", n=3, skip=set(seen))
+        except Exception as e:                      # a broken lore mustn't stop a message getting through
+            self.log("hobkin", f"field lore: recall failed ({e})")
+            return ""
+        if not hits:
+            return ""
+        seen.extend(h["topic"] for h in hits)
+        items = "\n".join(f"- **{h['topic']}**: {clip(' '.join(h['body'].split()), 600, 0)}" for h in hits)
+        self.log("hobkin", "field lore recalled: " + ", ".join(h["topic"] for h in hits))
+        return "\n" + RECALL.format(items=items)
+
+    def tool_field_lore(self, inp: dict) -> ToolResult:
+        lv, act = self.lore, str(inp.get("action") or "")
+        by, why = self.brownie_of and f"{self.brownie_of} (librarian)" or self.id, inp.get("why")
+        source = f"{self.brownie_of or self.id} on {os.uname().nodename}"
+        try:
+            if act == "search":
+                hits = lv.search(str(inp.get("query") or ""), 8)
+                return "\n".join(f"{h['topic']}\n    {h['snippet']}" for h in hits) or \
+                    f"nothing for {inp.get('query')!r} (topics lists what there is)", False
+            if act == "read":
+                t = lv.get(str(inp.get("topic") or ""))
+                if not t:
+                    near = [h["topic"] for h in lv.search(str(inp.get("topic") or ""), 5)]
+                    return f"no topic {inp.get('topic')!r}" + (f". Close: {', '.join(near)}" if near else ""), True
+                return (f"{t['topic']} (by {t['by'] or '?'}, {t['at']}; checked {t['checked']}"
+                        f"{'; from ' + t['source'] if t['source'] else ''}):\n{t['body']}"), False
+            if act == "topics":
+                rows = lv.topics(str(inp.get("topic") or ""))
+                return "\n".join(f"{t['topic']}: {clip(' '.join(t['body'].split()), 120, 0)}" for t in rows[:300]) \
+                    or "no topics yet", False
+            if act == "remember":
+                entries = inp.get("entries") or ([{"topic": inp.get("topic"), "text": inp.get("text")}]
+                                                 if inp.get("topic") else [])
+                if not entries:
+                    return "remember what? give topic and text, or entries", True
+                done = [f"{lv.remember(str(e.get('topic')), str(e.get('text') or ''), by, source, why)}: {e.get('topic')}"
+                        for e in entries]
+                self.log("hobkin", "field lore: " + "; ".join(done))
+                return "\n".join(done), False
+            if act == "forget":
+                ok = lv.forget(str(inp.get("topic") or ""), by, why)
+                if ok:
+                    self.log("hobkin", f"field lore: forgot {inp.get('topic')}" + (f" ({why})" if why else ""))
+                return (f"forgot {inp.get('topic')} (it's in the history)" if ok else f"no topic {inp.get('topic')!r}"), not ok
+            if act == "alias":
+                if not inp.get("alias") or not inp.get("name"):
+                    return "alias needs alias (another name) and name (the login name it means)", True
+                lv.alias(str(inp["alias"]), str(inp["name"]))
+                return f"{inp['alias']} means {lv.resolve(str(inp['name']))}: {', '.join(lv.names_of(str(inp['name'])))}", False
+        except Exception as e:               # lorewell's errors (a bad topic name) and sqlite's
+            return f"field lore: {e}", True
+        return "action is search, read, topics, remember, forget or alias", True
+
+    def housekeeping(self, kind: str, task: str, write: list[str] | None = None) -> None:
+        """A brownie for hobkin's own housekeeping (the librarian, the tidy): in the background, on the brownie model,
+        its report logged rather than sent to the agent (so it costs the agent nothing). One of each kind at a time."""
+        running = self.state.setdefault("brownies", {})
+        if any(c.get("quiet") == kind for c in running.values()):
+            return
+        try:
+            n, cd, name, proc = self.brownie_start(task, write)
+        except OSError as e:
+            self.log("hobkin", f"{kind}: couldn't start a brownie ({e})")
+            return
+        conf = self.cfg.get("brownie") or {}
+        running[str(n)] = {"dir": cd, "pid": proc.pid, "model": name, "started": time.time(), "quiet": kind,
+                           "timeout": parse_duration(str(conf.get("timeout") or "30m")), "task": kind}
+        self.save_state()
+
+    def librarian(self, note: str) -> None:
+        """At compaction: hand the handoff note and the conversation's highlights to a librarian brownie, which files
+        what's durable in the field lore (in the background: compaction never waits on it)."""
+        if not getattr(self, "lore", None) or self.brownie_of or not note:
+            return
+        said = []
+        for m in self.messages:
+            for b in m["content"]:
+                t = b.get("text") if isinstance(b, dict) and b.get("type") == "text" else None
+                if t and (m["role"] == "assistant" or t.startswith("[message from")):
+                    said.append(("hobkin: " if m["role"] == "assistant" else "") + clip(t.strip(), 800, 300))
+        highlights = clip("\n\n".join(said[-40:]), 24000, 6000) or "(none)"
+        try:
+            related = self.lore.recall(note + "\n" + highlights, n=12, min_words=2)
+            aliases = self.lore.aliases()
+        except Exception as e:
+            self.log("hobkin", f"librarian: the field lore can't be read ({e})")
+            return
+        rel = "\n\n".join(f"### {r['topic']}\n{clip(r['body'], 1500, 0)}" for r in related) or "(nothing yet)"
+        if aliases:
+            rel += "\n\nAliases: " + "; ".join(f"{n} = {', '.join(a)}" for n, a in aliases.items())
+        self.housekeeping("librarian", LIBRARIAN.format(parent=self.id, note=clip(note, 12000, 3000),
+                                                        highlights=highlights, related=rel))
+
+    def survey(self, where: str) -> str:
+        """/survey [PATH]: a brownie reads a code base and files its architecture, build and conventions (it reports
+        back to the agent when it's done)."""
+        if not getattr(self, "lore", None):
+            return "/survey files into the field lore, which needs lorewell (pip install lorewell)"
+        path = where or self.operator_cwd or self.cwd()
+        running = self.state.setdefault("brownies", {})
+        n, cd, name, proc = self.brownie_start(SURVEY.format(path=path))
+        conf = self.cfg.get("brownie") or {}
+        running[str(n)] = {"dir": cd, "pid": proc.pid, "model": name, "started": time.time(),
+                           "timeout": parse_duration(str(conf.get("timeout") or "30m")), "task": f"survey {path}"}
+        self.save_state()
+        return f"surveying {path} for the field lore (brownie #{n}, on {name}); its report arrives as a message"
+
+    def maybe_tidy(self) -> None:
+        """When idle, every tidy_every: a brownie tidies the workspace (its report is logged)."""
+        every = self.cfg.get("tidy_every")
+        if not every or self.brownie_of or getattr(self, "glass", None):
+            return
+        last = self.state.setdefault("tidied_at", time.time())   # a new agent's first tidy is a period away
+        if time.time() - float(last) < parse_duration(str(every)) or not os.path.isdir(self.work):
+            return
+        self.state["tidied_at"] = time.time()
+        self.housekeeping("tidy", TIDY.format(parent=self.id, work=self.wdir()), write=[self.wdir()])
+
+    # --- auto-stash: stashed every so often (and on a clean stop), so another machine can carry on
+    def autostash(self, wait: bool = False) -> None:
+        conf = self.cfg.get("stash") or {}
+        cmd = [sys.executable, SCRIPT, "stash", self.id, str(conf["store"]), "--auto"]
+        log = open(self.p("hobkin.log"), "ab")
+        try:
+            if wait:
+                subprocess.run(cmd, stdout=log, stderr=log, timeout=180)
+            else:
+                self.stash_proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                                   start_new_session=True)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.log("hobkin", f"auto-stash failed: {e}")
+        finally:
+            log.close()
+
+    def maybe_autostash(self) -> None:
+        conf = self.cfg.get("stash") or {}
+        if not conf.get("store") or self.brownie_of:
+            return
+        proc = getattr(self, "stash_proc", None)
+        if proc is not None:
+            code = proc.poll()
+            if code is None:
+                return
+            self.stash_proc = None
+            if code == STASH_MOVED:                 # popped on another machine since: that one is it now
+                self.moved = True
+                self.log("hobkin", "this agent was popped on another machine: stopping here (it carries on there)")
+                self.alert(f"hobkin {self.id}: popped on another machine, so stopped on {os.uname().nodename}")
+                systemctl("disable", f"{unit_prefix()}@{self.id}.service") if shutil.which("systemctl") else None
+                self.stop = True
+                return
+            if code:
+                self.log("hobkin", f"auto-stash failed (exit code {code}; see {self.p('hobkin.log')})")
+            else:
+                self.state["stashed_at"] = time.time()
+        last = float(self.state.get("stashed_at") or 0)
+        if time.time() - last >= parse_duration(str(conf.get("every") or "15m")):
+            self.state["stashed_at"] = time.time()      # (a failure tries again next period, not every second)
+            self.autostash()
 
     # --- files, skills, images
     def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
@@ -4353,7 +4743,8 @@ class Agent:
     def scheduled(self) -> bool:
         """True when the agent has set up its own next wake-up: a reminder, or a job still running.
         Then it's managing itself, and the hot-take, wrap-up and idle nudges stay quiet."""
-        return bool(self.state.get("jobs")) or bool(self.state.get("brownies")) or self.next_reminder_in() is not None
+        mine = [c for c in (self.state.get("brownies") or {}).values() if not c.get("quiet")]   # not housekeeping
+        return bool(self.state.get("jobs")) or bool(mine) or self.next_reminder_in() is not None
 
     # --- nudges: where the [hobkin: ...] hints (texts and detectors: the "nudges" section) get attached
     # Small models skim long instructions but follow a hint at the moment it applies.
@@ -4363,12 +4754,13 @@ class Agent:
         self.owe_reply, self.reply_nudged = True, False
         g = self.state.get("goal") or {}
         kept = f"\n{GOAL_KEPT.format(goal=g['goal'])}" if g.get("open") else ""
+        recalled = self.recall(text)
         if busy:
             return (f"[message from {self.who}, {self.stamp()}, while you were working: answer it in your next "
-                    f"reply, then carry on]\n{text}{kept}")
+                    f"reply, then carry on]\n{text}{kept}{recalled}")
         hint = "" if self.scheduled() else f"\n{HOT_TAKE if self.has_work_system() else HOT_TAKE_CHAT}"
         return (f"[message from {self.who}, {self.stamp()}: they're talking with you now. Answer them in your reply]"
-                f"\n{text}{hint}{kept}")
+                f"\n{text}{hint}{kept}{recalled}")
 
     def has_work_system(self) -> bool:
         """Any skills at all: somewhere work comes from besides the people talking to it here."""
@@ -4403,7 +4795,7 @@ class Agent:
         flagged = self.state.setdefault("prune_nudged", [])
         for f, what, n, limit in self.over_limit():     # working on a file that's grown too long: said once a
             if (f in said or f.split(".")[0] in said) and f not in flagged:          # time, not on every edit
-                content += "\n" + PRUNE.format(what=what, n=n, limit=limit, target=int(limit * PRUNE_TO))
+                content += "\n" + prune_text(what, n, limit)
                 flagged.append(f)
         return content
 
@@ -4780,9 +5172,21 @@ class Agent:
     # --- compaction: the conversation, summarised into a handoff note when it gets too big
     def window(self) -> int | None:
         """The context the agent works within: the model's window, capped at context_budget."""
+        return self.context_room()[0]
+
+    def context_room(self) -> tuple[int | None, str]:
+        """(the context the agent works within, why that much)."""
         ctx = self.state.get("context_tokens")
         budget = self.cfg.get("context_budget")
-        return min(ctx, int(budget)) if ctx and budget else (ctx or (int(budget) if budget else None))
+        if budget == "auto":
+            if not ctx:
+                return AUTO_UNKNOWN, "auto: the window isn't known yet"
+            if ctx <= AUTO_FULL:
+                return ctx, "auto: the whole window"
+            return max(AUTO_FULL, int(ctx * AUTO_SHARE)), f"auto: {int(AUTO_SHARE * 100)}% of a big window"
+        if budget is None:
+            return ctx, "the whole window"
+        return (min(ctx, int(budget)), "context_budget") if ctx else (int(budget), "context_budget (window unknown)")
 
     def context_share(self) -> float:
         """How full the conversation's room is (the window less the instructions), 0 when not known."""
@@ -4919,8 +5323,10 @@ class Agent:
         open(self.p("out"), "w").close()                      # truncated in place, so tail -F and chat follow
         text += (f"\n\n(Your whole earlier conversation is saved in {archived}, one message per line: grep it if "
                  "you need a detail the note doesn't have.)")
+        self.librarian(note)                                 # from the conversation that's about to go
         self.messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
         self.state["compactions"] = self.state.get("compactions", 0) + 1
+        self.state["recalled"] = []                          # a fresh context may be reminded again
         self.state["last_input_tokens"] = 0
         self.state["context_started"] = time.time()
         self.half_warned = False
@@ -4963,8 +5369,48 @@ class Agent:
         self.working = True
         self.save_context()
 
+    def instruction_files(self) -> dict[str, str]:
+        """{path: text} of the instruction files in use (one of the agent's own replaces the shared one)."""
+        out = {}
+        for d in (SHARED, self.dir):
+            for n in sorted(os.listdir(d)):
+                if n.endswith(".md") and n not in ("MEMORY.md", "BLOOPERS.md"):
+                    out.pop(os.path.join(SHARED, n), None)
+                    out[os.path.join(d, n)] = read(os.path.join(d, n))
+        return out
+
+    def watch_instructions(self) -> None:
+        """Show in the chat when an instruction file changes (the agent's edit, or a person's), with the diff."""
+        now = self.instruction_files()
+        seen = getattr(self, "_instructions_seen", None)
+        self._instructions_seen = now
+        if seen is None:
+            return
+        for path in sorted(set(now) | set(seen)):
+            old, new = seen.get(path), now.get(path)
+            if old == new:
+                continue
+            diff = [l for l in difflib.unified_diff((old or "").splitlines(), (new or "").splitlines(), lineterm="", n=0)
+                    if not l.startswith(("---", "+++", "@@"))]
+            what = "new" if old is None else "removed" if new is None else "changed"
+            self.log("hobkin", f"instructions {what}: {path}\n" + "\n".join(clip(l, 300, 0) for l in diff[:40])
+                     + (f"\n... ({len(diff) - 40} more lines)" if len(diff) > 40 else ""))
+            self.timeline(f"instructions {what}: {path}")
+
+    def look_for_lore(self) -> None:
+        """No field lore yet, but it's wanted: look for lorewell again now and then (it may have just been installed)."""
+        if self.lore or not self.cfg.get("field_lore", True) or time.time() - getattr(self, "lore_looked", 0) < 60:
+            return
+        self.lore_looked = time.time()
+        self.lore = open_field_lore()
+        if self.lore:
+            self.log("hobkin", f"field lore: on now (lorewell is installed); {len(self.lore.topics())} topics in {FIELD_LORE}")
+
     def step(self) -> None:
         """One model call, then run any commands it asked for."""
+        self.look_for_lore()
+        self.watch_instructions()
+        self.maybe_autostash()
         if self.over_budget():
             today, (budget, spent) = time.strftime("%Y-%m-%d"), self.budget_now()
             if self.state.get("budget_notice") != today:
@@ -5004,7 +5450,8 @@ class Agent:
             if is_too_long(e):
                 limit = context_limit_from_error(e.text)
                 if limit:
-                    self.state.update({"context_tokens": limit, "context_source": "learned from an error"})
+                    self.state.update({"context_tokens": limit, "context_source": "learned from an error",
+                                       "context_learned_at": time.time()})
                 else:
                     self.refresh_limits("model said the context is too long")     # it may have shrunk
                 self.compact("model said the context is too long")
@@ -5212,6 +5659,8 @@ class Agent:
                     self.compact("a task is done: a good moment", idle=True)   # between tasks, not mid-way
                     continue
                 self.save_state("idle")
+                self.maybe_tidy()
+                self.maybe_autostash()
                 if self.glass:                           # an incident: no waiting quietly
                     every = 120.0
                     self.next_idle_prompt = idle_since + every
@@ -5227,7 +5676,8 @@ class Agent:
                     news = self.take_wake()
                     if news:
                         self.log("hobkin", "woken by " + self.wake_source().replace("your ", "the "))
-                        self.add_user(WOKEN.format(source=self.wake_source(), stamp=self.stamp(), body=news))
+                        self.add_user(WOKEN.format(source=self.wake_source(), stamp=self.stamp(), body=news)
+                                      + self.recall(news))
                         idle_since = time.time()
                         continue
                     self.start_waker()
@@ -5268,6 +5718,8 @@ class Agent:
                 self.state["pid"] = None
                 self.save_state("stopped")
                 self.log("hobkin", "stopped")
+                if (self.cfg.get("stash") or {}).get("store") and not self.brownie_of and not self.moved:
+                    self.autostash(wait=True)            # a clean stop: stashed on the way out
 
 
 # ---- service: systemd user services
@@ -5388,7 +5840,7 @@ def service_states(names):
     return out
 
 
-# ---- command line: send, chat, the watch screen, list, breakglass, pack, main
+# ---- command line: send, chat, the watch screen, list, breakglass, stash, main
 
 def valid_id(agent_id):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id or ""):
@@ -6230,7 +6682,8 @@ def hearthboard_user(url: str, token: str) -> dict:
 def cmd_setup(argv):
     """hobkin URL MODEL [KEY] [--chat] [--hearthboard URL TOKEN] ...: configure the model endpoint, start an
     agent on it, maybe join it to a hearthboard, maybe chat. With --hearthboard alone, the configured model."""
-    pos, opts = split_args(argv, {"--chat", "--no-service", "--force", "--safe"}, {"--id", "--api", "--chore", "--host"},
+    pos, opts = split_args(argv, {"--chat", "--no-service", "--force", "--safe"},
+                           {"--id", "--api", "--chore", "--host", "--brownie"},
                            {"--hearthboard"}, {"--set", "--secret", "--project"})
     board = opts.get("--hearthboard")
     projects = [p.strip().lower() for x in opts.get("--project") or [] for p in x.split(",") if p.strip()]
@@ -6238,7 +6691,8 @@ def cmd_setup(argv):
         sys.exit("hobkin: --project goes with --hearthboard: which of the board's projects this worker serves")
     if len(pos) not in (2, 3) and not ((board or opts.get("--chore") or opts.get("--host") is not None) and not pos):
         sys.exit("usage: hobkin URL MODEL [KEY] [--chat] [--hearthboard BOARD_URL TOKEN] [--chore NAME [--set K=V]...] "
-                 "[--secret K=V]... [--host user@host] [--id ID] [--safe] [--api anthropic|openai] [--no-service] [--force]\n"
+                 "[--secret K=V]... [--host user@host] [--id ID] [--safe] [--api anthropic|openai] [--brownie MODEL[@SERVICE]] "
+                 "[--no-service] [--force]\n"
                  "       hobkin --hearthboard BOARD_URL TOKEN [--project SLUG]... [--id ID] [--chat]   (another agent, on the "
                  "configured model)\n"
                  "       hobkin --chore NAME [--set K=V]... [--id ID] [--chat]      (likewise, with a chore)")
@@ -6260,6 +6714,8 @@ def cmd_setup(argv):
     if pos:
         configure_model(pos, opts, agent_id)
     prepare_agent(agent_id, opts, board, board_user)
+    if opts.get("--brownie"):
+        configure_brownie(agent_id, opts["--brownie"], opts.get("--force"))
     if running:
         restart_running(agent_id)
         if opts.get("--chat"):
@@ -6324,6 +6780,50 @@ def configure_model(pos, opts, agent_id):
     print(f"model {m.name!r}: {model_id} via {m.base}, "
           + ("the default for every agent here" if fresh else f"for {agent_id} only (your other agents and settings are unchanged)")
           + f"\n  in {target}" + (f"; key in {entry['key_file']}" if key else ""))
+
+
+def configure_brownie(agent_id, spec, force=False):
+    """--brownie MODEL[@SERVICE]: the model this agent's brownies run on (its librarian too), so their labour doesn't
+    spend the main model's requests. A configured model's name, or a model id on the agent's own service (or on
+    @SERVICE: a configured model's name, or part of its host). Goes in the agent's own config.json."""
+    d = os.path.join(HOME, agent_id)
+    cfg = load_config(d)
+    models = cfg["models"]
+    if spec in models:
+        name = spec
+    else:
+        model_id, _, where = spec.rpartition("@") if "@" in spec else (spec, "", "")
+        base = models.get(cfg.get("model")) or {}
+        if where:
+            hits = {e.get("base_url"): e for n, e in models.items()
+                    if n == where or where.lower() in urllib.parse.urlparse(e.get("base_url", "")).netloc.lower()}
+            if len(hits) != 1:
+                sys.exit(f"hobkin: --brownie: {'no' if not hits else 'more than one'} configured service matches "
+                         f"{where!r}" + (f" ({', '.join(hits)})" if hits else ""))
+            base = next(iter(hits.values()))
+        entry = {k: v for k, v in base.items() if k in Agent.CONNECTION}
+        entry["model"] = model_id
+        if entry.get("api") == "anthropic":
+            entry["max_output_tokens"] = base.get("max_output_tokens") or ANTHROPIC_MAX_TOKENS
+        try:
+            found = [i for i, _ in Model("brownie", entry).list_models()]
+        except (urllib.error.URLError, OSError, ValueError):
+            found = None
+        if found is not None and model_id not in found and not force:
+            near = difflib.get_close_matches(model_id, found, n=5, cutoff=0.4)
+            sys.exit(f"hobkin: --brownie: {entry.get('base_url')} doesn't offer {model_id!r}"
+                     + (f". Close: {', '.join(near)}" if near else "") + " (--force skips this check)")
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", model_id).strip("-") or "brownie"
+        taken = models.get(name)
+        if taken and (taken.get("base_url"), taken.get("api")) != (entry.get("base_url"), entry.get("api")):
+            name += "@" + urllib.parse.urlparse(entry.get("base_url", "")).netloc.split(":")[0]
+    path = os.path.join(d, "config.json")
+    data = read_json(path, {}, exit_if_broken=True)
+    if spec not in models:
+        data.setdefault("models", {})[name] = entry
+    data["brownie"] = {**(data.get("brownie") or {}), "model": name}
+    write_json(path, data)
+    print(f"{agent_id}: brownies (and its librarian) run on {name!r}")
 
 
 # New agents get a name: consonant, vowel, consonant, "kin" (bodkin, tamkin, lirkin...). No c/k/q/x/y,
@@ -6431,48 +6931,131 @@ def start_agent(agent_id, opts):
     print(f"talk: hobkin chat {agent_id}")
 
 
-# --- pack, purge, break glass
-# A packed agent (hobkin pack): what's left out, and what it's told when it's started from the bundle
-PACK_SKIP = {"secrets.env", "keys", "in", "lock", "shell", "shell.sh", ".cwd", "last-output.log", ".tmp"}
-PACK_BIG = 2 * 1024 * 1024          # bigger files in its workspace stay out (salvaged copies went elsewhere)
-RESTORED = ("[from hobkin: you've been started from a bundle of yourself, packed {stamp} on {host}, where your "
-            "folder was {old}; it's now your folder ($HOBKIN_DIR), so read old paths under it as being there. The "
-            "system you were on may be gone: what you know of it is your MEMORY.md, your workspace (notes, "
-            "manifests, the incident timeline), your conversation and archive/. People will ask what you found: "
-            "answer from those, say where each thing was saved, and say when you aren't sure.]")
-RESTORE_MD = """# {aid}, packed {stamp} on {host}
+# --- purge, break glass (and stash, below)
+# --- stash: an agent moved between machines through a store (S3 with the AWS CLI, or a folder)
+STASH_KEEP = 10                     # stashes kept per agent (older ones are deleted: roll back within these)
+STASH_BIG = 50 * 1024 * 1024        # bigger files in the workspace stay out
+STASH_SKIP = {"secrets.env", "keys", "in", "lock", "shell", "shell.sh", ".cwd", "last-output.log", ".tmp", "brownies",
+              "jobs", "hobkin.log", ".git", "__pycache__"}
+STASH_MOVED = 3                     # exit code of `stash --auto` when the agent was popped elsewhere since
+MOVED = ("[from hobkin: you've moved: stashed on {old} {when} and popped here, on {new}. Your conversation, memory, "
+         "workspace and the field lore came with you; running jobs and shells didn't. Paths and tools may differ "
+         "here: check before you rely on them. If the machine you were on is gone, what you know of it is your "
+         "MEMORY.md, your workspace (notes, manifests, an incident's timeline), your conversation and archive/: "
+         "people will ask what you found, so answer from those, say where each thing was saved, and say when you "
+         "aren't sure.]")
+RESTORE_MD = """# {aid}, stashed {stamp} on {host}
 
-This is hobkin agent {aid}: the program (hobkin.py), its instructions, memory, conversation, archive and
-workspace notes, without secrets, API keys or big files from its workspace. Start it with any model:
+This is hobkin agent {aid}: the program itself (hobkin.py), its instructions, memory, conversation, archive,
+workspace and the field lore, without secrets or API keys. To carry on with it on any machine:
 
-    tar xzf {name}.tar.gz && cd {name}
-    HOBKIN_HOME=$PWD/home python3 hobkin.py URL MODEL [KEY] --id {aid} --no-service --chat
+    tar xzf {name} hobkin.py
+    python3 hobkin.py stash pop {name} --no-start
+    python3 hobkin.py URL MODEL [KEY] --id {aid} --chat      # give it a model here, and talk to it
 
-(e.g. URL MODEL = https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5). Its first message tells it it's
-a restored copy, so ask it what it found. Left out: {left}.
+(`hobkin stash pop {name}` where hobkin is installed; put HOBKIN_HOME=DIR in front of each to keep it apart from
+the agents already there). Its first message tells it it moved, so ask it what it found. Left out: {left}.
 """
 
 
-def cmd_pack(argv):
-    """hobkin pack ID [--to DIR]: the agent as a .tar.gz that starts again anywhere (RESTORE.md inside says
-    how). No secrets (secrets.env, keys, model headers) and no shell state; break-glass mode is left behind."""
-    pos, opts = split_args(argv, set(), {"--to"})
-    if len(pos) != 1:
-        sys.exit("usage: hobkin pack ID [--to DIR]")
-    aid = valid_id(pos[0])
+class StashStore:
+    """Where stashes go: s3://bucket/prefix (through the AWS CLI), or a folder. One folder per agent: its stashes
+    (STAMP-HOST.tar.gz, UTC stamps so they sort) and claim.json (which machine has it)."""
+
+    def __init__(self, url: str):
+        self.s3 = url.startswith("s3://")
+        self.url = url.rstrip("/") if self.s3 else os.path.abspath(os.path.expanduser(url))
+        if self.s3 and not shutil.which("aws"):
+            sys.exit("hobkin: stashing to S3 uses the AWS CLI, and there's no `aws` here")
+
+    def aws(self, *args) -> subprocess.CompletedProcess:
+        r = subprocess.run(["aws", "s3", *args, "--only-show-errors"] if args[0] in ("cp", "rm") else ["aws", "s3", *args],
+                           capture_output=True, text=True, timeout=600)
+        return r
+
+    def put(self, local: str, key: str) -> None:
+        if self.s3:
+            r = self.aws("cp", local, f"{self.url}/{key}")
+            if r.returncode:
+                sys.exit(f"hobkin: couldn't upload to {self.url}/{key}: {r.stderr.strip()}")
+            return
+        dest = os.path.join(self.url, key)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(local, dest + ".part")
+        os.replace(dest + ".part", dest)
+
+    def get(self, key: str, local: str) -> bool:
+        if self.s3:
+            return self.aws("cp", f"{self.url}/{key}", local).returncode == 0
+        src = os.path.join(self.url, key)
+        if not os.path.isfile(src):
+            return False
+        shutil.copyfile(src, local)
+        return True
+
+    def names(self, prefix: str = "") -> list[str]:
+        """What's in a folder of the store: files, and folders as NAME/."""
+        if self.s3:
+            r = self.aws("ls", f"{self.url}/{prefix.strip('/') + '/' if prefix else ''}")
+            out = []
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if parts[:1] == ["PRE"]:
+                    out.append(parts[1])
+                elif len(parts) >= 4:
+                    out.append(" ".join(parts[3:]))
+            return sorted(out)
+        d = os.path.join(self.url, prefix)
+        return sorted(n + ("/" if os.path.isdir(os.path.join(d, n)) else "") for n in os.listdir(d)) \
+            if os.path.isdir(d) else []
+
+    def read_json(self, key: str) -> dict | None:
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "x.json")
+            return read_json(f, None) if self.get(key, f) else None
+
+    def write_json(self, key: str, data: dict) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "x.json")
+            write_json(f, data)
+            self.put(f, key)
+
+    def delete(self, key: str) -> None:
+        if self.s3:
+            self.aws("rm", f"{self.url}/{key}")
+        elif os.path.isfile(os.path.join(self.url, key)):
+            os.remove(os.path.join(self.url, key))
+
+
+def stop_agent(aid: str, timeout: float = 120) -> None:
+    """Stop a running agent and wait for it: its service if it runs as one, else /stop through its FIFO."""
     d = os.path.join(HOME, aid)
-    if not os.path.isdir(d):
-        sys.exit(f"hobkin: no agent {aid}")
-    stamp, host = time.strftime("%Y%m%d-%H%M%S"), os.uname().nodename
-    name = f"hobkin-{aid}-{stamp}"
-    out_dir = os.path.abspath(os.path.expanduser(opts.get("--to") or os.path.join(d, "work")))
-    os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, name + ".tar.gz")
-    left = ["secrets.env and API keys", "shell state"]
+    unit = f"{unit_prefix()}@{aid}.service"
+    if shutil.which("systemctl") and systemctl("is-active", unit).stdout.strip() == "active":
+        systemctl("stop", unit)
+    else:
+        try:
+            fd = os.open(os.path.join(d, "in"), os.O_WRONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"/stop\n")
+        except OSError:
+            pass
+    end = time.time() + timeout
+    while is_running(d) and time.time() < end:
+        time.sleep(0.5)
+    if is_running(d):
+        sys.exit(f"hobkin: {aid} didn't stop within {int(timeout)}s (it finishes its current step first): try again")
+
+
+def pack_stash(aid: str, out: str, max_bytes: int = STASH_BIG) -> list[str]:
+    """The agent (its folder, the shared folder, a consistent copy of the field lore) and hobkin.py itself, as a
+    .tar.gz at `out` that starts again anywhere (RESTORE.md inside says how). No secrets: no keys, secrets.env or
+    model headers. Returns what was left out."""
+    d = os.path.join(HOME, aid)
+    left = ["keys, secrets.env and model headers (supply them on the new machine)"]
 
     def clean_cfg(path):
         cfg = read_json(path, {}, exit_if_broken=True)
-        cfg.pop("break_glass", None)
         for m in (cfg.get("models") or {}).values():
             if isinstance(m, dict):
                 m.pop("headers", None)
@@ -6484,40 +7067,218 @@ def cmd_pack(argv):
         info.size, info.mtime, info.mode = len(data), int(time.time()), 0o600
         tar.addfile(info, io.BytesIO(data))
 
-    def add_tree(tar, src, arc, replaced):          # replaced: files at this level written cleaned instead
-        for name_ in sorted(os.listdir(src)):
-            full, a = os.path.join(src, name_), f"{arc}/{name_}"
-            if name_ in PACK_SKIP or name_.endswith(".key") or os.path.islink(full) or full == out \
-                    or name_ in replaced:
+    def add_tree(tar, src, arc, replaced=()):
+        for n in sorted(os.listdir(src)):
+            full, a = os.path.join(src, n), f"{arc}/{n}"
+            if n in STASH_SKIP or n in replaced or n.endswith((".key", ".lore.db", ".lore.db-journal")) \
+                    or os.path.islink(full) or ".tmp" in n:
                 continue
             if os.path.isdir(full):
-                add_tree(tar, full, a, ())
+                add_tree(tar, full, a)
             elif os.path.isfile(full):
-                if f"/{aid}/work/" in a and os.path.getsize(full) > PACK_BIG:
-                    left.append(f"{a.split('/home/', 1)[1]} ({os.path.getsize(full) // 1024} KB)")
+                if os.path.getsize(full) > max_bytes:
+                    left.append(f"{a} ({os.path.getsize(full) // 1024} KB)")
                     continue
                 tar.add(full, a, recursive=False)
 
-    with tarfile.open(out + ".part", "w:gz") as tar:
-        tar.add(os.path.abspath(__file__), f"{name}/hobkin.py")
-        if os.path.isdir(SHARED):
-            add_tree(tar, SHARED, f"{name}/home/_shared", ("config.json",))
-        if os.path.exists(os.path.join(SHARED, "config.json")):
-            add_text(tar, f"{name}/home/_shared/config.json",
-                     json.dumps(clean_cfg(os.path.join(SHARED, "config.json")), indent=2) + "\n")
-        add_tree(tar, d, f"{name}/home/{aid}", ("config.json", "state.json", "queue"))
-        add_text(tar, f"{name}/home/{aid}/config.json", json.dumps(clean_cfg(os.path.join(d, "config.json")), indent=2) + "\n")
+    with tempfile.TemporaryDirectory() as t, tarfile.open(out, "w:gz") as tar:
+        add_tree(tar, d, "agent", ("config.json", "state.json"))
+        if os.path.exists(os.path.join(d, "config.json")):
+            add_text(tar, "agent/config.json", json.dumps(clean_cfg(os.path.join(d, "config.json")), indent=2) + "\n")
         state = read_json(os.path.join(d, "state.json"), {})
-        for k in ("break_glass", "glass_seen", "glass_log", "pid", "status"):
+        for k in ("pid", "status", "jobs", "brownies", "break_glass", "glass_seen", "glass_log"):
             state.pop(k, None)
-        add_text(tar, f"{name}/home/{aid}/state.json", json.dumps(state, indent=2) + "\n")
-        queued = read(os.path.join(d, "queue"))
-        add_text(tar, f"{name}/home/{aid}/queue", queued + json.dumps(RESTORED.format(stamp=when_text(time.time()),
-                                                                                      host=host, old=d)) + "\n")
-        add_text(tar, f"{name}/RESTORE.md", RESTORE_MD.format(aid=aid, stamp=when_text(time.time()), host=host,
-                                                              name=name, left="; ".join(left)))
-    os.replace(out + ".part", out)
-    print(f"{aid}: packed into {out} ({os.path.getsize(out) // 1024} KB); RESTORE.md inside says how to start it")
+        add_text(tar, "agent/state.json", json.dumps(state, indent=2) + "\n")
+        if os.path.isdir(SHARED):
+            add_tree(tar, SHARED, "shared", ("config.json",))
+            if os.path.exists(os.path.join(SHARED, "config.json")):
+                add_text(tar, "shared/config.json", json.dumps(clean_cfg(os.path.join(SHARED, "config.json")), indent=2) + "\n")
+        lore = open_field_lore()
+        if lore and os.path.exists(FIELD_LORE):
+            tar.add(str(lore.backup(os.path.join(t, "field.lore.db"))), "field.lore.db")
+        elif os.path.exists(FIELD_LORE):
+            left.append("the field lore (lorewell isn't installed here to copy it safely)")
+        add_text(tar, "stash.json", json.dumps({"agent": aid, "host": os.uname().nodename, "at": time.time(),
+                                                "hobkin": __version__}) + "\n")
+        tar.add(os.path.abspath(__file__), "hobkin.py")
+        add_text(tar, "RESTORE.md", RESTORE_MD.format(aid=aid, stamp=when_text(time.time()), host=os.uname().nodename,
+                                                      name=os.path.basename(out), left="; ".join(left)))
+    return left
+
+
+def stash_one(aid: str, store: StashStore, keep_running: bool = False, auto: bool = False,
+              max_bytes: int = STASH_BIG) -> int:
+    d = os.path.join(HOME, aid)
+    if not os.path.isdir(d):
+        sys.exit(f"hobkin: no agent {aid}")
+    if not keep_running and not auto and os.environ.get("HOBKIN_ID") == aid and is_running(d):
+        sys.exit(f"hobkin: {aid} can't move itself while it's running: stash with --keep-running (a copy), and stop")
+    me = os.uname().nodename
+    claim = store.read_json(f"{aid}/claim.json") or {}
+    if auto and claim.get("host") not in (None, "", me):
+        print(f"{aid}: popped on {claim['host']} since: not stashing over it from here")
+        return STASH_MOVED
+    moving = not keep_running and not auto
+    if moving and is_running(d):
+        print(f"{aid}: stopping it (it's moving; --keep-running stashes a copy and leaves it running)")
+        stop_agent(aid)
+    name = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + f"-{re.sub(r'[^A-Za-z0-9._-]+', '-', me)}.tar.gz"
+    with tempfile.TemporaryDirectory() as t:
+        out = os.path.join(t, name)
+        left = pack_stash(aid, out, max_bytes)
+        size = os.path.getsize(out)
+        store.put(out, f"{aid}/{name}")
+    store.write_json(f"{aid}/claim.json", {"host": "" if moving else me, "at": time.time(), "from": me, "stash": name})
+    old = [n for n in store.names(aid) if n.endswith(".tar.gz")][:-STASH_KEEP]
+    for n in old:
+        store.delete(f"{aid}/{n}")
+    if not auto:
+        print(f"{aid}: stashed in {store.url}/{aid}/{name} ({size // 1024} KB)"
+              + (f"; left out: {'; '.join(left)}" if left else "")
+              + (f"\n  carry on elsewhere: hobkin stash pop {aid} {store.url}" if moving else ""))
+    return 0
+
+
+def safe_members(tar: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    """Only plain files and folders, inside the archive's own folder (no absolute paths, .., links or devices)."""
+    out = []
+    for m in tar.getmembers():
+        parts = m.name.split("/")
+        if m.name.startswith("/") or ".." in parts or not (m.isfile() or m.isdir()):
+            continue
+        out.append(m)
+    return out
+
+
+def stash_pop(aid: str, store: StashStore | None, opts: dict, bundle: str | None = None) -> None:
+    """From a store (the newest stash, or --from STAMP), or from a stash file itself (`bundle`: no store, no claim)."""
+    me = os.uname().nodename
+    if bundle:
+        name, claim = os.path.basename(bundle), {}
+        with tarfile.open(bundle) as tar:
+            try:
+                aid = valid_id(json.load(tar.extractfile("stash.json"))["agent"])
+            except (KeyError, ValueError, TypeError):
+                sys.exit(f"hobkin: {bundle} isn't a hobkin stash")
+    else:
+        aid = valid_id(aid)
+        names = [n for n in store.names(aid) if n.endswith(".tar.gz")]
+        if opts.get("--from"):
+            names = [n for n in names if n.startswith(opts["--from"])]
+        if not names:
+            sys.exit(f"hobkin: no stash of {aid} in {store.url}" + (f" from {opts['--from']}" if opts.get("--from") else ""))
+        name = names[-1]
+        claim = store.read_json(f"{aid}/claim.json") or {}
+    if claim.get("host") not in (None, "", me):
+        print(f"note: {aid} was still claimed by {claim['host']} ({when_text(float(claim.get('at') or 0))}). If it's "
+              "still running there, it stops itself at its next auto-stash; taking it here.")
+    d = os.path.join(HOME, aid)
+    if os.path.isdir(d) and is_running(d):
+        sys.exit(f"hobkin: {aid} is running here already: stop it first (echo /stop > {os.path.join(d, 'in')})")
+    with tempfile.TemporaryDirectory() as t:
+        tgz = os.path.abspath(bundle) if bundle else os.path.join(t, name)
+        if not bundle and not store.get(f"{aid}/{name}", tgz):
+            sys.exit(f"hobkin: couldn't download {store.url}/{aid}/{name}")
+        root = os.path.join(t, "x")
+        with tarfile.open(tgz) as tar:
+            tar.extractall(root, members=safe_members(tar),
+                           **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+        info = read_json(os.path.join(root, "stash.json"), {})
+        if os.path.isdir(d):                            # kept, not overwritten: move it aside
+            aside = os.path.join(HOME, ".replaced", f"{aid}-{time.strftime('%Y%m%d-%H%M%S')}")
+            os.makedirs(os.path.dirname(aside), exist_ok=True)
+            shutil.move(d, aside)
+            print(f"{aid}: the copy that was here is kept in {aside}")
+        shutil.copytree(os.path.join(root, "agent"), d)
+        added = []
+        src_shared = os.path.join(root, "shared")       # the shared folder: only what's missing here is filled in
+        for dirpath, _, files in os.walk(src_shared):
+            for f in files:
+                rel = os.path.relpath(os.path.join(dirpath, f), src_shared)
+                dest = os.path.join(SHARED, rel)
+                if not os.path.exists(dest):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copyfile(os.path.join(dirpath, f), dest)
+                    added.append(rel)
+        if added:
+            print(f"shared: added {', '.join(added[:8])}" + (f" and {len(added) - 8} more" if len(added) > 8 else "")
+                  + " (what was already here is left as it is)")
+        lore_src = os.path.join(root, "field.lore.db")
+        if os.path.exists(lore_src):
+            lore = open_field_lore()
+            if lore:
+                c = lore.merge(lore_src)
+                print(f"field lore: merged in ({', '.join(f'{v} {k}' for k, v in c.items())})")
+            elif not os.path.exists(FIELD_LORE):
+                os.makedirs(os.path.dirname(FIELD_LORE), exist_ok=True)
+                shutil.copyfile(lore_src, FIELD_LORE)
+                print(f"field lore: copied to {FIELD_LORE} (install lorewell to use it: pip install lorewell)")
+            else:
+                print("field lore: not merged (that needs lorewell: pip install lorewell)")
+    if store:
+        store.write_json(f"{aid}/claim.json", {"host": me, "at": time.time(), "from": info.get("host"), "stash": name})
+    queue_message(d, MOVED.format(old=info.get("host", "another machine"), new=me,
+                                  when=when_text(float(info.get("at") or time.time()))))
+    cfg = load_config(d)
+    m = cfg["models"].get(cfg.get("model") or "") or {}
+    env = load_env_file(os.path.expanduser("~/.config/hobkin/env"))
+    if m.get("key_file") and not os.path.exists(os.path.expanduser(m["key_file"])):
+        print(f"note: its model ({cfg.get('model')}) reads its key from {m['key_file']}, which isn't on this machine: "
+              f"put the key there (chmod 600)" + (f", or set ${m['key_env']}" if m.get("key_env") else ""))
+    elif m.get("key_env") and not m.get("key_file") and m["key_env"] not in os.environ and m["key_env"] not in env:
+        print(f"note: its model ({cfg.get('model')}) reads its key from ${m['key_env']}: put {m['key_env']}=... in "
+              "~/.config/hobkin/env (chmod 600)")
+    print(f"{aid}: popped from {bundle or f'{store.url}/{aid}/{name}'} (stashed on {info.get('host', '?')})")
+    if not opts.get("--no-start"):
+        start_agent(aid, opts)
+
+
+def cmd_stash(argv):
+    """hobkin stash ID|--all STORE [--keep-running] | stash pop ID STORE [--from STAMP] [--no-start] [--no-service]
+    | stash list STORE."""
+    usage = ("usage: hobkin stash ID STORE [--keep-running] [--max-mb N]   (pack it up and upload it; it stops here "
+             "unless --keep-running)\n       hobkin stash --all STORE [--keep-running]\n"
+             "       hobkin stash pop ID STORE [--from STAMP] [--no-start] [--no-service]   (download, unpack, start)\n"
+             "       hobkin stash pop FILE.tar.gz [--no-start] [--no-service]   (from a stash file itself)\n"
+             "       hobkin stash list STORE\n  STORE: s3://bucket/prefix (with the AWS CLI) or a folder")
+    if argv[:1] == ["pop"]:
+        pos, opts = split_args(argv[1:], {"--no-start", "--no-service"}, {"--from"})
+        if len(pos) == 1 and pos[0].endswith(".tar.gz") and os.path.isfile(pos[0]):
+            return stash_pop("", None, opts, bundle=pos[0])
+        if len(pos) != 2:
+            sys.exit(usage)
+        return stash_pop(pos[0], StashStore(pos[1]), opts)
+    if argv[:1] == ["list"]:
+        if len(argv) != 2:
+            sys.exit(usage)
+        store = StashStore(argv[1])
+        rows = []
+        for a in [n.rstrip("/") for n in store.names() if n.endswith("/")]:
+            stashes = [n for n in store.names(a) if n.endswith(".tar.gz")]
+            if not stashes:
+                continue
+            claim = store.read_json(f"{a}/claim.json") or {}
+            where = f"running on {claim['host']}" if claim.get("host") else "not running anywhere (moving)"
+            rows.append(f"{a}: {len(stashes)} stash{'es' if len(stashes) != 1 else ''}, latest {stashes[-1][:-7]}; {where}")
+        return print("\n".join(rows) or f"nothing stashed in {store.url}")
+    pos, opts = split_args(argv, {"--all", "--keep-running", "--auto"}, {"--max-mb"})
+    try:
+        max_bytes = int(float(opts.get("--max-mb") or STASH_BIG / (1024 * 1024)) * 1024 * 1024)
+    except ValueError:
+        sys.exit("hobkin: --max-mb is a number (the biggest workspace file to take along, in MB)")
+    if (len(pos) != 2 and not opts.get("--all")) or (opts.get("--all") and len(pos) != 1):
+        sys.exit(usage)
+    store = StashStore(pos[-1])
+    if opts.get("--all"):
+        agents = sorted(n for n in os.listdir(HOME) if not n.startswith((".", "_"))
+                        and os.path.exists(os.path.join(HOME, n, "context.jsonl")))
+        for a in agents:
+            stash_one(a, store, bool(opts.get("--keep-running")), max_bytes=max_bytes)
+        return None
+    code = stash_one(valid_id(pos[0]), store, bool(opts.get("--keep-running")), bool(opts.get("--auto")), max_bytes)
+    if code:
+        sys.exit(code)
+    return None
 
 
 def cmd_purge(argv):
@@ -6687,8 +7448,8 @@ def main(argv):
         return cmd_list()
     if argv[:1] == ["breakglass"]:
         return cmd_breakglass(argv[1:])
-    if argv[:1] == ["pack"]:
-        return cmd_pack(argv[1:])
+    if argv[:1] == ["stash"]:
+        return cmd_stash(argv[1:])
     if argv[:1] == ["purge"]:
         return cmd_purge(argv[1:])
     if argv[:1] == ["watch"]:

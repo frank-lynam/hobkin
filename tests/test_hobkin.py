@@ -713,7 +713,7 @@ try:
     json.dump(cfg, open(h + "/_shared/config.json", "w"))
     d = os.path.join(h, "longlived"); os.makedirs(d + "/archive"); os.makedirs(d + "/jobs/1")
     json.dump({"last_step": time.time() - 3 * 86400 - 7200}, open(d + "/state.json", "w"))
-    open(d + "/BLOOPERS.md", "w").write("".join(f"- slip {i}\n" for i in range(70)))
+    open(d + "/BLOOPERS.md", "w").write("".join(f"- slip {i}: " + "x" * 120 + "\n" for i in range(70)))   # ~9.1 KB
     old = time.time() - 40 * 86400
     for n in ("context-20200101-000000.jsonl", "out-20200101-000000.log", "context-20200102-000000.jsonl"):
         open(f"{d}/archive/{n}", "w").write("{}\n"); os.utime(f"{d}/archive/{n}", (old, old))
@@ -733,11 +733,11 @@ try:
           and json.load(open(d + "/state.json"))["model"].startswith("n2"), out[-600:])
     alerts = open(os.path.join(BASE, "alerts.txt")).read()
     check("[alert] the switch is announced through alert_command", "model m (fake-gone via" in alerts and "switched to n2" in alerts, alerts)
-    check("[limits] an overgrown blooper reel is flagged in the prompt, with a target 40% under the limit (hysteresis)",
-          "your blooper reel is 70 lines, past its 60-line limit. Cut it back to about 36 lines in one go (roughly"
+    check("[limits] an overgrown blooper reel (in bytes) is flagged in the prompt, with a target 40% under the limit (hysteresis)",
+          "past its 8 KB limit. Cut it back to about 4.8 KB in one go (roughly"
           in ctx(d)[0]["content"] and "your memory is" not in ctx(d)[0]["content"])
     say(d, 'call: read_file {"path": "$HOBKIN_BLOOPERS"}'); wait_for(d, "BLOOPERS.md:     1|")
-    check("[limits] and nudged when it opens it", "past its 60-line limit. Cut it back to about 36"
+    check("[limits] and nudged when it opens it", "past its 8 KB limit. Cut it back to about 4.8 KB"
           in last_results(d)["content"][0]["content"])
     n_results = lambda: len([m for m in ctx(d) if m["role"] == "user" and any(b.get("type") == "tool_result" for b in m["content"])])
     before = n_results()
@@ -787,6 +787,7 @@ try:
              {"idle_prompt": None})
     p, aid, d = start(h)
     say(d, "/limits"); wait_for(d, "limits (/limits): context 100000 (unchanged")
+    wait_for(d, "working within 100,000 (auto: the whole window); instructions about")
     urllib.request.urlopen("http://127.0.0.1:48705/set_ctx/60000").read()
     say(d, "/limits"); wait_for(d, "context window now 60000 (was 100000")
     check("[limits] /limits picks up a changed window", json.load(open(d + "/state.json"))["context_tokens"] == 60000)
@@ -913,6 +914,75 @@ try:
           acfg["model"] == "fake-costly" and acfg["models"]["fake-costly"]["base_url"] == "http://127.0.0.1:48702/v1", r.stdout)
     r = run("chat", "s1", input="/model fake sideways\n")
     check("[model] /model with a second word that isn't a style says how it goes", "/model NAME [@SERVICE] [anthropic|openai]" in r.stdout, r.stdout)
+    # The field lore (lorewell): filed with the tool, recalled when it bears on a message, aliases joining names
+    import lorewell
+    lore = lorewell.Living(hs + "/_shared/field.lore.db")
+    run("chat", "s1", input='call: field_lore {"action": "remember", "entries": [{"topic": "repo/widget/build", "text": '
+                            '"Build widget with make; the slow suite takes 20 minutes. token=abc123secret"}, {"topic": '
+                            '"people/frank/preferences", "text": "Frank likes short answers."}]}\n')
+    t = lore.get("repo/widget/build")
+    check("[lore] field_lore remember files topics, by the agent, with secrets redacted", t and t["by"] == "s1"
+          and "abc123secret" not in t["body"] and lore.get("people/frank/preferences"), t)
+    lore.alias("flynam", "frank")
+    r = run("chat", "s1", input="how do I build widget with make?\n")
+    last = [b["text"] for b in ctx(hs + "/s1")[-2]["content"] if b.get("type") == "text"][-1]
+    check("[lore] recall: a message it bears on brings the topic along", "from the field lore" in last
+          and "repo/widget/build" in last and "echo: how do I build widget with make?" in r.stdout, last[-400:])
+    r = run("chat", "s1", input="how do I build widget with make, again?\n")
+    last = [b["text"] for b in ctx(hs + "/s1")[-2]["content"] if b.get("type") == "text"][-1]
+    check("[lore] ...once per context, not every time", "from the field lore" not in last, last[-400:])
+    r = run("chat", "s1", input="what does flynam want from answers?\n")
+    last = [b["text"] for b in ctx(hs + "/s1")[-2]["content"] if b.get("type") == "text"][-1]
+    check("[lore] aliases: flynam finds what's filed under frank", "people/frank/preferences" in last, last[-400:])
+    r = run("chat", "s1", input="yeah sounds good\n")
+    last = [b["text"] for b in ctx(hs + "/s1")[-2]["content"] if b.get("type") == "text"][-1]
+    check("[lore] chatter recalls nothing", "from the field lore" not in last, last[-300:])
+    run("chat", "s1", input='call: field_lore {"action": "alias", "alias": "Linium F", "name": "flynam"}\n')
+    check("[lore] field_lore alias joins a name to someone's (their canonical name)", lore.names_of("linium f")
+          == ["frank", "flynam", "linium f"], lore.names_of("linium f"))
+    # It knows its own files; the blooper reel is in the prompt once; an instruction change shows in the chat
+    open(hs + "/s1/BLOOPERS.md", "w").write("- tripped on the rug (marker-7731)\n")
+    open(hs + "/s1/AGENTS.md", "w").write("Always say hi first.\n")
+    run("chat", "s1", input="hello again\n")
+    sp = ctx(hs + "/s1")[0]["content"]
+    check("[self] the system prompt says where its files are and how its instructions work", "# Your own files" in sp
+          and hs + "/s1" in sp and "a change takes effect on your next one" in sp and "edit the file in your folder" in sp, sp[:300])
+    check("[self] the blooper reel is in the prompt once (not also as an instruction file)", sp.count("marker-7731") == 1,
+          sp.count("marker-7731"))
+    out = open(hs + "/s1/out").read()
+    check("[self] a new instruction file is shown in the chat, with what it says", "instructions new: " + hs + "/s1/AGENTS.md"
+          in out and "+Always say hi first." in out, out[-600:])
+    # Compaction hands the conversation to a librarian brownie, in the background, its report only logged
+    run("chat", "s1", input="/compact\n")
+    for _ in range(150):
+        if "librarian (brownie #" in open(hs + "/s1/out").read(): break
+        time.sleep(0.2)
+    out = open(hs + "/s1/out").read()
+    check("[lore] at compaction a librarian brownie gets the note, and reports to the log, not the agent",
+          "librarian (brownie #" in out and not any("a brownie you sent reports back" in json.dumps(m) for m in ctx(hs + "/s1")),
+          out[-800:])
+    # Stash: to a folder store and back, onto another "machine" (another home)
+    store = os.path.join(BASE, "stash-store")
+    r = run("stash", "s1", store, "--keep-running")
+    claim = json.load(open(store + "/s1/claim.json"))
+    check("[stash] --keep-running: stashed, still running, claimed by this machine", r.returncode == 0
+          and "stashed in" in r.stdout and os.uname().nodename == claim["host"], r.stdout + r.stderr)
+    r = run("stash", "list", store)
+    check("[stash] list says what's stashed and where it runs", "s1: 1 stash, latest" in r.stdout
+          and "running on " + os.uname().nodename in r.stdout, r.stdout)
+    h2 = os.path.join(BASE, "box2")
+    env2 = {**env, "HOBKIN_HOME": h2}
+    r = subprocess.run([sys.executable, HOB, "stash", "pop", "s1", store, "--no-start"], env=env2, capture_output=True,
+                       text=True, timeout=60)
+    names = os.listdir(h2 + "/s1")
+    check("[stash] pop: the agent, its conversation and the field lore arrive; no keys or secrets",
+          r.returncode == 0 and "context.jsonl" in names and "you've moved" in open(h2 + "/s1/queue").read()
+          and lorewell.Living(h2 + "/_shared/field.lore.db").get("repo/widget/build")
+          and not os.path.exists(h2 + "/_shared/keys") and "secrets.env" not in names, r.stdout + r.stderr)
+    json.dump({"host": "another-box", "at": time.time()}, open(store + "/s1/claim.json", "w"))
+    r = run("stash", "s1", store, "--auto")
+    check("[stash] auto-stash after it was popped elsewhere: doesn't overwrite it, and says it moved (exit 3)",
+          r.returncode == 3 and "popped on another-box" in r.stdout, r.stdout + r.stderr)
     run("send", "s1", "/stop")
     # --hearthboard: join a board (the fake web server plays one); a bad token is refused before anything's written
     r = run("--hearthboard", "http://127.0.0.1:48790/board", "hb-bad", "--no-service")
@@ -1200,42 +1270,55 @@ try:
           and "tools/hold: not offered: that's the name of a built-in tool" in sysp and "tools/noexec: not offered: it has no executable `run`" in sysp, sysp[-900:])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
-    # hobkin pack: a bundle without secrets that starts anywhere, told it's a restored copy
+    # An agent stashes itself into a file (as break glass's salvage does): no secrets, and it starts anywhere
     h = home("pack", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
                       "headers": {"X-Auth": "header-secret"}}, {"idle_prompt": None})
     p, aid, d = start(h)
     open(d + "/secrets.env", "w").write("AWS_SECRET=very-secret\n")
     open(d + "/MEMORY.md", "w").write("Found: the orders db, dumped to s3://acme-backups/salvage/\n")
     open(d + "/work/salvaged.bin", "wb").write(b"x" * (3 * 1024 * 1024))
-    say(d, "run: python3 $HOBKIN_SELF pack $HOBKIN_ID --to $HOBKIN_WORK/out && ls $HOBKIN_WORK/out")
+    say(d, "run: python3 $HOBKIN_SELF stash $HOBKIN_ID $HOBKIN_WORK/out --keep-running --max-mb 2 && ls $HOBKIN_WORK/out/$HOBKIN_ID")
     wait_for(d, "Done. Output was")
     p.send_signal(signal.SIGTERM); p.wait(10)
     import tarfile
-    bundles = os.listdir(d + "/work/out")
-    check("[pack] an agent packs itself with $HOBKIN_SELF", len(bundles) == 1 and bundles[0].startswith(f"hobkin-{aid}-"), bundles)
-    tar = tarfile.open(os.path.join(d, "work/out", bundles[0])); names = tar.getnames()
-    blob = b"".join(tar.extractfile(m).read() for m in tar.getmembers() if m.isfile() and not m.name.endswith("/hobkin.py"))
-    check("[pack] no secrets, keys or model headers; each file once; big workspace files left out",
+    bundles = [n for n in os.listdir(d + "/work/out/" + aid) if n.endswith(".tar.gz")]
+    check("[stash] an agent stashes itself with $HOBKIN_SELF (into a folder)", len(bundles) == 1, os.listdir(d + "/work/out"))
+    bundle = os.path.join(d, "work/out", aid, bundles[0])
+    tar = tarfile.open(bundle); names = tar.getnames()
+    blob = b"".join(tar.extractfile(m).read() for m in tar.getmembers() if m.isfile() and m.name != "hobkin.py")
+    check("[stash] no secrets, keys or model headers; each file once; files over --max-mb left out",
           b"very-secret" not in blob and b"header-secret" not in blob and len(names) == len(set(names))
-          and not any(n.endswith(("secrets.env", "salvaged.bin", "/in", "/lock")) for n in names), names)
-    top = os.path.join(BASE, "restored"); tar.extractall(top); top = os.path.join(top, bundles[0][:-7])
-    check("[pack] RESTORE.md says how to start it and what was left out", "--id " + aid in open(top + "/RESTORE.md").read()
-          and "salvaged.bin" in open(top + "/RESTORE.md").read())
+          and not any(n.endswith(("secrets.env", "salvaged.bin", "/in", "/lock")) for n in names)
+          and "hobkin.py" in names and "RESTORE.md" in names, names)
+    restore = tar.extractfile("RESTORE.md").read().decode()
+    check("[stash] RESTORE.md says how to start it and what was left out", "stash pop " + bundles[0] in restore
+          and "--id " + aid in restore and "salvaged.bin" in restore, restore)
+    top = os.path.join(BASE, "restored"); os.makedirs(top)
+    tar.extract("hobkin.py", top)
+    renv = {**os.environ, "HOBKIN_HOME": top + "/home"}
+    r = subprocess.run([sys.executable, top + "/hobkin.py", "stash", "pop", bundle, "--no-start"], env=renv,
+                       capture_output=True, text=True, timeout=60)
+    check("[stash] pop FILE: a stash file itself, without a store", r.returncode == 0 and os.path.isdir(top + "/home/" + aid),
+          r.stdout + r.stderr)
     r = subprocess.run([sys.executable, top + "/hobkin.py", "http://127.0.0.1:48701", "fake", "test-key", "--id", aid, "--no-service",
-                        "--api", "anthropic"], env={**os.environ, "HOBKIN_HOME": top + "/home"}, capture_output=True, text=True, timeout=60)
+                        "--api", "anthropic"], env=renv, capture_output=True, text=True, timeout=60)
     rd = top + "/home/" + aid
     try:
-        wait_for(rd, "started from a bundle of yourself"); wait_for(rd, "agent> echo:")
+        wait_for(rd, "you've moved"); wait_for(rd, "agent> echo:")
         c = ctx(rd)
-        check("[pack] the restored copy starts with its memory, told it's a copy of the one in its old folder",
-              "the orders db" in c[0]["content"] and any(d in json.dumps(m) and "started from a bundle" in json.dumps(m) for m in c[1:]), r.stdout + r.stderr)
+        check("[stash] the restored copy starts with its memory, told it moved and to answer from what it saved",
+              "the orders db" in c[0]["content"] and any("you've moved" in json.dumps(m) and "answer from those" in json.dumps(m)
+                                                        for m in c[1:]), r.stdout + r.stderr)
+        check("[self] it knows hobkin's family: lorewell and eaveswatch, and how to install them",
+              "**lorewell** (`" in c[0]["content"] and "**eaveswatch** (`" in c[0]["content"]
+              and "pip install" in c[0]["content"], c[0]["content"][-1500:])
         made = [m for f in (rd + "/config.json", top + "/home/_shared/config.json") if os.path.exists(f)
                 for m in (json.load(open(f)).get("models") or {}).values()
                 if m.get("api") == "anthropic" and str(m.get("key_file", "")).startswith(top + "/home/")]   # setup's own
         check("[max_tokens] setup writes max_output_tokens into a new Anthropic-style model entry, where it shows",
               made and all(m.get("max_output_tokens") == 16000 for m in made), made)
     finally:
-        subprocess.run([sys.executable, top + "/hobkin.py", "send", aid, "/stop"], env={**os.environ, "HOBKIN_HOME": top + "/home"})
+        subprocess.run([sys.executable, top + "/hobkin.py", "send", aid, "/stop"], env=renv)
 
     # a shared incident: --with joins them; each sees the other's work; a teammate's hold stops a command once
     alerts_file = os.path.join(BASE, "team-alerts.txt")

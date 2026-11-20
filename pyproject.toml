@@ -30,6 +30,9 @@ classifiers = [
     "Topic :: Software Development",
 ]
 
+[project.optional-dependencies]
+lore = ["lorewell>=0.4"]   # the field lore: what hobkins learn about their people and code bases, kept and recalled
+
 [project.urls]
 Homepage = "https://github.com/frank-lynam/hobkin"
 Issues = "https://github.com/frank-lynam/hobkin/issues"
