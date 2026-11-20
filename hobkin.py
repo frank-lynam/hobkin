@@ -2340,6 +2340,7 @@ class Agent:
             self.add_user(f"[from hobkin: restarted as asked, now hobkin {__version__}, at {when_text(time.time())}.]")
         self.prune()
         self.save_state("starting")
+        self.save_context()                          # "up" means ready: its context file is there
         self.log("hobkin", f"{self.id} up: {self.model.describe()}, {self.limits_text()}")
         if self.cfg.get("field_lore", True) and not self.brownie_of:
             self.log("hobkin", f"field lore: {len(self.lore.topics())} topics in {FIELD_LORE}" if self.lore else

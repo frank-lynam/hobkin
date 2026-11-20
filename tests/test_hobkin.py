@@ -30,7 +30,7 @@ def say(d, text):
 def wait_for(d, needle, t=15, file="out"):
     end = time.time() + t
     while time.time() < end:
-        if needle in open(os.path.join(d, file)).read(): return True
+        if os.path.exists(os.path.join(d, file)) and needle in open(os.path.join(d, file)).read(): return True
         time.sleep(0.1)
     raise AssertionError(f"timeout waiting for {needle!r} in {file}:\n" + open(os.path.join(d, "out")).read()[-1500:])
 def read_or_empty(path):
