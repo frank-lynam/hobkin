@@ -115,6 +115,11 @@ While it's busy, an empty input line shows a spinner with what it's doing
 (`bodkin is thinking (12s)`, `bodkin is running `pytest` (40s)`), so a slow
 model doesn't look like a dead one. It disappears as soon as you type.
 
+In a terminal, chat opens with the agent's antler: a five-line banner that
+forks across the window, swept in left to right and fading from bright amber at
+the base to dim at the tips. It grows from the agent's name, so each hobkin has
+its own (the same one every time at a given width). Piped chat skips it.
+
 Its replies come under its name (`bodkin> ...`), so with several chats open
 you know which hobkin is talking. (The `out` file says `agent>`, for scripts.)
 When a chat opens, the agent says hello first, and it's told which folder you

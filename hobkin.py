@@ -62,7 +62,7 @@ Standard library only. No ports: it only makes outgoing HTTP calls to the model 
 
 from __future__ import annotations
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 
 import email.utils
 import base64
@@ -78,6 +78,7 @@ import http.cookiejar
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import select
@@ -97,6 +98,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import zlib
 from datetime import date, datetime, timedelta
 import urllib.request
 
@@ -114,7 +116,7 @@ import urllib.request
 #                 the front desk, tools, bash and jobs, sessions, brownies, files, the goal, reminders, nudges, the web,
 #                 the model, compaction, the loop
 #   service       systemd user services
-#   command line  send, chat (the terminal), list, the watch screen, models and setup, pack, purge, breakglass, main
+#   command line  send, the banner (the agent's antler), chat (the terminal), list, the watch screen, models and setup, pack, purge, breakglass, main
 
 
 # ---- settings: defaults, the config.json types, and the default AGENTS.md
@@ -5416,6 +5418,96 @@ def cmd_send(agent_id, text):
     print(f"{agent_id} isn't running; queued for when it starts")
 
 
+# --- banner: the agent's antler, drawn when chat opens on a terminal
+# An antler that forks and forks again, grown from the agent's name (the same name grows the same antler at a
+# given width), swept in left to right in about a third of a second, bright amber at the base, dimmer at the tips.
+ANTLER_ROWS, ANTLER_STROKE = 5, "===---"
+ANTLER_GRADIENT = [229, 222, 221, 179, 178, 136, 137, 101, 95, 59]      # 256-colour, one per fork depth
+
+
+def antler(name: str, W: int) -> tuple[list, list]:
+    """(chars, depths): ANTLER_ROWS rows of W cells; the burr "(name)" has depth -1."""
+    H, rnd, scale = ANTLER_ROWS, random.Random(zlib.crc32(name.encode())), W / 78
+
+    def grow_once():
+        g, depth = [[" "] * W for _ in range(H)], [[0] * W for _ in range(H)]
+        free = lambda r, c: 0 <= r < H and 0 <= c < W and g[r][c] == " "
+
+        def put(r, c, ch, d):
+            g[r][c], depth[r][c] = ch, d
+
+        def grow(r, c, d, L):
+            n = 0
+            while n < L and free(r, c + n) and free(r, c + n + 1):     # stop short of another branch
+                put(r, c + n, ANTLER_STROKE[min(d, len(ANTLER_STROKE) - 1)], d); n += 1
+            end = c + n
+            if n < L or d >= max(6, round(6 * scale)) or end >= W - 3:
+                if free(r, end): put(r, end, rnd.choice("'.") if d > 2 else "-", d + 1)
+                return
+            kids = [(-1, "/"), (1, "\\")]
+            if r in (0, H - 1) or rnd.random() < 0.4:                  # at an edge, or now and then: fork one way, run on
+                kids = [k for k in kids if 0 <= r + k[0] < H][:1] + [(0, None)]
+                rnd.shuffle(kids)
+            grown = 0
+            for dr, ch in kids:
+                L2 = max(5, round(L * 0.92 * rnd.uniform(0.75, 1.25)))
+                if ch is None:
+                    grow(r, end, d + 1, L2); grown += 1
+                elif free(r + dr, end) and free(r + dr, end + 1):
+                    put(r + dr, end, ch, d + 1); grow(r + dr, end + 1, d + 1, L2); grown += 1
+            if not grown and free(r, end): put(r, end, "'", d + 1)
+
+        burr = f"({name})"
+        for i, ch in enumerate(burr):
+            put(H // 2, i, ch, -1)
+        grow(H // 2, len(burr), 0, 10)
+        return g, depth
+
+    best = None
+    for _ in range(20):                                    # keep one that reaches across the screen
+        g, depth = grow_once()
+        reach = max(len("".join(row).rstrip()) for row in g)
+        if best is None or reach > best[0]:
+            best = (reach, g, depth)
+        if reach >= W - 6:
+            break
+    return best[1], best[2]
+
+
+def show_banner(name: str, color: bool, seconds: float = 0.35):
+    """Sweep the agent's antler in, left to right. Only on a terminal wide enough for it."""
+    W = shutil.get_terminal_size((80, 24)).columns - 1
+    if W < len(name) + 30:
+        return
+    g, depth = antler(name, W)
+    H, frames, out = ANTLER_ROWS, 32, sys.stdout
+
+    def lines(upto):
+        rows = []
+        for r in range(H):
+            if not color:
+                rows.append("".join(g[r][:upto]).rstrip()); continue
+            cells, last = [], None
+            for ch, d in zip(g[r][:upto], depth[r]):
+                code = "1;38;5;230" if d < 0 else f"38;5;{ANTLER_GRADIENT[min(d, len(ANTLER_GRADIENT) - 1)]}"
+                if ch != " " and code != last:
+                    cells.append(f"\x1b[{code}m"); last = code
+                cells.append(ch)
+            rows.append("".join(cells).rstrip() + ANSI["off"])
+        return rows
+
+    out.write("\x1b[?25l" + "\n" * H)                      # hide the cursor, make room
+    try:
+        for f in range(1, frames + 1):
+            out.write(f"\x1b[{H}A\r" + "\n".join(lines(W * f // frames)) + "\n")
+            out.flush()
+            time.sleep(seconds / frames)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        out.write(ANSI["off"] + "\x1b[?25h\n"); out.flush()
+
+
 # --- chat: the view of the out log, colour, and the terminal (readline hooks, arrows, the status line)
 # Out-log entries that are tool calls (chat hides them unless --full): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full (but compaction's note).
@@ -5560,6 +5652,8 @@ def cmd_chat(agent_id, full=False):
         return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st, color, agent_id)
 
     if sys.stdin.isatty():
+        if sys.stdout.isatty():
+            show_banner(agent_id, color)
         return chat_terminal(agent_id, d, fifo, recent, new_lines, short, color)
     sent_at, eof = 0.0, False
     try:

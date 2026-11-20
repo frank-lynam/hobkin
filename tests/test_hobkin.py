@@ -819,6 +819,12 @@ try:
     check("[chat] piped chat stays plain text (no colour codes)", "\x1b[" not in r.stdout, repr(r.stdout[:200]))
     sys.path.insert(0, os.path.join(HERE, ".."))
     import hobkin as hb
+    g1, d1 = hb.antler("s1", 79)
+    g2, _ = hb.antler("s1", 79)
+    g3, _ = hb.antler("other", 79)
+    check("[chat] the banner: the agent's name is its antler's burr and its seed, and it fits the terminal",
+          g1 == g2 and g1 != g3 and "".join(g1[2]).startswith("(s1)=") and all(len(row) == 79 for row in g1)
+          and d1[2][0] == -1 and max(len("".join(row).rstrip()) for row in g1) > 60, "\n".join("".join(r) for r in g1))
     painted = "\n".join(hb.chat_view(["2026-10-24 10:00:00 agent> **Done.** Fixed `parse()` in tests/a.py, see https://x.io/y.",
                                        "2026-10-24 10:00:01 => (exit code 1; now in ~/w)"], "frank> ", True, {}, True, "s1"))
     check("[chat] colour on a terminal: code and file paths green, bold, links underlined, failures red",
