@@ -946,7 +946,7 @@ try:
     run("chat", "s1", input="hello again\n")
     sp = ctx(hs + "/s1")[0]["content"]
     check("[self] the system prompt says where its files are and how its instructions work", "# Your own files" in sp
-          and hs + "/s1" in sp and "a change takes effect on your next one" in sp and "edit the file in your folder" in sp, sp[:300])
+          and hs + "/s1" in sp and "a change applies on your next one" in sp and "edit (or create) the file in your folder" in sp, sp[:300])
     check("[self] the blooper reel is in the prompt once (not also as an instruction file)", sp.count("marker-7731") == 1,
           sp.count("marker-7731"))
     out = open(hs + "/s1/out").read()
@@ -1205,9 +1205,9 @@ try:
     # a reason makes it an ordinary incident
     r = glass("--for", "1h"); wait_for(d, "salvage what can't be replaced", 20)
     g = json.load(open(d + "/config.json"))["break_glass"]
-    check("[salvage] no reason: a new salvage, with its brief (and packing itself) in the prompt", g.get("salvage") is True
+    check("[salvage] no reason: a new salvage, with its brief (and stashing itself) in the prompt", g.get("salvage") is True
           and not g.get("extensions")
-          and "No guidance given: salvage" in ctx(d)[0]["content"] and "$HOBKIN_SELF pack" in ctx(d)[0]["content"], r.stdout + r.stderr)
+          and "No guidance given: salvage" in ctx(d)[0]["content"] and "$HOBKIN_SELF stash" in ctx(d)[0]["content"], r.stdout + r.stderr)
     glass("--for", "2h"); g = json.load(open(d + "/config.json"))["break_glass"]
     check("[salvage] an extension with nothing said stays a salvage", g.get("salvage") is True and g.get("extensions") == 1, g)
     glass("disk full", "--for", "2h"); g = json.load(open(d + "/config.json"))["break_glass"]

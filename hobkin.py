@@ -699,26 +699,22 @@ TOOLS = [
 # With lorewell installed (and field_lore on): the field lore, the long-term knowledge every hobkin here shares
 FIELD_LORE_TOOL = {
     "name": "field_lore",
-    "description": ("The field lore: what the hobkins on this machine have learned about the people they work with, "
-                    "their code bases (architecture, conventions, gotchas), build systems and environments, kept across "
-                    "conversations, compactions and agents. Search it before you go digging for how things are done "
-                    "here, and read a topic in full. File what you learn that will still be true and useful in a month, "
-                    "to another hobkin, on another task: general understanding, never file paths, line numbers, today's "
-                    "bug, or anything secret. Writing a topic again updates it (the old version is kept). People go "
-                    "under people/<login name>/...; `alias` joins their other names (a board name, a full name). Your "
-                    "librarian also files what's worth keeping each time your context is compacted."),
+    "description": ("The field lore: what the hobkins here know about their people, code bases, build systems and "
+                    "environments, across conversations and agents. Search it before digging for how things are done "
+                    "here. File what will still be true and useful in a month, to another hobkin (general understanding: "
+                    "no paths, line numbers, today's bug or secrets); a topic written again is updated. People go under "
+                    "people/<login>/; alias joins their other names."),
     "input_schema": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["search", "read", "topics", "remember", "forget", "alias"]},
-        "query": {"type": "string", "description": "search: what you're looking for"},
-        "topic": {"type": "string", "description": "read, remember, forget: the topic (people/frank/preferences, "
-                                                   "repo/NAME/build, env/NAME); topics: a prefix (repo/NAME)"},
-        "text": {"type": "string", "description": "remember: the whole topic as it should now read"},
-        "entries": {"type": "array", "description": "remember: several topics in one go",
+        "query": {"type": "string"},
+        "topic": {"type": "string", "description": "e.g. people/frank/preferences, repo/NAME/build (topics: a prefix)"},
+        "text": {"type": "string", "description": "remember: the whole topic, as it should read"},
+        "entries": {"type": "array", "description": "remember: several at once",
                     "items": {"type": "object", "properties": {"topic": {"type": "string"}, "text": {"type": "string"}},
                               "required": ["topic", "text"]}},
-        "alias": {"type": "string", "description": "alias: another name for someone (their board name, full name)"},
-        "name": {"type": "string", "description": "alias: the name it means (their login name)"},
-        "why": {"type": "string", "description": "remember, forget: why it changed (kept in the history)"}},
+        "alias": {"type": "string", "description": "another name (a board name)"},
+        "name": {"type": "string", "description": "the login name it means"},
+        "why": {"type": "string"}},
         "required": ["action"]}}
 
 # Only during a shared incident (`hobkin breakglass ... --with`): holds, so teammates don't undo each other's work
@@ -1034,34 +1030,24 @@ HOST_NOTE = ("# Where you work: {host}\n\nYou work on **{host}**, over ssh. Your
              "Your memory, blooper reel, conversation and notes stay with hobkin on {here} (the file tools still reach "
              "them as $HOBKIN_MEMORY and $HOBKIN_BLOOPERS). If {host} can't be reached, your commands fail with ssh's "
              "error: that's information too, so say what it means rather than retrying blindly.")
-OWN_FILES = ("# Your own files\n\nYou're files, and you can look at yourself. Your folder is {dir} ($HOBKIN_DIR):\n"
-             "- **Your instructions** are the `.md` files in {shared} (shared by every hobkin on this machine) and in your "
-             "folder (yours alone; one of yours replaces the shared file of the same name). Now: {files}. They're read "
-             "again for every step, so a change takes effect on your next one.\n"
-             "- **config.json** in your folder: your settings (models, safe mode, chores, wake-ups), over "
-             "{shared}/config.json. **MEMORY.md** and **BLOOPERS.md** are yours to keep. **context.jsonl** is this "
-             "conversation, **out** its log, **state.json** hobkin's own, **reminders.json** your reminders.\n"
+OWN_FILES = ("# Your own files\n\nYour folder: {dir} ($HOBKIN_DIR).\n"
+             "- **Instructions:** the `.md` files in {shared} (every hobkin here) and in your folder (yours; one replaces "
+             "the shared file of the same name). Now: {files}. Re-read every step: a change applies on your next one.\n"
+             "- **config.json** (your settings, over the shared one), MEMORY.md, BLOOPERS.md, context.jsonl (this "
+             "conversation), out (its log), state.json (hobkin's), reminders.json.\n"
              "{editing}\n"
-             "- How hobkin works, all of it: `python3 $HOBKIN_SELF --help` and its README "
-             "(https://github.com/frank-lynam/hobkin).\n"
+             "- The manual: `python3 $HOBKIN_SELF --help`, and https://github.com/frank-lynam/hobkin.\n"
              "{lore}\n{family}")
-FIELD_LORE_OFFER = ("- **The field lore is available, but not installed here.** With it, the hobkins on this machine share "
-                    "what they learn about the people, code bases, build systems and environments they work with: kept "
-                    "across conversations, compactions and machines, and recalled when it bears on a message. It needs "
-                    "lorewell: `{pip}`. Tell the person about it once, when it would help (they'd like you to remember "
-                    "things across conversations, or to know their setup), and if they want it, {how}. hobkin notices it "
-                    "within a minute and switches it on, no restart.")
-FAMILY = ("- **hobkin's family**, to suggest when someone needs one (set one up only when asked): **lorewell** (`{lorewell}`), "
-          "reference packs for languages and their tools, one SQLite file each, that you look things up in instead of "
-          "holding them in context (https://github.com/frank-lynam/lorewell); and **eaveswatch** (`{eaveswatch}`), AI "
-          "log review: it learns a system's logs, ships them redacted to S3, alerts by email and writes a findings "
-          "page, with a hobkin as its reviewer (https://github.com/frank-lynam/eaveswatch).")
-OWN_FILES_SAFE = ("- **In safe mode your instructions and config are read-only to you.** Asked to change them (\"update your "
-                  "AGENTS.md\"), give the person the exact edit: the file's path, and the text to add or change, ready to "
-                  "paste.")
-OWN_FILES_FREE = ("- **Asked to change your instructions** (\"update your AGENTS.md\"), edit the file in your folder (create "
-                  "it, from the shared one if you're changing that, so the change is yours alone). Changing a file in {shared} "
-                  "changes every hobkin here: ask first. Every change to an instruction file is shown in the chat.")
+FIELD_LORE_OFFER = ("- **The field lore isn't installed** (`{pip}`): with it, hobkins here keep and recall what they learn "
+                    "about people, code bases and setups, across conversations and machines. Mention it once, when it would "
+                    "help; if they want it, {how} (it switches on within a minute).")
+FAMILY = ("- **hobkin's family** (suggest when useful; set up only when asked): **lorewell** (`{lorewell}`): reference "
+          "packs to look things up in; **eaveswatch** (`{eaveswatch}`): AI log review, alerts and a findings page, "
+          "reviewed by a hobkin.")
+OWN_FILES_SAFE = ("- **In safe mode your instructions and config are read-only to you:** asked to change them, give the "
+                  "person the exact edit (the file, and the text to paste).")
+OWN_FILES_FREE = ("- **Asked to change your instructions,** edit (or create) the file in your folder. Files in {shared} "
+                  "change every hobkin here: ask first. Every change shows in the chat.")
 RECALL = ("[hobkin: from the field lore (what hobkins here have learned; check it before you rely on it, and correct it "
           "with field_lore if it's wrong):\n{items}]")
 LIBRARIAN = ("You're the librarian of the field lore (the field_lore tool): what the hobkins on this machine know about "
@@ -2991,7 +2977,7 @@ class Agent:
                 parts.append(text.strip())
         safe = getattr(self, "safe", None) or getattr(self, "safe_remote", False)
         if getattr(self, "lore", None):
-            lore = "- **The field lore is on:** the `field_lore` tool (see its description)."
+            lore = "- **The field lore is on:** the `field_lore` tool."
         elif self.cfg.get("field_lore", True) and not getattr(self, "brownie_of", None):
             lore = FIELD_LORE_OFFER.format(pip=pip_install("lorewell"),
                                            how="give them that command to run" if safe else "install it yourself")
@@ -5221,12 +5207,15 @@ class Agent:
     @staticmethod
     def shrink_history(history: list, attempt: int) -> list:
         """A history too long even to summarise, made shorter: always clip old command output; from the
-        second try, also drop the oldest third, restarting at a user message. Tool results whose calls
-        were dropped become plain text, so the history stays valid (every call answered)."""
-        for m in history[:-2]:
+        second try, also drop the oldest third, restarting at a user message; from the third, clip the newest
+        messages too (just after a compaction they're nearly all there is: the carried-over note and a big
+        output). Tool results whose calls were dropped become plain text, so the history stays valid."""
+        for m in history[:-2] if attempt < 2 else history:
             for b in m["content"]:
                 if b.get("type") == "tool_result":
                     b["content"] = clip(result_text(b["content"]), 700, 500)
+                elif attempt >= 2 and b.get("type") == "text" and len(b.get("text") or "") > 3000:
+                    b["text"] = clip(b["text"], 1500, 1000)
         if attempt < 1:
             return history
         start = max(1, len(history) // 3)
