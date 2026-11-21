@@ -68,7 +68,7 @@ their people, code bases, build systems and environments, recalled when it bears
 
 from __future__ import annotations
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 import email.utils
 import base64
