@@ -249,6 +249,9 @@ DEFAULT_CONFIG = {
     # The always-shown files' limits, in bytes (they're in every call): past one, the agent is told to cut it back
     "memory_bytes": 24000,
     "bloopers_bytes": 8000,
+    # ...and with the field lore on, which holds what's learned about the world, so these hold only the agent's own
+    "memory_bytes_with_lore": 8000,
+    "bloopers_bytes_with_lore": 4000,
     # The field lore (needs lorewell: pip install lorewell): what the hobkins here learn about their people, code
     # bases, build systems and environments, recalled when it's relevant, kept by a librarian brownie at compaction
     "field_lore": True,
@@ -270,6 +273,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "idle_prompt": (str, type(None)), "idle_seconds": (int, float), "bash_timeout": (int, float),
                 "output_limit": int, "compact_at": (int, float), "compact_early": (int, float),
                 "context_budget": (int, str, type(None)), "memory_bytes": int, "bloopers_bytes": int,
+                "memory_bytes_with_lore": int, "bloopers_bytes_with_lore": int,
                 "field_lore": bool, "tidy_every": (str, type(None)), "stash": (dict, type(None)),
                 "skill_dirs": list,
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
@@ -909,9 +913,20 @@ def kb(n: float) -> str:
     return f"{n / 1000:.1f}".rstrip("0").rstrip(".")
 
 
-def prune_text(what: str, n: int, limit: int) -> str:
-    return PRUNE.format(what=what, n=kb(n), limit=kb(limit), target=kb(limit * PRUNE_TO))
+PRUNE_LORE = (" Facts about the world in it (people, code bases, setups, tools, lessons others could use) belong in "
+              "the field lore: remember them there (field_lore), then cut them here.")
 
+
+def prune_text(what: str, n: int, limit: int, lore: bool = False) -> str:
+    text = PRUNE.format(what=what, n=kb(n), limit=kb(limit), target=kb(limit * PRUNE_TO))
+    return text[:-1] + PRUNE_LORE + "]" if lore else text
+
+
+MEMORY_WITH_LORE = ("Keep here only what's yours: who you work for, what you've promised, the threads you have "
+                    "open, and the rules your people have given you. What you learn about the world (people, code "
+                    "bases, setups, tools) goes in the field lore (field_lore remember), where every hobkin here finds "
+                    "it when it's relevant; your librarian moves any that lands here at compaction. Same for a "
+                    "blooper's lesson that others could use: the lesson goes in the lore, the blooper stays yours.")
 
 PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: **How it works:** what you "
               "looked at and saw; **Why it doesn't:** do the thing, with the evidence; **What would:** make it do "
@@ -1079,8 +1094,16 @@ LIBRARIAN = ("You're the librarian of the field lore (the field_lore tool): what
              "clearly false (say why).\n"
              "4. People are filed under their login name; when the conversation shows two names are the same person (a "
              "board name and a login), alias them.\n"
+             "5. Its memory (below) should hold only its own: who it works for, what it's promised, its open threads, "
+             "rules its people gave it. A line there that's a durable fact about the world: file it (folded into the "
+             "right topic), and list it after your report as `MOVED: topic | the line, copied exactly`, one per line; "
+             "hobkin then takes those lines out of its memory. Leave its own state alone, and list nothing you didn't "
+             "file.\n"
+             "6. A blooper in its reel with a lesson another hobkin could use: file the lesson (not the joke) where it "
+             "belongs (tools/<name>, env/<name>, repo/<name>/gotchas). The reel stays its own: never list it as MOVED.\n"
              "Nothing durable? File nothing: that's a fine outcome. End with REPORT: one line per topic you added, updated "
-             "or forgot.\n\n## The handoff note\n\n{note}\n\n## Highlights of the conversation\n\n{highlights}\n\n"
+             "or forgot (then any MOVED lines).\n\n## The handoff note\n\n{note}\n\n## Highlights of the conversation\n\n"
+             "{highlights}\n\n## Its memory (MEMORY.md)\n\n{memory}\n\n## Its blooper reel\n\n{bloopers}\n\n"
              "## What the lore says on related topics\n\n{related}")
 SURVEY = ("Survey the code base at {path} for the field lore (the field_lore tool). First see what it already says "
           "(field_lore topics, prefix repo/<its name>). Then read its README, build files (Makefile, package.json, "
@@ -3085,11 +3108,12 @@ class Agent:
             data, ok = self.load_reminders()
             if ok and data["items"]:
                 parts.append("# Your reminders\n\n" + "\n".join(self.reminder_lines(data["items"])))
-        over = {f: prune_text(w, n, lim) + "\n\n" for f, w, n, lim in self.over_limit()}
+        lore = bool(getattr(self, "lore", None))
+        over = {f: prune_text(w, n, lim, lore) + "\n\n" for f, w, n, lim in self.over_limit()}
         memory = read(self.p("MEMORY.md")).strip()
         parts.append(f"# Your memory ({self.p('MEMORY.md')})\n\nA sketch of where you were, not the truth: check the "
-                     f"real thing before you act on it, and enjoy catching it out.\n\n{over.get('MEMORY.md', '')}"
-                     f"{memory or '(empty)'}")
+                     f"real thing before you act on it, and enjoy catching it out.\n\n"
+                     + (MEMORY_WITH_LORE + "\n\n" if lore else "") + f"{over.get('MEMORY.md', '')}{memory or '(empty)'}")
         bloopers = read(self.p("BLOOPERS.md")).strip()
         parts.append(f"# Your blooper reel ({self.p('BLOOPERS.md')})\n\n{over.get('BLOOPERS.md', '')}"
                      f"{bloopers or '(empty so far!)'}")
@@ -3100,6 +3124,8 @@ class Agent:
         under it is forgotten, so the next time it grows past, it's flagged afresh."""
         out, flagged = [], self.state.setdefault("prune_nudged", [])
         for f, (what, key) in SIZE_LIMITS.items():
+            if getattr(self, "lore", None):
+                key += "_with_lore"
             limit = int(self.cfg.get(key) or DEFAULT_CONFIG[key])
             n = len(read(self.p(f)).strip().encode())
             if n > limit:
@@ -4178,6 +4204,8 @@ class Agent:
             del self.state["brownies"][key]
             if c.get("quiet"):                       # housekeeping (the librarian, the tidy): logged, not a message
                 self.log("hobkin", f"{c['quiet']} (brownie #{key}): {clip(text.split(chr(10), 1)[-1].strip(), 1500, 0)}")
+                if c["quiet"] == "librarian":
+                    self.moved_to_lore(text)
                 continue
             out.append(f"[from hobkin: a brownie you sent reports back, {self.stamp()}. You gave it: "
                        f"{clip(c['task'], 200, 0)}]\n{text}")
@@ -4284,8 +4312,32 @@ class Agent:
         rel = "\n\n".join(f"### {r['topic']}\n{clip(r['body'], 1500, 0)}" for r in related) or "(nothing yet)"
         if aliases:
             rel += "\n\nAliases: " + "; ".join(f"{n} = {', '.join(a)}" for n, a in aliases.items())
-        self.housekeeping("librarian", LIBRARIAN.format(parent=self.id, note=clip(note, 12000, 3000),
-                                                        highlights=highlights, related=rel))
+        self.housekeeping("librarian", LIBRARIAN.format(
+            parent=self.id, note=clip(note, 12000, 3000), highlights=highlights, related=rel,
+            memory=read(self.p("MEMORY.md")).strip() or "(empty)", bloopers=read(self.p("BLOOPERS.md")).strip() or "(empty)"))
+
+    def moved_to_lore(self, report: str) -> list[str]:
+        """The librarian's MOVED lines: each memory line it filed in the field lore comes out of MEMORY.md, here in
+        hobkin's own process (the librarian never writes the agent's files). Only a line that's still there word for
+        word, and only when its topic really is in the lore: a claim alone moves nothing."""
+        moved = [m.groups() for m in re.finditer(r"(?m)^MOVED:\s*(.+?)\s*\|\s*(.+?)\s*$", report or "")]
+        if not moved or not getattr(self, "lore", None):
+            return []
+        path = self.p("MEMORY.md")
+        lines = read(path).splitlines()
+        gone = []
+        for topic, line in moved:
+            try:
+                known = self.lore.get(topic) is not None
+            except Exception:
+                known = False
+            hit = next((i for i, l in enumerate(lines) if l.strip() == line.strip() and l.strip()), None)
+            if known and hit is not None:
+                gone.append(f"{topic}: {clip(lines.pop(hit).strip(), 120, 0)}")
+        if gone:
+            write_atomic(path, "\n".join(lines).rstrip() + "\n")
+            self.log("hobkin", "the librarian moved from your memory to the field lore: " + "; ".join(gone))
+        return gone
 
     def survey(self, where: str) -> str:
         """/survey [PATH]: a brownie reads a code base and files its architecture, build and conventions (it reports
@@ -4820,7 +4872,7 @@ class Agent:
         flagged = self.state.setdefault("prune_nudged", [])
         for f, what, n, limit in self.over_limit():     # working on a file that's grown too long: said once a
             if (f in said or f.split(".")[0] in said) and f not in flagged:          # time, not on every edit
-                content += "\n" + prune_text(what, n, limit)
+                content += "\n" + prune_text(what, n, limit, bool(self.lore))
                 flagged.append(f)
         return content
 

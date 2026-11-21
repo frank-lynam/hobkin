@@ -170,8 +170,8 @@ tmux, or a systemd user service.
 | `in` | A named pipe. `echo text > in` sends a message. A write waits until the agent is running; `hobkin send ID text` queues it instead. |
 | `out` | Everything it says and does since the last compaction, with timestamps: messages, commands, output. At each compaction it's moved to `archive/` and starts afresh. `tail -F out` |
 | `context.jsonl` | Exactly what the model is sent: line 1 is the system prompt, then one message per line. Rewritten after every change. |
-| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 24 KB (`memory_bytes`; about 6k tokens), it's told to cut it back to about 14 KB in one go (a 40% margin, so it isn't nagged again for a line or two; told once, not on every edit). Limits are in bytes, not lines: bytes are what it costs in every call, and `wc -c` shows where it stands. |
-| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 8 KB (`bloopers_bytes`), it's told to keep the best, about 4.8 KB, in one go. |
+| `MEMORY.md` | The agent's own notes. Part of its instructions on every turn, and kept when the conversation is compacted. Past 24 KB (`memory_bytes`; about 6k tokens), it's told to cut it back to about 14 KB in one go (a 40% margin, so it isn't nagged again for a line or two; told once, not on every edit). Limits are in bytes, not lines: bytes are what it costs in every call, and `wc -c` shows where it stands. With the field lore on, it holds only the agent's own (who it works for, its promises, open threads, its people's rules: what has to be in view every step), the world's facts go to the lore, and its limit is 8 KB (`memory_bytes_with_lore`). |
+| `BLOOPERS.md` | Its blooper reel: its own mistakes, told for laughs, each with the lesson. Also part of its instructions every turn, so the jokes double as lessons learned. Past 8 KB (`bloopers_bytes`; 4 KB with the field lore, `bloopers_bytes_with_lore`), it's told to keep the best, in one go. A blooper's lesson that others could use also goes to the field lore. |
 | `state.json` | Model, context window (and where that number came from), status, pid, compaction count. |
 | `work/` | Its working directory. `work/tools/` holds tools it made itself (see "Its tools"); in break-glass mode, `work/incident-*.md` is the incident's timeline. |
 | `reminders.json` | Its reminders (when, message, repeat). Readable and editable by hand. |
@@ -854,7 +854,13 @@ needs lorewell for it; without it, there's no field lore and everything else wor
   MODEL`) is given the handoff note, the conversation's highlights and what the lore says on related
   topics, and files what's durable: merging into existing topics, correcting what turned out wrong,
   in a call or two. It works in the background (compaction never waits) and reports to the log only,
-  so it costs the agent nothing.
+  so it costs the agent nothing. It's also given the agent's memory and blooper reel: a fact about the
+  world in memory it files and lists as moved, and hobkin takes that line out of MEMORY.md (only when the
+  topic really is in the lore and the line is still there word for word; the librarian never writes the
+  agent's files). A blooper's lesson goes to the lore too; the blooper stays in the reel.
+- **Two kinds of memory:** MEMORY.md and the blooper reel are in every prompt, and the agent's own; the
+  field lore is shared, and recalled when a message bears on it. So rules and promises live in memory
+  (they must be in view whatever the step's words), and facts about people, code and setups in the lore.
 - **`/survey [PATH]`** has a brownie read a code base and file its architecture, build and conventions.
 - Read and correct it yourself with lorewell: `lorewell living ~/.hobkins/_shared/field.lore.db topics`,
   `... search build`, `... topic repo/NAME/build`, `... history TOPIC`, `... forget TOPIC`.

@@ -706,7 +706,7 @@ try:
 
     # a long life: time stamps, size limits, fallback models and alerts, pruning, /restart
     h = home("long", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake-gone", "key_env": "TESTKEY"},
-             {"idle_prompt": None, "fallback_models": ["n2", "nope"],
+             {"idle_prompt": None, "fallback_models": ["n2", "nope"], "field_lore": False,   # the limits without the lore
               "alert_command": "echo \"$HOBKIN_ALERT\" >> " + os.path.join(BASE, "alerts.txt")})
     cfg = json.load(open(h + "/_shared/config.json"))
     cfg["models"]["n2"] = {"api": "openai", "base_url": "http://127.0.0.1:48702/v1", "model": "fake", "key_env": "TESTKEY"}
@@ -954,6 +954,27 @@ try:
     out = open(hs + "/s1/out").read()
     check("[self] a new instruction file is shown in the chat, with what it says", "instructions new: " + hs + "/s1/AGENTS.md"
           in out and "+Always say hi first." in out, out[-600:])
+    # With the field lore, the always-shown files are smaller, and say that the world's facts belong in the lore
+    open(hs + "/s1/MEMORY.md", "w").write("".join(f"- note {i}: " + "y" * 120 + "\n" for i in range(70)))   # ~9 KB
+    run("chat", "s1", input="and now?\n")
+    sp = ctx(hs + "/s1")[0]["content"]
+    check("[lore] with the field lore, memory's limit is smaller (8 KB, not 24) and says to move facts to the lore",
+          "your memory is 9" in sp and "past its 8 KB limit" in sp and "belong in the field lore" in sp
+          and "Keep here only what's yours" in sp, sp[-2500:])
+    # The librarian's MOVED lines come out of memory, but only what it really filed and what's really there
+    open(hs + "/s1/MEMORY.md", "w").write("- working for Pat on the SSP\n- widget builds with make, 20 min suite\n"
+                                          "- the NAS is at nas01\n")
+    import types
+    stub = types.SimpleNamespace(p=lambda f: hs + "/s1/" + f, lore=lore, logged=[])
+    stub.log = lambda who, text: stub.logged.append(text)
+    gone = hb.Agent.moved_to_lore(stub, "REPORT: updated repo/widget/build\n"
+                                      "MOVED: repo/widget/build | - widget builds with make, 20 min suite\n"
+                                      "MOVED: env/nas | - the NAS is at nas01\n"            # not filed: stays
+                                      "MOVED: repo/widget/build | - a line that isn't there\n")
+    check("[lore] the librarian's MOVED lines leave memory only when filed and still there word for word",
+          gone == ["repo/widget/build: - widget builds with make, 20 min suite"]
+          and open(hs + "/s1/MEMORY.md").read() == "- working for Pat on the SSP\n- the NAS is at nas01\n", gone)
+    open(hs + "/s1/MEMORY.md", "w").write("")
     # Compaction hands the conversation to a librarian brownie, in the background, its report only logged
     run("chat", "s1", input="/compact\n")
     for _ in range(150):
