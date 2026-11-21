@@ -1780,6 +1780,29 @@ try:
           r.stdout + r.stderr)
     check("[chore] several chores side by side, each with its own instructions", set(cfg["chores"]) == {"demo", "vault"}
           and os.path.exists(d + "/CHORE-demo.md") and "key=(secret)" in r.stdout)
+    # An expert pack: an installed package with a hobkin.packs entry point brings chores, each with its own skills
+    site = os.path.join(BASE, "packsite")
+    os.makedirs(site + "/fakepack-0.1.dist-info")
+    open(site + "/fakepack-0.1.dist-info/METADATA", "w").write("Metadata-Version: 2.1\nName: fakepack\nVersion: 0.1\n")
+    open(site + "/fakepack-0.1.dist-info/entry_points.txt", "w").write("[hobkin.packs]\nfake = fakepack:folder\n")
+    pack = os.path.join(BASE, "packfolder")
+    os.makedirs(pack + "/chores/expert/skills/expert-howto")
+    json.dump({"name": "expert", "description": "an expert's job", "settings": {}}, open(pack + "/chores/expert/chore.json", "w"))
+    open(pack + "/chores/expert/CHORE.md", "w").write("# Be the expert\n")
+    open(pack + "/chores/expert/skills/expert-howto/SKILL.md", "w").write("---\nname: expert-howto\ndescription: how\n---\nSteps.\n")
+    open(site + "/fakepack.py", "w").write(f"def folder():\n    return {pack!r}\n")
+    open(site + "/brokenpack.py", "w").write("def folder():\n    raise RuntimeError('nope')\n")
+    open(site + "/fakepack-0.1.dist-info/entry_points.txt", "a").write("broken = brokenpack:folder\n")
+    r = subprocess.run([sys.executable, HOB, "--chore", "expert", "--id", "pk", "--no-service"],
+                       env={**cenv, "PYTHONPATH": site + os.pathsep + os.environ.get("PYTHONPATH", "")},
+                       capture_output=True, text=True, timeout=60)
+    pk = os.path.join(h, "pk")
+    check("[pack] a chore from an installed expert pack is found, and its skills are the agent's own",
+          r.returncode == 0 and os.path.exists(pk + "/CHORE-expert.md")
+          and os.path.exists(pk + "/skills/expert-howto/SKILL.md")
+          and not os.path.exists(os.path.join(h, "_shared", "skills", "expert-howto")), r.stdout + r.stderr)
+    check("[pack] a pack that fails to load is skipped, with a warning", "the broken pack didn't load" in r.stderr, r.stderr)
+    subprocess.run([sys.executable, HOB, "send", "pk", "/stop"], env=cenv, timeout=30)
     subprocess.run([sys.executable, HOB, "send", "sw", "/stop"], env=cenv, timeout=30)
     for _ in range(50):
         if not hbk.is_running(d): break

@@ -1027,8 +1027,8 @@ hobkin --chore ark --set dest=s3://backups/web-1 --secret aws_secret_access_key=
 ```
 
 A chore is found by path, by name in `_shared/chores/` and the folders in
-`"chore_dirs"` (in config), or built in (`hearthboard`). An agent can hold several;
-each gets its own instructions file. A chore is a folder:
+`"chore_dirs"` (in config), in an installed **expert pack**, or built in (`hearthboard`).
+An agent can hold several; each gets its own instructions file. A chore is a folder:
 
 | File | What it is |
 |---|---|
@@ -1036,6 +1036,14 @@ each gets its own instructions file. A chore is a folder:
 | `CHORE.md` | Its instructions, copied into the agent's folder as `CHORE-<name>.md`, so they're part of its instructions every turn. |
 | `tools/` | Tools for it (see "Its tools"), copied to `work/tools/`. |
 | `spells/` | Starter scripts, copied to `work/spells/`. |
+| `skills/` | Skills for it, copied to the agent's `skills/`: they're this agent's, not every hobkin's on the machine. |
+
+**Expert packs.** A Python package can bring chores (and their skills): `pip install` it,
+and `hobkin --chore NAME` finds them. A pack registers an entry point in the group
+`hobkin.packs`: a function that returns its folder, with `chores/` in it. A pack that
+fails to load is skipped with a warning. [atone](https://github.com/frank-lynam/atone)
+is one (`hobkin --chore atone`); anyone can make their own, privately, for their own
+tools and runbooks.
 
 `{{setting}}` in `CHORE.md`, the config and tool descriptions is filled in, and
 each setting reaches commands, tools and the watch as an environment variable:

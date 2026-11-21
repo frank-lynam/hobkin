@@ -1369,9 +1369,31 @@ BUILTIN_CHORES = {
 }
 
 
+def pack_dirs() -> list[str]:
+    """Folders of expert packs installed as Python packages: each registers an entry point in the group hobkin.packs,
+    a function that returns its folder (with chores/ in it, each chore with its own skills/ if it has any). A pack
+    that fails to load is skipped, with a warning."""
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:
+        return []
+    eps = entry_points()
+    group = eps.select(group="hobkin.packs") if hasattr(eps, "select") else eps.get("hobkin.packs", [])
+    out = []
+    for ep in group:
+        try:
+            folder = ep.load()()
+        except Exception as e:                      # someone else's package: never the end of hobkin
+            print(f"hobkin: the {ep.name} pack didn't load ({type(e).__name__}: {e})", file=sys.stderr)
+            continue
+        if folder and os.path.isdir(str(folder)):
+            out.append(str(folder))
+    return out
+
+
 def load_chore(chore: str, cfg: dict) -> tuple[dict, str, str | None]:
-    """(chore.json, CHORE.md, its folder or None for a built-in one): a path to a chore, a name in _shared/chores/
-    or a config chore_dirs folder, or a built-in chore."""
+    """(chore.json, CHORE.md, its folder or None for a built-in one): a path to a chore, a name in _shared/chores/,
+    a config chore_dirs folder or an installed expert pack (pack_dirs), or a built-in chore."""
     def from_dir(src):
         spec = read_json(os.path.join(src, "chore.json"), None, exit_if_broken=True)
         if not isinstance(spec, dict) or not os.path.isfile(os.path.join(src, "CHORE.md")):
@@ -1379,7 +1401,8 @@ def load_chore(chore: str, cfg: dict) -> tuple[dict, str, str | None]:
         return spec, read(os.path.join(src, "CHORE.md")), src
     if os.path.isfile(os.path.join(os.path.expanduser(chore), "chore.json")):
         return from_dir(os.path.abspath(os.path.expanduser(chore)))
-    dirs = [os.path.join(SHARED, "chores")] + [os.path.expanduser(d) for d in cfg.get("chore_dirs") or []]
+    dirs = [os.path.join(SHARED, "chores")] + [os.path.expanduser(d) for d in cfg.get("chore_dirs") or []] + \
+        [os.path.join(p, "chores") for p in pack_dirs()]
     for d in dirs:
         if os.path.isfile(os.path.join(d, chore, "chore.json")):
             return from_dir(os.path.join(d, chore))
@@ -1473,6 +1496,8 @@ def install_chore(agent_id: str, chore: str, sets: list[str], secret_sets: list[
     for part in ("tools", "spells"):                    # its own tools, and starter spells
         if src and os.path.isdir(os.path.join(src, part)):
             shutil.copytree(os.path.join(src, part), os.path.join(d, "work", part), dirs_exist_ok=True)
+    if src and os.path.isdir(os.path.join(src, "skills")):   # the chore's skills: this agent's, not every agent's
+        shutil.copytree(os.path.join(src, "skills"), os.path.join(d, "skills"), dirs_exist_ok=True)
     tools = os.path.join(d, "work", "tools")
     for t in os.listdir(os.path.join(src, "tools")) if src and os.path.isdir(os.path.join(src, "tools")) else []:
         if os.path.isfile(os.path.join(tools, t, "tool.json")):    # descriptions can name the settings too
