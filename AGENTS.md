@@ -36,6 +36,9 @@
   hobkin's own writes on the agent's behalf go through `writable()`. If Landlock isn't there or the
   start-up probe doesn't hold, the agent doesn't start. Nothing in an agent's reach may turn it off
   (its config.json is outside what it can write).
+- **Agents read this file to learn how they work** (OWN_FILES tells them to): keep the section map
+  (`# ----`, `# --- `) true and docstrings saying what each part does and why. Write a fact once, beside the
+  code that uses it; instructions say what and why, and point here for how.
 - **Tests:** `python3 tests/test_hobkin.py` (real processes against
   `tests/fake_api.py`; no key, no cost). Add a check for every behaviour you change.
 - GitHub: `frank-lynam/hobkin` (remote `origin` uses the `github-hobkin` SSH alias). Commit and push finished work.

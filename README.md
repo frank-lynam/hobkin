@@ -1045,6 +1045,13 @@ fails to load is skipped with a warning. [atone](https://github.com/frank-lynam/
 is one (`hobkin --chore atone`); anyone can make their own, privately, for their own
 tools and runbooks.
 
+**Self-aware by design.** Every hobkin is told its own source is the truth about it: one file,
+with a section map (`grep -n '^# ----'`), that it reads to learn how a feature works rather
+than guessing. Packs work the same way, and should be written for it: put each format, menu
+and option in the code beside what reads it, have the CLI print it (`atone mappings --example`),
+and let skills say what to do and why, pointing at the code for the how. One copy of each
+fact, so nothing an agent reads can drift from what runs.
+
 `{{setting}}` in `CHORE.md`, the config and tool descriptions is filled in, and
 each setting reaches commands, tools and the watch as an environment variable:
 its `env` name if it has one, else `CHORE_<NAME>` (`folder` → `$CHORE_FOLDER`).

@@ -947,6 +947,8 @@ try:
     sp = ctx(hs + "/s1")[0]["content"]
     check("[self] the system prompt says where its files are and how its instructions work", "# Your own files" in sp
           and hs + "/s1" in sp and "a change applies on your next one" in sp and "edit (or create) the file in your folder" in sp, sp[:300])
+    check("[self] it knows its own source is the truth about it, and how to find its way around it",
+          "Your source is the truth about you" in sp and "grep -n '^# ----'" in sp, sp[-1500:])
     check("[self] the blooper reel is in the prompt once (not also as an instruction file)", sp.count("marker-7731") == 1,
           sp.count("marker-7731"))
     out = open(hs + "/s1/out").read()
