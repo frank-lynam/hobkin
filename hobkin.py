@@ -1,69 +1,82 @@
 #!/usr/bin/env python3
-"""hobkin: an AI agent for austere environments. One stdlib-only file, no installs, no open
-ports; one unattended agent per process, driven through plain files. Use it from the command
-line, or as a worker on hearthboard.
+"""usage: hobkin URL MODEL [KEY] [setup options]   or   hobkin COMMAND ...
 
-    hobkin URL MODEL [KEY] [--chat]   set up that API and start an agent on it (see below)
-    hobkin [URL MODEL [KEY]] --hearthboard BOARD_URL TOKEN   ...and make it a worker on that board
-                                    [--project SLUG]...         (only those of its board projects)
-    hobkin [URL MODEL [KEY]] --chore NAME [--set K=V]...    ...and give it a standing job (a chore: sweep, pulse...)
-    hobkin [...] --host user@host   ...working on another machine over ssh (its commands and files act there)
-    hobkin                 start a new agent (prints its id)
-    hobkin ID              resume agent ID
-    hobkin chat [ID]       talk to a running agent in this terminal (no ID: a running one; --full: tool output too)
-    hobkin service add ID      run agent ID as a systemd user service (now and at boot)
-    hobkin service remove ID   stop it and take it off boot
-    hobkin send ID TEXT    message an agent (queued if it isn't running)
-    hobkin list            list agents
-    hobkin models [NAME | URL [KEY]]   the models an API offers (default: your configured model's)
-    hobkin breakglass ID "what's wrong" [--for 2h] [--budget $]   an incident: the agent acts fully on its own (--off ends it)
-    hobkin breakglass ID [--for 2h]   ...with nothing said: salvage (save the system's data and logs while it's up)
-    hobkin breakglass ID ["what's wrong"] --chore mender   ...with a chore as the incident's playbook
-    hobkin breakglass ID ["what's wrong"] --with ID2,ID3   one incident, shared: they see each other's work and holds
-    hobkin watch [ID ...]   one screen for an incident: every agent on it, what they're doing, risky-looking commands
-    hobkin purge [--yes]   stop every agent, remove their services, delete ~/.hobkins (asks first)
-    hobkin stash ID STORE [--keep-running]   move it: pack it up into STORE (s3://bucket/prefix or a folder); it stops here
-    hobkin stash pop ID STORE   ...and carry on, on this machine (the conversation, memory, workspace, field lore)
-                                (or pop FILE.tar.gz: a stash file itself, which also holds hobkin.py and RESTORE.md)
-    hobkin stash list STORE     what's stashed, and where each one runs (--all stashes every agent here)
-    hobkin --version
+hobkin: an AI agent for austere environments. One stdlib-only file, no installs, no open ports:
+one unattended agent per process, driven through plain files. Use it from the command line, or
+as a worker on hearthboard.
 
-Set up and go in one line (no config editing):
+set up and start (one line, no config editing):
+  hobkin URL MODEL [KEY]               that API as the default model, and an agent on it (the key
+                                       goes in _shared/keys/, readable only by you; left out: asked)
+  hobkin ... --hearthboard URL TOKEN   ...and a worker on that board: its skill, its token in the
+                                       agent's secrets.env, hobkin waiting on the board for it
+  hobkin ... --chore NAME [--set K=V]  ...and a standing job (a chore: sweep, pulse, atone...)
+  (leave out URL MODEL KEY to use the model already set up; with the --id of an agent you
+  have, it joins or changes the model of that one, restarting it if it's running)
 
-    hobkin https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --chat
+setup options:
+  --chat                    talk to it straight away
+  --id ID                   the agent's id (default: its board user, else made up)
+  --safe                    safe mode: it reads, but its commands write only in its workspace
+  --api anthropic|openai    the API's style (default: guessed from the URL)
+  --brownie MODEL[@SERVICE] what its brownies (its librarian among them) run on
+  --project SLUG            with --hearthboard: only this one of its board projects (repeatable)
+  --secret NAME=VALUE       with --chore: a secret setting (kept in secrets.env)
+  --host user@host          it works on that machine, over ssh (commands and files act there)
+  --no-service              run it in the background, not as a systemd service
+  --force                   don't check that the model exists
 
-adds that endpoint to _shared/config.json as the default model (the key goes in
-_shared/keys/, readable only by you; leave it out to be asked for it), checks the model
-exists, starts a new agent as a systemd user service (or in the background where there's
-no systemd), and with --chat connects you to it. Also: --id ID (the agent's id), --safe (safe mode:
-it can read, but its commands write only in its workspace; see "safe_mode" in config),
---api anthropic|openai (else guessed from the URL), --brownie MODEL[@SERVICE] (what its brownies,
-its librarian among them, run on), --no-service, --force (skip the check).
-With --hearthboard BOARD_URL TOKEN it also joins that board: the board's skill, the token in
-the agent's secrets.env, and the board's wait loop as its idle prompt (named after its board
-user unless --id). Leave out URL MODEL KEY to use the model already set up. With the --id of an
-agent you already have, it joins (or changes the model of) that one, restarting it if it's running.
+agents:
+  hobkin                    start a new agent (prints its id)
+  hobkin ID                 resume agent ID
+  hobkin chat [ID]          talk to a running agent in this terminal (--full: tool output too)
+  hobkin send ID TEXT       message an agent (queued if it isn't running)
+  hobkin list               list agents
+  hobkin watch [ID ...]     one screen: every agent, what it's doing, risky-looking commands
+  hobkin models [NAME | URL [KEY]]   the models an API offers (default: your model's)
+  hobkin service add ID     run it as a systemd user service (now and at boot)
+  hobkin service remove ID  stop it and take it off boot
 
-(Or run the file directly: python3 hobkin.py ...)
+incidents:
+  hobkin breakglass ID "what's wrong" [--for 2h] [--budget $]   it acts fully on its own
+  hobkin breakglass ID [--for 2h]          nothing said: salvage (save the data and logs while up)
+  hobkin breakglass ID [...] --chore mender      with a chore as the incident's playbook
+  hobkin breakglass ID [...] --with ID2,ID3      one incident, shared: they see each other's work
+  hobkin breakglass ID --off                     it's over
 
-Each agent lives in ~/.hobkins/ID/ (or $HOBKIN_HOME/ID/):
+moving and cleaning up:
+  hobkin stash ID STORE [--keep-running]   pack it up into STORE (s3://bucket/prefix or a folder)
+  hobkin stash --all STORE                 ...every agent here
+  hobkin stash pop ID STORE                carry on here: conversation, memory, workspace, lore
+                                           (or pop FILE.tar.gz, which also holds hobkin.py)
+  hobkin stash list STORE                  what's stashed, and where each one runs
+  hobkin purge [--yes]                     stop every agent, remove their services, delete
+                                           ~/.hobkins (asks first)
 
-    in              FIFO: echo "text" > in     (lines like /stop are commands)
-    out             what it says and does:     tail -F out
-    context.jsonl   exactly what the model sees: the system prompt, then one message per line
-    MEMORY.md       the agent's own notes; part of its instructions, kept across compaction
-    state.json      model, context size, status, what it's busy with, pid
-    work/           its working directory (work/tools/: tools it made itself)
-    config.json, secrets.env, reminders.json, archive/, skills/   (see README.md)
+options:
+  -h, --help                show this help and exit
+  --version                 show the version and exit
 
-Instructions are the .md files in ~/.hobkins/_shared/ and the agent's folder
-(an agent's own file replaces the shared one of the same name). Settings:
-_shared/config.json, overridden per agent by ID/config.json. Environment variables
-for the agent's shell: _shared/secrets.env and ID/secrets.env (KEY=value lines).
+examples:
+  hobkin https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-... --chat
+  hobkin --hearthboard http://127.0.0.1:43917 TOKEN --chat
+  hobkin chat
 
-Standard library only. No ports: it only makes outgoing HTTP calls to the model API. With
-lorewell installed (pip install hobkin[lore]), the field lore: what the hobkins here learn about
-their people, code bases, build systems and environments, recalled when it bears on a message.
+files: each agent lives in ~/.hobkins/ID/ (or $HOBKIN_HOME/ID/):
+  in             a FIFO: echo "text" > in (lines like /stop are commands)
+  out            what it says and does: tail -F out
+  context.jsonl  exactly what the model sees: the system prompt, then one message per line
+  MEMORY.md      its own notes, in every prompt and kept across compaction (BLOOPERS.md: its reel)
+  state.json     model, context size, status, what it's busy with, pid
+  work/          its working directory (work/tools/: tools it made itself)
+  config.json, secrets.env, reminders.json, archive/, skills/
+Instructions are the .md files in _shared/ and the agent's folder (its own replaces a shared
+one of the same name). Settings: _shared/config.json, overridden by ID/config.json. The
+agent's shell gets _shared/secrets.env and ID/secrets.env (KEY=value lines).
+
+Standard library only; no ports (it only calls the model API out). With lorewell (pip install
+"hobkin[lore]"): the field lore, what the hobkins here learn, recalled when it bears on a
+message. Or run the file directly: python3 hobkin.py ... More: https://github.com/frank-lynam/hobkin
 """
 
 from __future__ import annotations
