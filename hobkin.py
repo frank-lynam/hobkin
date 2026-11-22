@@ -912,6 +912,23 @@ DRIVE = ("[hobkin: drive mode: keep working until every step of your goal is tic
          "Plan wrong? goal with revise. ({left} pushes left.)]")
 
 
+ANNOUNCED = ("[hobkin: you said what you'd do next (\"{said}\"), then stopped without doing it. Do it now; or, if "
+             "you've decided not to, say so and why.]")
+# A reply whose last sentence announces an action ("Let me commit it", "I'll run the tests next"): ending the turn
+# there leaves it undone, a common model habit
+ANNOUNCE_RE = re.compile(r"(?i)\b(let me|let's|now i'll|i'll now|next,? i'll|i'm going to|i am going to|i'll go ahead|"
+                         r"i'll start|i'll get|i'll do that|i'll run|i'll commit|i'll push|i'll fix)\b")
+
+
+def announced_next(text: str) -> str | None:
+    """The last sentence of a reply, if it announces something the agent is about to do (else None)."""
+    sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+", text.strip()) if x.strip()]
+    last = sentences[-1] if sentences else ""
+    if not last or last.endswith("?") or len(last) > 300:
+        return None
+    return last if ANNOUNCE_RE.search(last) else None
+
+
 COMMITTEE = ("[hobkin: that reads like a committee wrote it. Say it like a hobkin: the verdict first, the "
              "specific things you saw, jokes allowed, filler out.]")
 
@@ -2391,6 +2408,7 @@ class Agent:
         self.wake_last = ("", 0.0)         # the last answer delivered, and when (the same one isn't sent twice soon)
         self.wrap_up_sent = False
         self.voice_sent = False
+        self.announce_sent = False
         self.continue_sent = False         # the one "carry on" a turn gets without drive
         self.pending = []          # operator messages not yet given to the model
         self.fifo_buf = b""
@@ -5138,6 +5156,9 @@ class Agent:
             self.save_context()
             return True
         said = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        nxt = announced_next(said)
+        if nxt and self.nudge_once("announce_sent", ANNOUNCED.format(said=clip(nxt, 160, 0))):
+            return True                             # "let me commit it", then nothing: do it
         if len(committee_speak(said)) >= 3 and self.nudge_once("voice_sent", COMMITTEE):
             return True
         if self.push_on():                          # stopped with the goal unfinished
@@ -5678,6 +5699,7 @@ class Agent:
         if record:                         # people's messages and hobkin's notices, in an incident's timeline
             self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = self.continue_sent = False   # a new turn
+        self.announce_sent = False
         (self.state.get("goal") or {}).pop("waiting", None)                 # someone's said something: on we go
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False

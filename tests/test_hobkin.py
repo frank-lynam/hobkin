@@ -954,6 +954,11 @@ try:
     out = open(hs + "/s1/out").read()
     check("[self] a new instruction file is shown in the chat, with what it says", "instructions new: " + hs + "/s1/AGENTS.md"
           in out and "+Always say hi first." in out, out[-600:])
+    # A reply that ends by announcing an action ("Let me commit it now."), with no action: nudged, once
+    run("chat", "s1", input="Let me commit it now.\n")
+    cx = open(hs + "/s1/context.jsonl").read()
+    check("[nudge] a turn that ends announcing what it'll do, without doing it, is told to do it (once)",
+          cx.count("you said what you'd do next") == 1 and "Let me commit it now." in cx, cx[-600:])
     # With the field lore, the always-shown files are smaller, and say that the world's facts belong in the lore
     open(hs + "/s1/MEMORY.md", "w").write("".join(f"- note {i}: " + "y" * 120 + "\n" for i in range(70)))   # ~9 KB
     run("chat", "s1", input="and now?\n")
