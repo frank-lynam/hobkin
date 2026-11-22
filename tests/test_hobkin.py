@@ -1208,6 +1208,20 @@ try:
           and any("<secret>" in l for l in lines), [l for l in lines if "token" in l])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
+    # an agent that joined its board with an older hobkin is told, at start, how to set it up as this one does
+    h = home("oldboard", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    os.makedirs(h + "/old")
+    json.dump({"chores": {"hearthboard": {"settings": {"url": "http://127.0.0.1:48790/board"}}},
+               "inbox": {"url": "http://127.0.0.1:48790/board/api/chat/inbox?flat=1", "reply": "x/{thread}"}},
+              open(h + "/old/config.json", "w"))
+    p, aid, d = start(h, "old")
+    check("[board] an agent with older board settings is told how to update them",
+          "joined its board with an older hobkin" in open(d + "/out").read()
+          and "hobkin --hearthboard http://127.0.0.1:48790/board TOKEN --id old" in open(d + "/out").read(),
+          open(d + "/out").read()[-600:])
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent
     h = home("beat", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
              {"heartbeat_seconds": 1, "idle_prompt": None})
@@ -2066,6 +2080,13 @@ try:
 finally:
     for p in procs:
         if p.poll() is None: p.kill()
+    for pid in [x for x in os.listdir("/proc") if x.isdigit()]:     # agents and brownies started in the background
+        try:
+            env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+            if any(e.startswith(b"HOBKIN_HOME=" + BASE.encode()) for e in env):
+                os.kill(int(pid), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
     shutil.rmtree(BASE, ignore_errors=True)
 print("FAILED" if failed else "ALL PASSED")
 sys.exit(1 if failed else 0)

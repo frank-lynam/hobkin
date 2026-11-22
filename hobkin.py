@@ -2491,6 +2491,12 @@ class Agent:
         if self.cfg.get("field_lore", True) and not self.brownie_of:
             self.log("hobkin", f"field lore: {len(self.lore.topics())} topics in {FIELD_LORE}" if self.lore else
                      "field lore: off (it needs lorewell 0.4 or later: pip install lorewell)")
+        board = ((self.cfg.get("chores") or {}).get("hearthboard") or {}).get("settings") or {}
+        if (self.cfg.get("chores") or {}).get("hearthboard") and not self.brownie_of and \
+                not ((self.cfg.get("inbox") or {}).get("deliver") and self.cfg.get("live")):
+            self.log("hobkin", "this agent joined its board with an older hobkin: its chat is only answered mid-command, "
+                     "and it sends no live view. To set it up as this hobkin does, run the board's line again: "
+                     f"hobkin --hearthboard {board.get('url') or 'BOARD_URL'} TOKEN --id {self.id}")
         self.log("hobkin", f"talk: echo 'hello' > {self.p('in')}    watch: tail -F {self.p('out')}")
 
     def _on_signal(self, signum, frame):
