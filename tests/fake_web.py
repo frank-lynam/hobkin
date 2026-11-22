@@ -23,6 +23,11 @@ DDG = """<html><body>
 
 
 POSTED = []      # replies posted to the board's chat
+# A second board, for chat delivered like a terminal's and the live feed: its chat (held requests), what's posted
+CHAT2 = [{"id": 5, "thread": 7, "thread_name": "frank", "from": "frank",
+          "text": "is the build done? (token tok-live-123456)", "needs_reply": True},
+         {"id": 6, "thread": 8, "thread_name": "builds", "from": "bot-2", "text": "fyi: nightly is green", "needs_reply": False}]
+POSTED2, READ2, LIVE2, INBOX2 = [], [], [], []
 WAITS = []       # the board's /api/wait requests, as asked (path and query)
 
 
@@ -66,8 +71,9 @@ class H(BaseHTTPRequestHandler):
 <form method="post" action="/sso/acs"><input type="hidden" name="SAMLResponse" value="signed-assertion">
 <input type="hidden" name="RelayState" value="{back}"><input type="submit" value="Continue"></form></body></html>""")
         if path == "/board/api/chat/inbox":                  # its chat: one message from a person, until answered
-            msgs = [] if POSTED else [{"id": 5, "thread": 7, "thread_name": "frank", "from": "frank",
-                                       "text": "is the build done?", "needs_reply": True}]
+            mine = self.headers.get("authorization") == "Bearer tok-9"     # (only for the front desk's test agent)
+            msgs = [] if POSTED or not mine else [{"id": 5, "thread": 7, "thread_name": "frank", "from": "frank",
+                                                   "text": "is the build done?", "needs_reply": True}]
             return self.send(200, json.dumps({"messages": msgs}), "application/json")
         if path == "/board/api/wait":                         # a worker set to some projects gets a ticket in one
             WAITS.append(self.path)
@@ -78,6 +84,19 @@ class H(BaseHTTPRequestHandler):
                     "application/json")
             time.sleep(1)
             return self.send(200, json.dumps({"reason": "timeout", "tickets": []}), "application/json")
+        if path == "/hb2/api/chat/inbox":                    # held until there's something newer than `after`
+            INBOX2.append(self.path)
+            after, wait = int(q.get("after", ["0"])[0]), float(q.get("wait", ["0"])[0])
+            end = time.time() + min(wait, 2)
+            while True:
+                msgs = [m for m in CHAT2 if m["id"] > after]
+                if msgs or time.time() >= end:
+                    break
+                time.sleep(0.1)
+            return self.send(200, json.dumps({"messages": msgs}), "application/json")
+        if path == "/hb2/seen":
+            return self.send(200, json.dumps({"posted": POSTED2, "read": READ2, "live": LIVE2, "inbox": INBOX2}),
+                             "application/json")
         if path == "/board/waits":
             return self.send(200, json.dumps(WAITS), "application/json")
         if path == "/board/posted":
@@ -97,6 +116,20 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("content-length") or 0)).decode()
+        if self.path == "/board/api/live":                    # the board workers' live feeds: taken, not checked
+            return self.send(200, '{"seq": 1}', "application/json")
+        if self.path == "/hb2/api/live":
+            LIVE2.append({"body": json.loads(raw), "auth": self.headers.get("authorization")})
+            return self.send(200, '{"seq": 1}', "application/json")
+        if self.path == "/hb2/inject":                        # the test sends a new chat message
+            CHAT2.append(json.loads(raw))
+            return self.send(200, "{}", "application/json")
+        if self.path.startswith("/hb2/api/chat/") and self.path.endswith("/read"):
+            READ2.append(self.path)
+            return self.send(200, "{}", "application/json")
+        if self.path.startswith("/hb2/api/chat/"):
+            POSTED2.append({"path": self.path, "body": raw, "auth": self.headers.get("authorization")})
+            return self.send(201, "{}", "application/json")
         if self.path.startswith("/board/api/chat/"):
             POSTED.append({"path": self.path, "type": self.headers.get("content-type"), "body": raw,
                            "auth": self.headers.get("authorization")})

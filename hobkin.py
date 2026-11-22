@@ -213,11 +213,17 @@ DEFAULT_CONFIG = {
     # "front desk"): one model call with the worker's own conversation, so a local server's KV cache is
     # reused, and never alongside the worker's own calls. false: they wait for the command to finish.
     "front_desk": True,
-    # Another inbox for the front desk, checked over HTTP every `every` seconds while a command runs (set
-    # up by --hearthboard): {"url": ..., "reply": ".../{thread}/messages", "headers": {...}, "every": 15}.
-    # The url returns {"messages": [{"id", "thread", "from", "text", "needs_reply"}]}; replies are POSTed
-    # to `reply` as plain text. ${NAME} in headers comes from secrets.env.
+    # Another inbox, a tracker's chat (set up by --hearthboard): {"url": ..., "reply": ".../{thread}/messages",
+    # "read": ".../{thread}/read", "headers": {...}, "deliver": true, "wait": 50, "every": 3}. The url returns
+    # {"messages": [{"id", "thread", "thread_name", "from", "text", "needs_reply"}]}; replies are POSTed to `reply`
+    # as plain text. ${NAME} in headers comes from secrets.env. With "deliver", it's chat like this terminal's:
+    # hobkin listens all the time (holding the request `wait` seconds, &wait=N&after=ID, where the server can;
+    # else asking every `every` seconds), each message goes into the conversation at once (the front desk answers
+    # it mid-command), and what the agent says back is posted there. Without it: only answered mid-command.
     "inbox": None,
+    # Where hobkin sends what the agent says as it works (what `hobkin chat` shows, secrets masked), for the people
+    # it works for to watch (set up by --hearthboard): {"url": ".../api/live", "headers": {...}}.
+    "live": None,
     # Waiting for work, done by hobkin instead of by the agent (set up by --hearthboard): while the agent is
     # idle, hobkin long-polls `url` (headers as for inbox) and wakes it with the answer, unless the answer
     # matches `quiet` (e.g. {"reason": "timeout"}). One waiter, so nothing races for the same news.
@@ -292,7 +298,7 @@ CONFIG_TYPES = {"model": (str, type(None)), "models": dict, "operator": (str, ty
                 "heartbeat_seconds": (int, float), "announce_first": dict, "announce_delay": (int, float),
                 "daily_budget_usd": (int, float, type(None)), "web": dict, "drive_max_pushes": int,
                 "fallback_models": list, "alert_command": (str, type(None)), "safe_mode": (bool, dict), "front_desk": bool,
-                "inbox": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
+                "inbox": (dict, type(None)), "live": (dict, type(None)), "wake": (dict, type(None)), "notify": (dict, type(None)),
                 "break_glass": (dict, type(None)), "chores": (dict, type(None)), "chore_dirs": list,
                 "host": (str, type(None)), "ssh": (str, type(None)), "brownie": (dict, type(None)),
                 "projects": (list, type(None))}
@@ -1146,6 +1152,43 @@ CHORE_GIVEN = ("[from hobkin: you've been given a chore: {name}. Read CHORE.md a
 GOAL_KEPT = ("[hobkin: you have an open goal: {goal}. If this adds to or changes it, fold it in with the goal tool (a "
              "subgoal, or revise) rather than dropping what you were doing.]")
 REPLY_OWED = "[hobkin: {who} is waiting for an answer: reply to them now, in your reply text, then carry on.]"
+BOARD_MESSAGE = ("[message from {who} in the board's chat ({where}), {stamp}{busy}: what you say back is posted there, "
+                 "so answer them in your reply]\n{text}")
+BOARD_NOTE = "[from {who} in the board's chat ({where}), {stamp}: for reading; no reply needed]\n{text}"
+
+# What never leaves the machine in what hobkin sends out (the live feed): secrets.env and key values, and these
+# (the redaction floor atone, lorewell and eaveswatch keep too)
+REDACT = [(re.compile(p, re.S), r) for p, r in (
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "<redacted key>"),
+    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "<redacted>"),
+    (r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}", "<redacted>"),
+    (r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}", "<redacted>"),
+    (r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}", "<redacted>"),
+    (r"(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}", r"\1 <redacted>"),
+    (r"(?i)(\b[\w.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|"
+     r"session[_-]?id|authorization))([\"']?\s*[:=]\s*[\"']?)(?!<redacted|\()[^\s&\"',;<]+", r"\1\2<redacted>"),
+    (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),
+    (r"(?<![\w/+=])(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{40,}={0,2}"
+     r"(?![\w/+=])", "<redacted blob>"))]
+
+
+def secret_values(agent_dir: str) -> list[str]:
+    """The values of the secrets an agent holds (secrets.env, shared and its own, and the model keys): masked in
+    anything hobkin sends out. Longest first, so one inside another goes whole."""
+    vals = list(load_env_file(os.path.join(SHARED, "secrets.env")).values()) + \
+        list(load_env_file(os.path.join(agent_dir, "secrets.env")).values())
+    keys = os.path.join(SHARED, "keys")
+    for n in (os.listdir(keys) if os.path.isdir(keys) else []):
+        vals.append(read(os.path.join(keys, n)).strip())
+    return sorted({v for v in vals if len(v) >= 6}, key=len, reverse=True)
+
+
+def redact_secrets(text: str, values: list[str]) -> str:
+    for v in values:
+        text = text.replace(v, "<secret>")
+    for rx, rep_ in REDACT:
+        text = rx.sub(rep_, text)
+    return text
 
 
 STUMBLE = "[hobkin: ha, a stumble! If that was your slip, add a line to your blooper reel ($HOBKIN_BLOOPERS).]"
@@ -1379,18 +1422,22 @@ def chore_env(key: str) -> str:
 
 # The board's skill tells an agent to keep GET /api/wait running and set up its own listener; on hobkin, hobkin is it.
 HEARTHBOARD_LISTENER = (
-    "hobkin is your listener: while you're idle it waits on the board (GET /api/wait) for you and wakes you "
-    "with what the board says, and while you're busy running a command it answers board chat for you. So don't "
-    "call /api/wait yourself, and don't set up background waits, cron jobs or polling for the board: when you've "
-    "finished an action, end your turn. Where the skill asks how you set up the listener, that's the answer: "
-    "hobkin does it (wake and inbox in its config), nothing to run.")
+    "hobkin is your listener. The board's chat comes to you like a message here, as soon as it's sent, even "
+    "mid-task, and what you say back is posted to that conversation: so answer chat just by replying (use the chat "
+    "API only to start a conversation, add someone or attach a file). While you're running a command, hobkin "
+    "answers it for you meanwhile. While you're idle, it waits on the board (GET /api/wait) and wakes you with "
+    "what's next. So don't call /api/wait or /api/chat/inbox yourself, and don't set up background waits, cron "
+    "jobs or polling for the board: when you've finished an action, end your turn. Where the skill asks how you "
+    "set up the listener, that's the answer: hobkin does it (wake and inbox in its config), nothing to run. What "
+    "you say as you work also shows live on your page on the board, for the people you work tickets for.")
 
 # Chores built into hobkin: hearthboard is one (`--hearthboard URL TOKEN` is short for it). A chores folder of the
 # same name wins over a built-in one.
 BUILTIN_CHORES = {
     "hearthboard": ({
         "name": "hearthboard",
-        "description": "Work from a hearthboard: its skill, hobkin waiting on it while idle, its chat answered mid-command.",
+        "description": "Work from a hearthboard: its skill, hobkin waiting on it while idle, its chat as quick as a "
+                       "terminal, and a live view of what it says on its page there.",
         "apprentice": False,
         "settings": {
             "url": {"about": "the board's URL", "env": "HEARTHBOARD_URL"},
@@ -1405,11 +1452,15 @@ BUILTIN_CHORES = {
         "config": {
             "idle_prompt": None,
             # hobkin waits on the board while the agent's idle, and wakes it with what the board says
-            "wake": {"url": "{{url}}/api/wait?timeout=50&project={{projects}}", "headers": {"Authorization": "Bearer {{token}}"},
-                     "quiet": {"reason": "timeout"}},
-            # the board's chat, for the front desk: answered while the agent's busy running a command
+            # (chat=0: the chat comes in by the inbox below, so the wait is for the rest; an older board ignores it)
+            "wake": {"url": "{{url}}/api/wait?timeout=50&chat=0&project={{projects}}",
+                     "headers": {"Authorization": "Bearer {{token}}"}, "quiet": [{"reason": "timeout"}, {"reason": "chat"}]},
+            # the board's chat, like this terminal's: listened to all the time, delivered at once, replies posted
             "inbox": {"url": "{{url}}/api/chat/inbox?flat=1", "reply": "{{url}}/api/chat/{thread}/messages",
-                      "headers": {"Authorization": "Bearer {{token}}"}, "every": 15}}},
+                      "read": "{{url}}/api/chat/{thread}/read", "headers": {"Authorization": "Bearer {{token}}"},
+                      "deliver": True, "wait": 50, "every": 3},
+            # what it says as it works, live on its page on the board, for the people it works tickets for
+            "live": {"url": "{{url}}/api/live", "headers": {"Authorization": "Bearer {{token}}"}}}},
         "# Your work comes from the hearthboard at {{url}}\n\nYou're {{user}} there. Your hearthboard skill has the "
         "board's rules: follow them, except for its wait loop. " + HEARTHBOARD_LISTENER + "\n\nThe board has one "
         "project per team, and you work in the ones you're a member of. Projects you're set to work here (empty: "
@@ -2325,6 +2376,9 @@ class Agent:
         self.glass_ended = None            # set at start-up when it ended while hobkin wasn't running
         self.glass_extension = None
         self.answered = []                 # (who, message, reply, where, posted) the front desk handled this step
+        self.board_q = []                  # the board's chat: messages the listener brought in, not yet delivered
+        self.board_lock = threading.Lock()
+        self.board_owed = []               # conversations waiting for what the agent says next: [(thread, where)]
         self.inbox_checked = 0.0
         self.waker = None                  # the thread long-polling the wake URL while idle
         self.woken = None                  # what it brought back: (ok, body)
@@ -3192,7 +3246,8 @@ class Agent:
         """Wait up to `timeout` seconds for input; collect complete messages into self.pending."""
         deadline = time.time() + timeout
         before = (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested, self.model_wanted, self.greet_wanted, self.working)   # working: /drive got it going
+                  self.models_requested, self.model_wanted, self.greet_wanted, self.working,   # working: /drive got it going
+                  len(self.board_q))
         self._drain_queue()
         while True:
             left = max(0.0, deadline - time.time())
@@ -3217,7 +3272,7 @@ class Agent:
                 self.fifo_buf = b""
             self._drain_queue()
             if self.stop or time.time() >= deadline or (len(self.pending), self.paused, self.compact_requested, self.restart_requested, self.limits_requested,
-                  self.models_requested, self.model_wanted, self.greet_wanted, self.working) != before:
+                  self.models_requested, self.model_wanted, self.greet_wanted, self.working, len(self.board_q)) != before:
                 return
 
     def _drain_queue(self):
@@ -3352,7 +3407,7 @@ class Agent:
             self.answered.append((self.who, self.pending.pop(0), reply, "", ""))
             self.owe_reply = False
 
-    def inbox_request(self, url: str, data: bytes | None = None):
+    def inbox_request(self, url: str, data: bytes | None = None, timeout: float = 15):
         """An HTTP request to the inbox, with its headers (${NAME} from secrets.env)."""
         env = {**os.environ, **load_env_file(os.path.join(SHARED, "secrets.env")), **load_env_file(self.p("secrets.env"))}
         headers = {k: re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), ""), str(v))
@@ -3361,7 +3416,7 @@ class Agent:
         if data is not None:
             headers["content-type"] = "text/plain; charset=utf-8"
         req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET", headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
 
     def start_waker(self) -> None:
@@ -3439,7 +3494,8 @@ class Agent:
             data = json.loads(body) if body.strip() else None
         except ValueError:
             data = body
-        if data is None or (isinstance(data, dict) and quiet and all(data.get(k) == v for k, v in quiet.items())):
+        if data is None or (isinstance(data, dict) and any(q and all(data.get(k) == v for k, v in q.items())
+                                                           for q in (quiet if isinstance(quiet, list) else [quiet]))):
             return None
         same = body.strip() == self.wake_last[0]
         if same and time.time() - self.wake_last[1] < 300:   # it was told this already: give it time
@@ -3481,6 +3537,174 @@ class Agent:
             seen.append(key)
             del seen[:-300]
             self.save_state()
+
+    def board_delivers(self) -> bool:
+        return bool((self.cfg.get("inbox") or {}).get("deliver")) and not self.brownie_of
+
+    def start_board(self) -> None:
+        """The board's chat, as fast as this terminal: a thread that listens all the time (see "inbox")."""
+        if self.board_delivers():
+            threading.Thread(target=self.board_listen, daemon=True).start()
+
+    def board_listen(self) -> None:
+        inbox = self.cfg.get("inbox") or {}
+        wait, every = float(inbox.get("wait") or 50), float(inbox.get("every") or 3)
+        with self.board_lock:
+            seen = set(self.state.get("inbox_seen") or [])
+            after = int(self.state.get("inbox_after") or 0)
+        while not self.stop:
+            url = str(inbox["url"])
+            url += ("&" if "?" in url else "?") + f"wait={int(wait)}&after={after}"
+            started = time.time()
+            try:
+                data = json.loads(self.inbox_request(url, timeout=wait + 20) or b"{}")
+                self.state.pop("inbox_warned", None)
+            except (KeyError, urllib.error.URLError, OSError, ValueError) as e:
+                if not self.state.get("inbox_warned"):
+                    self.state["inbox_warned"] = True
+                    self.log("hobkin", f"couldn't reach the board's chat ({e}); trying again every 10s")
+                time.sleep(10)
+                continue
+            new = []
+            for m in (data.get("messages") if isinstance(data, dict) else data) or []:
+                key = f'{m.get("thread")}:{m.get("id")}'
+                try:
+                    after = max(after, int(m.get("id") or 0))
+                except (TypeError, ValueError):
+                    pass
+                if key not in seen:
+                    seen.add(key)
+                    new.append(m)
+            if new:
+                with self.board_lock:
+                    self.board_q.extend(new)
+                    self.state["inbox_seen"] = (list(self.state.get("inbox_seen") or []) + [
+                        f'{m.get("thread")}:{m.get("id")}' for m in new])[-300:]
+                    self.state["inbox_after"] = after
+            if time.time() - started < 1 and not new:
+                time.sleep(every)                     # a server that doesn't hold the request: ask every few seconds
+
+    def take_board(self, busy: bool = False) -> list[str]:
+        """The board's new messages, as the agent sees them (like a message here); the ones that want a reply are
+        remembered, so what it says next is posted back to their conversation."""
+        if not self.board_q:
+            return []
+        with self.board_lock:
+            msgs, self.board_q = self.board_q, []
+        out = []
+        for m in msgs:
+            who, text = str(m.get("from") or "someone"), str(m.get("text") or "")
+            where = str(m.get("thread_name") or f"conversation {m.get('thread')}")
+            self.log(f"{who} (board)", text)
+            self.timeline(f"told on the board, by {who}: " + clip(" ".join(text.split()), 400, 100))
+            if m.get("needs_reply") is False:
+                out.append(BOARD_NOTE.format(who=who, where=where, stamp=self.stamp(), text=text))
+                self.board_read(m)
+                continue
+            out.append(BOARD_MESSAGE.format(who=who, where=where, stamp=self.stamp(), text=text,
+                                            busy=", while you were working" if busy else "") + self.recall(text))
+            if (m.get("thread"), where) not in self.board_owed:
+                self.board_owed.append((m.get("thread"), where))
+            self.owe_reply, self.reply_nudged, self.owe_who = True, False, who
+        return out
+
+    def board_read(self, m: dict) -> None:
+        read_url = (self.cfg.get("inbox") or {}).get("read")
+        if read_url:
+            try:
+                self.inbox_request(str(read_url).replace("{thread}", str(m.get("thread"))), b"")
+            except (urllib.error.URLError, OSError):
+                pass
+
+    def post_board(self, text: str) -> None:
+        """What the agent just said, posted to each board conversation waiting for it."""
+        inbox, owed, self.board_owed = self.cfg.get("inbox") or {}, self.board_owed, []
+        for thread, where in owed:
+            try:
+                self.inbox_request(str(inbox["reply"]).replace("{thread}", str(thread)), text.encode())
+                self.log("hobkin", f"posted to the board's chat ({where})")
+            except (KeyError, urllib.error.URLError, OSError) as e:
+                self.log("hobkin", f"couldn't post to the board's chat ({where}): {e}; answer there yourself")
+
+    def board_front_desk(self) -> None:
+        """While a command runs: the board's messages that want a reply are answered now, and posted back."""
+        with self.board_lock:
+            ask = [m for m in self.board_q if m.get("needs_reply") is not False]
+        for m in ask:
+            who, text = str(m.get("from") or "someone"), str(m.get("text") or "")
+            where = f' in the board\'s chat ({m.get("thread_name") or m.get("thread")})'
+            reply = self.front_desk_reply(who, text, where)
+            if not reply:
+                return                                   # it'll go in with the command's result instead
+            try:
+                self.inbox_request(str((self.cfg.get("inbox") or {})["reply"]).replace("{thread}", str(m.get("thread"))),
+                                   reply.encode())
+                posted = ", posted there"
+            except (KeyError, urllib.error.URLError, OSError) as e:
+                posted = f" (but posting it failed: {e}; answer there yourself)"
+            with self.board_lock:
+                self.board_q = [x for x in self.board_q if x is not m]
+            self.log(f"{who} (board)", text)
+            self.log("agent", f"(to {who}{where}) {reply}")
+            self.answered.append((who, text, reply, where, posted))
+
+    def start_live(self) -> None:
+        if (self.cfg.get("live") or {}).get("url") and not self.brownie_of:
+            threading.Thread(target=self.live_send, daemon=True).start()
+
+    def live_status(self) -> tuple[str, str]:
+        st, g = self.state, self.state.get("goal") or {}
+        busy = (st.get("busy") or {}).get("what")
+        return (st.get("status") or "") + (f": {busy}" if busy else ""), (g.get("goal") or "") if g.get("open") else ""
+
+    def live_send(self) -> None:
+        """What the agent says as it works, as `hobkin chat` shows it (secrets masked), sent to `live` every second
+        or so, starting with the last few lines; its status at least every 30s, so the page knows it's there."""
+        live = self.cfg.get("live") or {}
+        env = {**os.environ, **load_env_file(os.path.join(SHARED, "secrets.env")), **load_env_file(self.p("secrets.env"))}
+        headers = {k: re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), ""), str(v))
+                   for k, v in (live.get("headers") or {}).items()}
+        headers.update({"user-agent": USER_AGENT, "content-type": "application/json"})
+        path, st, buf, sent, values, values_at = self.p("out"), {}, [], (None, 0.0), [], 0.0
+        try:
+            pos = max(0, os.path.getsize(path) - 6000)
+        except OSError:
+            pos = 0
+        part = b""
+        while not self.stop:
+            time.sleep(1)
+            try:
+                with open(path, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read(1 << 20)
+            except OSError:
+                chunk = b""
+            pos += len(chunk)
+            part += chunk
+            lines, _, part = part.rpartition(b"\n")
+            if lines:
+                text = lines.decode(errors="replace").splitlines()
+                if not st and text and pos - len(chunk) > 0 and not buf:
+                    while text and text[0].startswith("    "):    # started mid-entry: from the next whole one
+                        text.pop(0)
+                if time.time() - values_at > 60:
+                    values, values_at = secret_values(self.dir), time.time()
+                buf += [redact_secrets(l, values) for l in chat_view(text, "\x00", False, st, name=self.id)]
+            status = self.live_status()
+            if not buf and status == sent[0] and time.time() - sent[1] < 30:
+                continue
+            body = json.dumps({"lines": buf[:500], "status": status[0], "goal": status[1]}).encode()
+            try:
+                urllib.request.urlopen(urllib.request.Request(str(live["url"]), data=body, headers=headers,
+                                                              method="POST"), timeout=15).read()
+                buf, sent = buf[500:], (status, time.time())
+                self.state.pop("live_warned", None)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                if not self.state.get("live_warned"):
+                    self.state["live_warned"] = True
+                    self.log("hobkin", f"couldn't send the live feed ({e}); will keep trying")
+                del buf[:-2000]
+                time.sleep(10)
 
     # --- tools: dispatch, the agent's own tools, the shell's environment and folder
     def run_tool(self, name: str, inp: dict) -> ToolResult:
@@ -3722,7 +3946,10 @@ class Agent:
                 if self.pending and self.cfg.get("front_desk", True):
                     self.front_desk()                # answer now; the command keeps running
                 inbox = self.cfg.get("inbox")
-                if inbox and self.cfg.get("front_desk", True) and \
+                if inbox and self.cfg.get("front_desk", True) and self.board_delivers():
+                    if self.board_q:
+                        self.board_front_desk()          # the listener brought them in: answered now
+                elif inbox and self.cfg.get("front_desk", True) and \
                         time.time() - self.inbox_checked >= float(inbox.get("every") or 15):
                     self.check_inbox()
                 if self.stop:
@@ -4100,7 +4327,7 @@ class Agent:
         cd = os.path.join(home, cid)
         os.makedirs(os.path.join(home, "_shared"), exist_ok=True)
         cfg = {k: v for k, v in self.cfg.items() if not k.startswith("_") and k not in (
-            "idle_prompt", "wake", "inbox", "chores", "break_glass", "alert_command", "brownie", "operator",
+            "idle_prompt", "wake", "inbox", "live", "chores", "break_glass", "alert_command", "brownie", "operator",
             "front_desk")}
         cfg.update({"model": name, "idle_prompt": None, "heartbeat_seconds": 0, "tidy_every": None,
                     "_brownie_of": self.id})
@@ -4841,7 +5068,7 @@ class Agent:
     def from_operator(self, text: str, busy: bool = False) -> str:
         """A message from the operator as the model sees it: who sent it, and the hot-take hint, unless
         the agent is busy (mid-task) or managing itself (a reminder or job of its own coming)."""
-        self.owe_reply, self.reply_nudged = True, False
+        self.owe_reply, self.reply_nudged, self.owe_who = True, False, self.who
         g = self.state.get("goal") or {}
         kept = f"\n{GOAL_KEPT.format(goal=g['goal'])}" if g.get("open") else ""
         recalled = self.recall(text)
@@ -4900,7 +5127,7 @@ class Agent:
         if self.reply_nudged:
             return None
         self.reply_nudged = True
-        return REPLY_OWED.format(who=self.who)
+        return REPLY_OWED.format(who=getattr(self, "owe_who", None) or self.who)
 
     def turn_end_nudge(self, blocks: list) -> bool:
         """At the end of a turn: someone still waiting for an answer, a committee-voiced reply, or the
@@ -5588,6 +5815,9 @@ class Agent:
                 self.log("agent", b["text"])
                 self.turn_said += "\n" + b["text"]
                 self.timeline("said: " + clip(" ".join(b["text"].split()), 400, 100))
+        said = "\n\n".join(b["text"].strip() for b in blocks if b.get("type") == "text" and b.get("text", "").strip())
+        if said and self.board_owed:
+            self.post_board(said)
         calls = [b for b in blocks if b.get("type") == "tool_use"]
         if stop_reason in ("max_tokens", "length") and not calls:
             self.log("hobkin", "reply hit the output limit")
@@ -5713,6 +5943,8 @@ class Agent:
         self.save_context()
         self.next_idle_prompt = None
         self.start_heartbeat()
+        self.start_board()
+        self.start_live()
         idle_since = time.time()
         try:
             while not self.stop and not self.restart_requested:
@@ -5737,8 +5969,9 @@ class Agent:
                     self.compact_requested = False
                     self.compact("requested")
                 due = self.due_events()
-                if due or self.pending:
-                    self.add_user("\n\n".join(due + [self.from_operator(t) for t in self.pending]))
+                board = self.take_board(busy=self.working)
+                if due or self.pending or board:
+                    self.add_user("\n\n".join(due + [self.from_operator(t) for t in self.pending] + board))
                     self.pending = []
                 if self.working:
                     self.save_state("working")

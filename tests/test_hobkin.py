@@ -1023,7 +1023,10 @@ try:
           and oct(os.stat(ad + "/secrets.env").st_mode & 0o777) == "0o600", r.stdout + r.stderr + sec)
     check("[hearthboard] on the configured model, with hobkin waiting on the board and answering its chat (and saying so)",
           "hi board" in open(ad + "/context.jsonl").read() and "You're now a worker" in open(ad + "/context.jsonl").read()
-          and "don't call /api/wait yourself" in open(ad + "/context.jsonl").read()
+          and "don't call /api/wait or /api/chat/inbox yourself" in open(ad + "/context.jsonl").read()
+          and json.load(open(ad + "/config.json"))["inbox"]["deliver"] is True
+          and json.load(open(ad + "/config.json"))["live"]["url"].endswith("/board/api/live")
+          and "chat=0" in json.load(open(ad + "/config.json"))["wake"]["url"]
           and "/api/wait" in json.load(open(ad + "/config.json"))["wake"]["url"]
           and json.load(open(ad + "/config.json"))["inbox"]["url"].endswith("/api/chat/inbox?flat=1")
           and "hb-good" not in open(ad + "/context.jsonl").read(), r.stdout)
@@ -1147,6 +1150,57 @@ try:
           and "FRONT DESK: still on it, re: is the build done?" in posted[0]["body"] and posted[0]["auth"] == "Bearer tok-9", posted)
     check("[inbox] the worker hears it", "frank wrote in chat (frank) and you answered straight away, posted there"
           in open(d + "/context.jsonl").read())
+    p.send_signal(signal.SIGTERM); p.wait(10)
+
+    # the board's chat like a terminal's (inbox deliver): listened to all the time, delivered at once, the reply
+    # posted back; a note only marked read; mid-command, the front desk answers; and the live feed, secrets masked
+    h = home("board2", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY"},
+             {"idle_prompt": None})
+    os.makedirs(h + "/hb")
+    B2 = "http://127.0.0.1:48790/hb2"
+    json.dump({"inbox": {"url": B2 + "/api/chat/inbox?flat=1", "reply": B2 + "/api/chat/{thread}/messages",
+                         "read": B2 + "/api/chat/{thread}/read", "headers": {"Authorization": "Bearer ${BOARD_TOKEN}"},
+                         "deliver": True, "wait": 2, "every": 1},
+               "live": {"url": B2 + "/api/live", "headers": {"Authorization": "Bearer ${BOARD_TOKEN}"}}},
+              open(h + "/hb/config.json", "w"))
+    open(h + "/hb/secrets.env", "w").write("BOARD_TOKEN=tok-live-123456\n")
+    p, aid, d = start(h, "hb")
+    wait_for(d, "echo: is the build done?", 20)
+    seen2 = lambda: json.loads(urllib.request.urlopen(B2 + "/seen").read())
+    for _ in range(50):
+        if seen2()["posted"]: break
+        time.sleep(0.2)
+    got = seen2()
+    check("[board] its chat comes in at once and the agent's reply is posted to that conversation",
+          [x["path"] for x in got["posted"]] == ["/hb2/api/chat/7/messages"] and got["posted"][0]["body"].startswith(
+              "echo: is the build done?") and got["posted"][0]["auth"] == "Bearer tok-live-123456", got["posted"])
+    c = open(d + "/context.jsonl").read()
+    check("[board] it's told who wrote, where, and that its reply goes there; a note is only for reading (marked read)",
+          "in the board's chat (frank)" in c and "what you say back is posted there" in c
+          and "for reading; no reply needed" in c and "nightly is green" in c and got["read"] == ["/hb2/api/chat/8/read"], got)
+    check("[board] the listener holds the request (wait, after the newest it has)",
+          any("wait=2" in x and "after=6" in x for x in got["inbox"]), got["inbox"][-3:])
+    say(d, "run: sleep 4; echo built")
+    time.sleep(1.5)
+    urllib.request.urlopen(urllib.request.Request(B2 + "/inject", data=json.dumps(
+        {"id": 9, "thread": 7, "thread_name": "frank", "from": "frank", "text": "and the tests?", "needs_reply": True}).encode(),
+        method="POST")).read()
+    wait_for(d, "Done. Output was: built", 20)
+    posted = [x["body"] for x in seen2()["posted"]]
+    check("[board] mid-command, the front desk answers it and posts that", any(b.startswith("FRONT DESK: still on it, re: "
+          "and the tests?") for b in posted) and "frank wrote in the board's chat (frank)" in open(d + "/context.jsonl").read(), posted)
+    for _ in range(50):
+        lines = [l for x in seen2()["live"] for l in x["body"]["lines"]]
+        if any("echo: is the build done?" in l for l in lines): break
+        time.sleep(0.2)
+    live = seen2()["live"]
+    lines = [l for x in live for l in x["body"]["lines"]]
+    check("[live] what it says goes to the live feed as chat shows it: messages and replies, no tool calls",
+          any("frank (board)> is the build done?" in l for l in lines) and any("hb> echo: is the build done?" in l for l in lines)
+          and not any("$> sleep 4" in l for l in lines) and live[-1]["auth"] == "Bearer tok-live-123456"
+          and "status" in live[-1]["body"], lines[-8:])
+    check("[live] secrets never go out in it", not any("tok-live-123456" in l for l in lines)
+          and any("<secret>" in l for l in lines), [l for l in lines if "token" in l])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
     # heartbeat: on duty (working, or a wake-up scheduled) prints to stdout; waiting for a message is silent

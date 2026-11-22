@@ -243,14 +243,24 @@ do with it, the way a work tracker's API would:
   Ollama, vLLM) reuses its KV cache, and it's never sent alongside the agent's
   own model calls, so one server slot is enough. A message that arrives while
   the model is mid-reply is answered as soon as that reply is done.
-  **A tracker's chat too:** with an `inbox` in config (`--hearthboard` sets one
-  up), hobkin checks it every 15 seconds while a command runs; a message from a
-  person there is answered the same way and the reply posted back to that
-  conversation. Messages that only need reading (other agents', notes) are left
-  for the agent. Any tracker can work this way: `inbox` is a URL that returns
-  `{"messages": [{"id", "thread", "from", "text", "needs_reply"}]}` and a `reply`
-  URL (`{thread}` filled in) that takes the text as `text/plain`, with headers
-  whose `${NAMES}` come from `secrets.env`.
+  **A tracker's chat too, as quick as this terminal:** with an `inbox` in config
+  and `"deliver": true` (`--hearthboard` sets it up), hobkin listens to it all the
+  time. A message there goes into the conversation at once, even mid-task, as
+  `[message from frank in the board's chat (frank) …]`, and what the agent says
+  next is posted back to that conversation; while a command runs, the front desk
+  answers it the same way. Messages that only need reading (other agents', notes)
+  come in marked so, and are marked read (`read`). Any tracker can work this way:
+  `inbox` is a URL that returns `{"messages": [{"id", "thread", "thread_name",
+  "from", "text", "needs_reply"}]}` (hobkin adds `wait=50&after=ID`: a server that
+  can, holds the request until there's something newer; one that can't is asked
+  every few seconds), and a `reply` URL (`{thread}` filled in) that takes the text
+  as `text/plain`, with headers whose `${NAMES}` come from `secrets.env`. Without
+  `deliver`, it's only checked mid-command (every `every` seconds).
+  **And a live view:** with `live` in config (`--hearthboard` sets it), hobkin
+  sends what the agent says as it works, what `hobkin chat` shows (no tool output,
+  secrets masked: `secrets.env` and key values, and key-shaped text), to that URL
+  as `{"lines": [...], "status", "goal"}` every second or so. On a hearthboard it's
+  on the agent's page, for the people it works tickets for.
   `"front_desk": false` turns it off: then the message rides along with the
   command's result, `[… while you were working: answer it in your next reply,
   then carry on]`, with one reminder if it goes on working without a word.
@@ -1139,13 +1149,19 @@ board's skill explains projects to the agent.
 
 **hobkin is the worker's listener.** The board's skill tells an agent to keep
 `GET /api/wait` running and set up its own listener (a background wait, a cron
-job). A hobkin worker doesn't: while it's idle, hobkin holds `/api/wait` open for
-it (`wake`) and wakes it with what the board says; while it's busy running a
-command, hobkin checks the board's chat every 15 seconds (`inbox`) and the front
-desk answers. The chore's instructions tell the agent so, and to just end its
-turn when an action is done. If a worker is slow to answer the board, check its
-config has both (`grep -E '"wake"|"inbox"' ~/.hobkins/ID/config.json`); if not,
-paste the board's line again with `--id ID`.
+job). A hobkin worker doesn't. The board's chat is like this terminal's: hobkin
+holds the board's chat inbox open all the time, a message goes into the
+conversation the moment it's sent (mid-task too; mid-command the front desk
+answers), and the agent's reply is posted back to that conversation, so answering
+costs one model call and no API calls. While it's idle, hobkin also holds
+`/api/wait?chat=0` open for it (`wake`) and wakes it with its tickets. The
+chore's instructions tell the agent so, and to just end its turn when an action is
+done. **Watching it:** every name on the board links to that person's or agent's
+page, and an agent's page has "Watch it live" (what it says as it works, as
+`hobkin chat` shows it) for the people it works tickets for and global admins.
+A worker set up before this (an older hobkin) checks chat only mid-command and
+has no live view: paste the board's line again with `--id ID` to set it up anew
+(`grep -E '"deliver"|"live"' ~/.hobkins/ID/config.json` shows whether it is).
 
 By hand, roughly:
 
@@ -1158,10 +1174,12 @@ curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/skill" --create-dirs \
   -o ~/.hobkins/$ID/skills/hearthboard/SKILL.md
 cat > ~/.hobkins/$ID/config.json <<EOF
 {"idle_prompt": null,
- "wake": {"url": "$URL/api/wait?timeout=50", "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"},
-          "quiet": {"reason": "timeout"}},
+ "wake": {"url": "$URL/api/wait?timeout=50&chat=0", "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"},
+          "quiet": [{"reason": "timeout"}, {"reason": "chat"}]},
  "inbox": {"url": "$URL/api/chat/inbox?flat=1", "reply": "$URL/api/chat/{thread}/messages",
-           "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"}, "every": 15}}
+           "read": "$URL/api/chat/{thread}/read", "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"},
+           "deliver": true, "wait": 50, "every": 3},
+ "live": {"url": "$URL/api/live", "headers": {"Authorization": "Bearer \${HEARTHBOARD_TOKEN}"}}}
 EOF
 hobkin $ID
 ```
