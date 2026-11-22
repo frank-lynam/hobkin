@@ -1216,6 +1216,7 @@ try:
                "inbox": {"url": "http://127.0.0.1:48790/board/api/chat/inbox?flat=1", "reply": "x/{thread}"}},
               open(h + "/old/config.json", "w"))
     p, aid, d = start(h, "old")
+    wait_for(d, "talk: echo")                        # the notice comes after "up", just before this line
     check("[board] an agent with older board settings is told how to update them",
           "joined its board with an older hobkin" in open(d + "/out").read()
           and "hobkin --hearthboard http://127.0.0.1:48790/board TOKEN --id old" in open(d + "/out").read(),
