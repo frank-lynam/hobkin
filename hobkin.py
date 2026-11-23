@@ -81,7 +81,7 @@ message. Or run the file directly: python3 hobkin.py ... More: https://github.co
 
 from __future__ import annotations
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 
 import email.utils
 import base64
