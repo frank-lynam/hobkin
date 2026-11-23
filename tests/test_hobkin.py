@@ -44,6 +44,17 @@ def check(name, cond, info=""):
     if not cond: global failed; failed = True
 failed = False
 try:
+    # Context from a models list: llama-server's meta.n_ctx, and a one-model server answers to any name
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("hobkin_mod", HOB)
+    hk = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(hk)
+    _listing = {"data": [{"id": "Qwen-27B.gguf", "meta": {"n_ctx": 203264, "n_ctx_train": 262144}}]}
+    hk.http_json = lambda method, url, *a, **k: _listing if url.endswith("/models") else {}
+    check("llama-server n_ctx, any name, one model",
+          hk.endpoint_model("http://x/v1", "qwen", None, None).query_limits()[0] == 203264)
+    _listing["data"].append({"id": "other", "context_length": 9})
+    check("two models: no guessing which", hk.endpoint_model("http://x/v1", "qwen", None, None).query_limits()[0] is None)
+    check("two models: its own entry", hk.endpoint_model("http://x/v1", "other", None, None).query_limits()[0] == 9)
     for api, port in (("anthropic", 48701), ("openai", 48702)):
         mock(port, 100000)
         base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")

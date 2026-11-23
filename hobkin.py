@@ -2072,9 +2072,9 @@ def retry_hint(headers: dict, text: str) -> tuple[float | None, str | None]:
 
 def listed_context(m: dict) -> int | None:
     """The context window in one entry of an OpenAI-style /models list (OpenRouter, vLLM and others name it differently)."""
-    top = m.get("top_provider") or {}
+    top, meta = m.get("top_provider") or {}, m.get("meta") or {}
     ctx = (m.get("context_length") or m.get("max_model_len") or m.get("context_window")
-           or m.get("max_context_length") or top.get("context_length"))
+           or m.get("max_context_length") or top.get("context_length") or meta.get("n_ctx"))   # meta: llama-server
     return int(ctx) if ctx else None
 
 
@@ -2165,13 +2165,14 @@ class Model:
             if self.api == "anthropic":
                 info = http_json("GET", f"{self.base}/v1/models/{self.model}", h, timeout=30)
                 return info.get("max_input_tokens"), info.get("max_tokens"), "anthropic models API"
-            listing = http_json("GET", f"{self.base}/models", h, timeout=30)
-            for m in listing.get("data", []):
-                if m.get("id") == self.model:
-                    ctx = listed_context(m)
-                    out = (m.get("top_provider") or {}).get("max_completion_tokens") or m.get("max_completion_tokens")
-                    if ctx:
-                        return ctx, out, "models list"
+            listing = [m for m in http_json("GET", f"{self.base}/models", h, timeout=30).get("data", [])
+                       if isinstance(m, dict)]
+            # its own entry; a server serving one model (llama.cpp and the like) answers to any name, so that one
+            for m in [m for m in listing if m.get("id") == self.model] or (listing if len(listing) == 1 else []):
+                ctx = listed_context(m)
+                out = (m.get("top_provider") or {}).get("max_completion_tokens") or m.get("max_completion_tokens")
+                if ctx:
+                    return ctx, out, "models list"
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             pass
         root = re.sub(r"/v1$", "", self.base)
