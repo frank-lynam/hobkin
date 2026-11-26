@@ -2439,7 +2439,7 @@ class Agent:
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.turn_said = ""                # what the agent has said this turn (for "plan before changing files")
         self.step_done = False             # a goal step was just ticked: a good moment to compact
-        self.housekeeping = False          # after its report: the wrap-up's chores (its words logged as "aside")
+        self.after_report = False          # after its report: the wrap-up's chores (its words logged as "aside")
         self.half_warned = False           # told once per context that it's half full
         self.idle_compact_tried = False
         self.plan_checked = False
@@ -5229,7 +5229,7 @@ class Agent:
         if self.push_on():                          # stopped with the goal unfinished
             return True
         if bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP):
-            self.housekeeping = True                # its report's given: what follows is chores, quiet in the chat
+            self.after_report = True                # its report's given: what follows is chores, quiet in the chat
             return True
         return False
 
@@ -5742,7 +5742,7 @@ class Agent:
         if record:                         # people's messages and hobkin's notices, in an incident's timeline
             self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = self.continue_sent = False   # a new turn
-        self.announce_sent = self.housekeeping = False
+        self.announce_sent = self.after_report = False
         (self.state.get("goal") or {}).pop("waiting", None)                 # someone's said something: on we go
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False
@@ -5877,7 +5877,7 @@ class Agent:
         self.save_context()
         for b in blocks:
             if b.get("type") == "text":
-                quiet = self.housekeeping and not b["text"].lstrip().lower().startswith("correction")
+                quiet = self.after_report and not b["text"].lstrip().lower().startswith("correction")
                 self.log("aside" if quiet else "agent", b["text"])     # after-report chores: chat hides them
                 self.turn_said += "\n" + b["text"]
                 self.timeline("said: " + clip(" ".join(b["text"].split()), 400, 100))
