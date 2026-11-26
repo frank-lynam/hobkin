@@ -145,7 +145,10 @@ beside hobkin (`pip install hearthside`, or `pip install "hobkin[chat]"`; `hobki
 Enter sends, Alt+Enter (or Shift+Enter, where the terminal tells them apart)
 starts a new line, a paste lands as one block you can edit before sending,
 output appears above what you're typing and never through it, a status bar
-says what the agent's doing, and Tab completes the commands.
+says what the agent's doing, Tab completes the commands (and `/model` then Tab
+is a model picker), PgUp scrolls back through the conversation and Ctrl-F
+searches it, tables come out lined up, and a half-written message is kept if
+you leave or the connection drops.
 
 **Without it, the chat is deliberately plain,** for when nothing can be
 installed: each line you type is sent when you press Enter; end a line with

@@ -81,7 +81,7 @@ message. Or run the file directly: python3 hobkin.py ... More: https://github.co
 
 from __future__ import annotations
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 import email.utils
 import base64
@@ -6639,6 +6639,8 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, color=False):
         try:
             extra = {"status": status, "history": history + "-hearthside", "local": local,
                      "commands": {c: line for c, (_, line, _) in COMMAND_HELP.items()},
+                     "backlog": lambda: chat_view(read(os.path.join(d, "out")).splitlines(), "\0", False, {}, False,
+                                                  agent_id),     # PgUp: since its last compaction
                      "arguments": {"/model": lambda: model_choices(d),
                                    "/help": lambda: [(c[1:], line) for c, (_, line, _) in COMMAND_HELP.items()]}}
             takes = inspect.signature(hearthside.chat).parameters          # an older hearthside: what it knows

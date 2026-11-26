@@ -32,8 +32,8 @@ classifiers = [
 
 [project.optional-dependencies]
 lore = ["lorewell>=0.4"]   # the field lore: what hobkins learn about their people and code bases, kept and recalled
-chat = ["hearthside>=0.2"]   # hobkin chat's full editor: multi-line input, output above it, a status bar
-all = ["lorewell>=0.5", "hearthside>=0.2"]   # everything: pip install "hobkin[all]"
+chat = ["hearthside>=0.3"]   # hobkin chat's full editor: multi-line input, output above it, a status bar
+all = ["lorewell>=0.5", "hearthside>=0.3"]   # everything: pip install "hobkin[all]"
 
 [project.urls]
 Homepage = "https://github.com/frank-lynam/hobkin"
