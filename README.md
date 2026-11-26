@@ -131,24 +131,34 @@ In a terminal it's in colour, so things are easy to find when you scroll back:
 its name in magenta, file names, paths and `code` in green, **bold** in
 bold, links underlined (agents are asked to put names of things in backticks
 for this). Piped, or with `NO_COLOR` set, it's plain text. Its replies appear as
-they come; tool calls are hidden (the status line says what it's running), and
-so is the handoff note compaction writes. `hobkin chat ID --full` shows them
-all, tool calls dimmed with their output and failed commands in red, as the
-`out` file has it. A line is drawn above each message you send, so yours stand
-out when you scroll back. Each line you type is sent; lines you paste
-arrive together and become one message (the chat says "(5 lines, sent as one
-message)"), though a pasted line that's exactly a command, such as `/stop`, still
-runs as one. `/stop` and the other commands work, Ctrl-C drops what you've typed
-(as in a shell: a fresh prompt, and the chat stays), and Ctrl-D leaves. What the
-agent's doing ("bodkin is thinking (12s)") shows on a status line of its own just
-above your prompt, so it never sits where you type. Output never wipes out what
-you're typing: it's printed above, and your input is redrawn below it, with the
-cursor where you left it, even mid-edit. You get the usual line
-editing: ↑/↓ for earlier messages (kept in the agent's `.chat_history`),
-←/→, Ctrl-R to search. In a message that spans rows (a pasted block, or a long
-line wrapped on screen), ↑/↓ move between its rows first, and go through history
-from its top or bottom row (GNU readline; with libedit they only do history; on Python 3.9 a pasted
-block arrives line by line, still sent as one message, so only a wrapped long line has rows to move between). Piped, it sends the
+they come, each message flush left under its name, so a code block copies out
+exactly as the agent wrote it; `/copy` puts its last code block on your
+clipboard (`/copy 2`, the one before; a shell command split over lines with
+`\` comes out as one line, ready to paste; it goes through the terminal, so it
+works over ssh, and in tmux with `set -g set-clipboard on`). Tool calls are hidden, and so
+is the note compaction writes. `hobkin chat ID --full` shows them all, tool
+calls dimmed with their output and failed commands in red, as the `out` file
+has it.
+
+**For the full editor, install [hearthside](https://github.com/frank-lynam/hearthside)**
+beside hobkin (`pip install hearthside`, or `pip install "hobkin[chat]"`; `hobkin[all]` brings lorewell too):
+Enter sends, Alt+Enter (or Shift+Enter, where the terminal tells them apart)
+starts a new line, a paste lands as one block you can edit before sending,
+output appears above what you're typing and never through it, a status bar
+says what the agent's doing, and Tab completes the commands.
+
+**Without it, the chat is deliberately plain,** for when nothing can be
+installed: each line you type is sent when you press Enter; end a line with
+`\` to carry on to the next (one message); lines you paste arrive together
+and become one message (the chat says "(5 lines, sent as one message)"), and a
+command inside them, such as `/stop`, is just text: a command counts only as a
+message of its own. Output is printed as it comes, so it can land in the
+middle of what you're typing (on screen only: what you typed is intact), and
+"· bodkin is working" marks when it starts. ↑ brings back earlier messages
+(kept in the agent's `.chat_history`). Ctrl-C drops what you've typed, Ctrl-D
+leaves. `HOBKIN_CHAT=plain` gives you this one even with hearthside installed.
+
+Piped, it sends the
 input, prints the reply and exits: `echo "status?" | hobkin chat bodkin`.
 
 Or with plain files:
@@ -187,7 +197,7 @@ tmux, or a systemd user service.
 | `queue`, `lock` | Messages sent while it was stopped; the process lock. |
 
 `~/.hobkins/_shared/` holds what all agents share: `config.json`, `AGENTS.md` (how
-to work as a hobkin: a task routine with checklists, failure handling,
+to work as a hobkin: a task routine with goals, failure handling,
 organization, memory and tidying up; created on first run, edit freely: it's never
 overwritten, so new defaults reach it only if you delete it), an optional `SOUL.md`,
 any other `.md` instructions, `secrets.env`, `keys/` (API keys from setup, readable
@@ -271,24 +281,16 @@ do with it, the way a work tracker's API would:
 
 Automatic messages are marked and timed too (`[from hobkin: idle prompt, …]`,
 `[Reminder #3 …]`, finished jobs), so the agent never mistakes them for you. A
-line that is just one of these is a command instead:
+message that is just one of these is a command instead (in a chat, `/help` lists them with a line each, F1 in
+hearthside, and `/help NAME` gives one in full):
 
-| Command | Effect |
-|---|---|
-| `/stop` | Finish cleanly and exit (Ctrl-C and SIGTERM do the same). |
-| `/pause`, `/resume` | Stop and restart work; messages wait until `/resume`. |
-| `/interrupt` | Kill the command it's running now (it's told it was interrupted). |
-| `/compact` | Summarise and clear the conversation now. |
-| `/status` | Write its status to `out`. |
-| `/reminders` | Write its reminders to `out`. |
-| `/veto` | Block every announced command that's waiting to run (see "Announce first"). |
-| `/drive [on\|off]` | Drive mode, for a model that stops before it's done. Each time the agent stops with its goal's steps unticked, it's pushed on, and its next reply must make a tool call (`tool_choice` required). It keeps going until every step is ticked, then drive turns itself off. It stops early at `drive_max_pushes` (30) pushes, or when the agent says it's waiting on someone (`goal` `waiting`). Alone, `/drive` toggles. `"drive": true` in a model's entry makes it permanent for that model. |
-| `/model [N\|NAME [@SERVICE] [anthropic\|openai]]` | Alone: the configured models, numbered, each with its service (`>` marks the one in use); `/model N` switches to number N. With a name: switch to that configured model, or to any model the agent's API offers (it gets a config entry like the current one). `@SERVICE` (or `NAME@SERVICE`) asks a particular service for it, named by a configured model or part of its host (`@gov`, `@openrouter`), for when several services offer models with the same name. A new entry whose name another service already uses gets `@host` added. Add `anthropic` or `openai` to ask for it in that API style on the same host: `anthropic` drops a trailing `/v1` from the URL (its paths carry it), `openai` puts it back. Saved in the agent's `config.json`, so it lasts. It happens at once, even mid-call (that call is dropped and asked of the new model) or while waiting out a rate limit. |
-| `/models [@SERVICE]`, `/models star\|unstar N...` | List the models the agent's API (or another configured service) offers, numbered, with their context windows: `★` for those in your config, `>` for the one in use. `star N...` adds those (by number from the last list, or id) to the agent's own `config.json`; `unstar N...` takes them out of it (not the one in use, and not entries from `_shared/config.json`). |
-| `/survey [PATH]` | A brownie surveys a code base (the folder you opened the chat in, if no PATH) for the field lore: its architecture, how it's built and tested, its conventions and gotchas. Its report comes back as a message. Needs lorewell. |
-| `/limits` | Ask the API for the context window again (it's also re-asked before every compaction and after a "too long" error, so a window that grew or shrank is noticed). |
-| `/hello [FOLDER]` | Sent by `hobkin chat` as it opens (not logged): the agent says hello, and is told the folder you opened the chat in. |
-| `/restart` | Once the current step is done, start over in the same process on the code on disk now (after a `git pull` or `pip install -U`), and carry on. The agent can send it itself: a repeating reminder can pull and restart. |
+- `/stop`, `/pause`, `/resume`, `/interrupt` (kill the command it's running now), `/restart` (on the code on disk
+  now, after a `git pull` or `pip install -U`)
+- `/model` lists your models; `/model N`, `/model NAME` or `/model NAME @SERVICE` switches, at once, even while it's
+  waiting out a rate limit (in hearthside, `/model` and Tab is a menu, with each model's service and any rate limit)
+- `/models [@SERVICE]` what a service offers; `/limits` asks for the context window again
+- `/compact`, `/status`, `/reminders`, `/veto`, `/drive [on|off]`, `/survey [PATH]`
+- in a chat only: `/copy [N]` and `/help`
 
 `hobkin chat [ID]` puts both in one terminal (see "The long way"). Commands work while the model is thinking, too: the call runs in the background. `hobkin list` shows all agents, their status and their last line of output.
 
@@ -418,21 +420,21 @@ where its numbers come from: `context 1,000,000 (anthropic models API), working 
 400,000 (auto: 40% of a big window); instructions about 21,000 tokens (memory 5.1 KB,
 blooper reel 2 KB)`.
 - **Past `compact_early` (75%) of the room the conversation has** (the window less
-  the instructions), the agent is told once to read narrowly and keep its checklist
-  current. It's compacted at the next good moment: right after it ticks a step in
-  its `CHECKLIST.md`, or when it finishes a task (that one happens quietly, without
+  the instructions), the agent is told once to read narrowly and keep its memory
+  current. It's compacted at the next good moment: right after it ticks a step of
+  its goal, or when it finishes a task (that one happens quietly, without
   waking it).
 - **Past `compact_at` (80%)** it's compacted wherever it is, as a fallback.
 - **A big command output is counted as it arrives,** not after the next request,
   so one huge output can't blow the window before anything notices.
-- **What carries it over** is its handoff note plus its current checklist, word
+- **What carries it over** is its compaction note plus its open goal, word
   for word. The note is its own summary, including, for each file it read, what
-  it'll need from it later; the checklist is the plan, so it picks up at the first
-  unchecked step. Mid-task, the last two command results come over too (shortened),
+  it'll need from it later; the goal is the plan, so it picks up at the first
+  unticked step. Mid-task, the last two command results come over too (shortened),
   so what it was just looking at isn't lost.
 
 When the conversation is compacted, the agent writes
-itself a handoff note. The conversation is replaced by that note, with the
+itself a note. The conversation is replaced by that note, with the
 newest unanswered message carried over unchanged, and the old conversation goes to
 `archive/` (messages only: the system prompt is rebuilt every turn anyway), along
 with `out`, which starts afresh. The note tells the agent where the archive is,
@@ -485,11 +487,11 @@ default; the agent can ask for any longer timeout on a command),
   or cancels them (see below).
 - **`skill`** opens a skill by name.
 - **`goal`** sets the goal for the task it's on: the goal, how it works, why it
-  doesn't, what would, and the steps. hobkin writes the task's `CHECKLIST.md`
-  from it, shows the thinking in the chat, keeps the goal in the agent's
-  instructions (through compaction and restarts), and ticks steps with
-  `{"done": [N]}`. File changes (other than `CHECKLIST.md` and `NOTES.md`) aren't
-  made until there's a goal (or the agent has said **What would:**), once per
+  doesn't, what would, and the steps. hobkin keeps it (in `state.json`: no file
+  lands in anyone's repo), shows the thinking in the chat, keeps the goal in the
+  agent's instructions (through compaction and restarts), and ticks steps with
+  `{"done": [N]}`; called with nothing, it shows the goal. File changes (other
+  than its memory) aren't made until there's a goal (or the agent has said **What would:**), once per
   turn: a second try goes through.
   - **Stopping early:** if a turn ends with steps unticked, hobkin says "carry
     on with step N" once, not the wrap-up check. The wrap-up's "all done?" is
@@ -499,7 +501,7 @@ default; the agent can ask for any longer timeout on a command),
     arrives.
   - **Sub-goals:** when you ask for something mid-task, the agent doesn't drop
     its goal: `{"subgoal": ..., "why": ..., "steps": [...]}` (optionally
-    `"before_step": N`) adds a sub-goal it works on first, shown in the checklist
+    `"before_step": N`) adds a sub-goal it works on first, shown in the goal
     before that step. When it's done, hobkin hands it back to the goal and its
     next step. Messages you send while a goal is open remind it to fold them in.
   - **Revise:** `{"revise": {"add": [...], "after": N, "drop": [N], "goal": ...}}`
@@ -851,7 +853,7 @@ needs lorewell for it; without it, there's no field lore and everything else wor
   (`people/<login>/...`), what a code base's parts are for and how it's built and tested
   (`repo/<name>/architecture`, `/build`, `/conventions`, `/gotchas`), environments, hosts, services
   and tools (`env/...`, `tools/...`), how the team works. Not file paths, line numbers, today's bug,
-  or anything only true until the next commit: that's what `MEMORY.md` and the checklist are for.
+  or anything only true until the next commit: that's what `MEMORY.md` and the goal are for.
   The test: would it still be true and useful in a month, to a different hobkin, on a different task?
 - **Secrets never get in:** every write goes through a redaction floor (keys, tokens, passwords).
 - **Recall:** each message from a person, and each wake-up (the board, the inbox, a watch), is
@@ -861,7 +863,7 @@ needs lorewell for it; without it, there's no field lore and everything else wor
   again updates it; the old version is kept in its history), and joins names that mean the same
   person with `alias` (a hearthboard name and a login: looking one up finds the other).
 - **The librarian:** at each compaction, a brownie (on the brownie model: `hobkin URL MODEL KEY --brownie
-  MODEL`) is given the handoff note, the conversation's highlights and what the lore says on related
+  MODEL`) is given the compaction note, the conversation's highlights and what the lore says on related
   topics, and files what's durable: merging into existing topics, correcting what turned out wrong,
   in a call or two. It works in the background (compaction never waits) and reports to the log only,
   so it costs the agent nothing. It's also given the agent's memory and blooper reel: a fact about the
@@ -879,7 +881,7 @@ needs lorewell for it; without it, there's no field lore and everything else wor
 ## Stash: moving between machines
 
 Machines come and go (ephemeral work boxes, autoscaling): stash a hobkin in a store and pop it on
-the next machine, and it carries on where it was: its conversation, memory, checklist, reminders,
+the next machine, and it carries on where it was: its conversation, memory, goal, reminders,
 workspace, and the field lore.
 
 ```sh
@@ -906,7 +908,7 @@ hobkin stash pop 20261120-153527-oldbox.tar.gz    # or from a stash file itself 
   overwrite it, and stops the agent there: one hobkin, one place.
 - **The workspace stays tidy:** every `tidy_every` (24h), when the agent is idle, a brownie clears what's
   clearly junk from its workspace (build outputs, caches, stale downloads and logs), never its spells,
-  tools, checklists or notes, and anything recent or uncommitted; its report goes to the log.
+  tools, and anything recent or uncommitted; its report goes to the log.
 
 ## A hobkin knows its own setup
 

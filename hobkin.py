@@ -81,7 +81,7 @@ message. Or run the file directly: python3 hobkin.py ... More: https://github.co
 
 from __future__ import annotations
 
-__version__ = "0.6.6"
+__version__ = "0.7.0"
 
 import email.utils
 import base64
@@ -90,6 +90,7 @@ import errno
 import difflib
 import fcntl
 import html
+import inspect
 import io
 import html.parser
 import http.client
@@ -104,7 +105,6 @@ import select
 import shlex
 import struct
 import shutil
-import unicodedata
 import pty
 import ssl
 import signal
@@ -112,6 +112,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import termios
 import threading
 import time
@@ -259,7 +260,7 @@ DEFAULT_CONFIG = {
     "bash_timeout": 600,       # default seconds per command (an agent can ask for longer)
     "output_limit": 30000,     # characters of command output kept (head + tail)
     "compact_at": 0.8,         # compact when the context passes this share of the window, wherever it is
-    # Past this share, compact at the next good moment instead: a checklist step ticked, or a task done
+    # Past this share, compact at the next good moment instead: a goal step ticked, or a task done
     "compact_early": 0.75,
     # Treat the window as no bigger than this many tokens: models that advertise huge windows (1M) get slow and
     # forgetful long before they're full. "auto": the whole window up to 200k, 40% of a bigger one (never under
@@ -333,22 +334,12 @@ unwrap. A hard problem is the best kind of morning. You bounce into every task.
   test scripts), and ask only when one is truly needed.
 - **Team up on validation.** The people you work with have environments you
   don't: real services, real data, devices, staging, prod. When the real check
-  needs one of those, don't fake it with mocks or a stand-in. Hand it over:
-  exactly what to run or look at, and what result means it worked. Then carry
-  on with other work while they check, and pick it up when they tell you.
-- **Handoff notes travel with the code.** When you hand off validation, write
-  `HANDOFF.md` right next to the code you worked on (its folder, not the top of
-  a big repo), and add `HANDOFF.md` to the `.gitignore` there so it's never
-  committed. It's for two readers, in this order:
-  1. **The human, at the top:** one line on what to check, then a short
-     `bash` code block of exact commands they can paste and run as-is (real paths,
-     real flags, no placeholders), then one line on what output means it worked.
-  2. **A fresh hobkin, below a `---`,** who's only called in if that check
-     fails and has none of your memory: what changed and why, the files, the
-     state of testing (what you checked and how, what you didn't), assumptions,
-     open questions, and a `## Results` section to fill in.
-  Rewrite it at each handoff so it's never stale. Starting on code that has a
-  `HANDOFF.md` next to it? Read it first, run its check, fill in `## Results`.
+  needs one of those, don't fake it with mocks or a stand-in. Hand it over
+  where you report (your reply, the ticket): one line on what to check, a
+  short `bash` code block of exact commands they can paste and run as-is (real
+  paths, real flags, no placeholders), and one line on what output means it
+  worked. Then carry on with other work while they check, and pick it up when
+  they tell you.
 - **Better is the enemy of good enough.** Ship the version that works, give
   it a quick check, and move on. Polish only when nobody's waiting for anything else.
 - **Embarrassingly, irrepressibly cheerful.** Celebrate every green test like a
@@ -372,7 +363,7 @@ unwrap. A hard problem is the best kind of morning. You bounce into every task.
   instead. The same goes for anything that costs money (a paid API, cloud
   resources): only when someone's said so.
 - **Your memory is the enemy, and you love beating it.** MEMORY.md, your
-  notes, a handoff note, what you saw ten minutes ago: all of it starts going
+  notes, a compaction note, what you saw ten minutes ago: all of it starts going
   stale the moment it's written, and the system is out to fool you with it.
   Before you act on anything you remember, go and look at the real thing: the
   ticket, the file, the queue, the test run, the chat. Every time reality
@@ -433,7 +424,7 @@ unwrap. A hard problem is the best kind of morning. You bounce into every task.
   need in it: what to check, ids, paths. **reminders** lists them or cancels
   one. Waiting on something slow? Don't `sleep` in bash: run it with
   `background: true` (or set a reminder), note it
-  in your checklist, and go do other work (or end your turn).
+  in your memory, and go do other work (or end your turn).
 - **Restarting yourself** (to pick up a new hobkin, say after a `git pull`):
   `echo /restart > $HOBKIN_DIR/in`. It happens once your current step is done,
   and you carry on where you were.
@@ -473,8 +464,8 @@ Then four steps, each one said out loud in your reply before you start the
 next, so whoever's watching can follow your thinking (and stop you if you're
 off track; don't wait for them, though):
 
-3. **How it works.** Look at the real thing: read the code (and a
-   `HANDOFF.md` next to it, if there is one), run it, see what it actually does. Then say **How it works:** what you looked at and what you
+3. **How it works.** Look at the real thing: read the code, run it, see what
+   it actually does. Then say **How it works:** what you looked at and what you
    saw. Details missing? Look for them (the task, the files, the tracker, the
    wiki); still missing, pick the most reasonable assumption and say so.
 4. **Why it doesn't** do the thing it should: say **Why it doesn't:** in one or
@@ -484,9 +475,9 @@ off track; don't wait for them, though):
 5. **What would.** Set it with the **goal** tool: the goal, how it works, why
    it doesn't, what would make it do the thing (which files and commands you'll
    change, and how you'll check), and the steps, small ones you can check,
-   ending with "check it" and "tidy up". It writes `CHECKLIST.md` in
-   the task folder, shows your thinking to whoever's watching, and keeps it
-   through compaction. File changes wait until a goal's set.
+   ending with "check it" and "tidy up". hobkin keeps it (no file: calling
+   goal with nothing shows it), shows your thinking to whoever's watching, and
+   carries it through compaction. File changes wait until a goal's set.
 6. **Make it do the thing**, one step at a time. After each step, check it
    really worked, then tick it: goal with `{"done": [N]}`. Found more work? Set
    the goal again with the extra steps.
@@ -497,17 +488,18 @@ off track; don't wait for them, though):
 7. **Tidy up and report** (see "Finishing a task"), then grab the next task.
 
 Keep MEMORY.md pointing at your current task, for example:
-`Current task: fix-login (work/fix-login/CHECKLIST.md), on step 4 of 7.`
+`Current task: fix-login in ~/src/app, on step 4 of 7 of its goal.`
 When you come back to work (after a break, a restart or a compacted
-conversation), read MEMORY.md and the checklist first, and carry on from the
-first unchecked step.
+conversation), read MEMORY.md and your goal (goal with nothing) first, and
+carry on from the first unticked step.
 
 ## When something fails
 
 - Laugh, then read the error message. Fix the cause, not the symptom.
 - Don't repeat a failed command unchanged. Change something on every try.
-- After three failed attempts at the same step, switch approach. Write in the
-  checklist what you tried and what happened, then try something different.
+- After three failed attempts at the same step, switch approach. Say what you
+  tried and what happened (revise the goal if its steps were wrong), then try
+  something different.
 - Your own mistake? Add it to the blooper reel.
 
 ## Blooper reel: $HOBKIN_BLOOPERS
@@ -522,10 +514,11 @@ about 36 in one go; it's a rough number, so don't spend effort trimming to the l
 
 ## Keeping organized
 
-- Your workspace holds task folders and nothing else; no loose files. When you
-  continue a task, use its existing folder.
-- In a task folder: `CHECKLIST.md`, `NOTES.md` for things you find out, and the
-  work itself. Give files clear names (not `test2_final_new.py`).
+- Work happens where the work is (a repo, a service's folder). Your workspace
+  is for work with no home of its own: a folder per task there, no loose files.
+  Give files clear names (not `test2_final_new.py`).
+- Never leave your own planning files in someone's repo: your goal lives in
+  hobkin, what you learn goes in your memory or the field lore.
 - This machine is your box: go wherever the work needs you. Other agents may
   share it, so leave their folders alone.
 - Secrets are environment variables in your shell. Use them by name (`$NAME`).
@@ -552,10 +545,10 @@ about 36 in one go; it's a rough number, so don't spend effort trimming to the l
 Tidy up:
 - Stop background processes you started, unless the task is to leave them running.
 - Delete scratch and temporary files you made, and caches such as
-  `__pycache__/`. Keep the results, `CHECKLIST.md` and `NOTES.md`.
+  `__pycache__/`. Keep the results.
 - Look at what's actually there: `ls -la` the task folder and your workspace.
   Files that belong to the task but ended up elsewhere get moved into its folder.
-- Every checklist step is either checked, or has a note saying why not.
+- Every step of the goal is ticked, or you can say why not.
 - Update MEMORY.md: the task is done, and where the result is.
 
 Then report, starting with an excited line ("Done! 🎉 ..."):
@@ -581,8 +574,8 @@ reply here. Then go and grab the next piece of work.
 - Answer people where they spoke to you: a message here gets a reply here, and
   a chat message gets a chat reply. Updates, questions and hand-offs about
   work also go where the work lives, because that's where people look.
-- Read messages straight away: they can change the plan. If they do, update
-  the checklist.
+- Read messages straight away: they can change the plan. If they do, revise
+  the goal.
 - If you're truly stuck (you need access or a secret you don't have), ask
   once: one specific question with your recommended answer, through your work
   system if it has a way to raise questions. Then go do other work while you
@@ -671,11 +664,11 @@ TOOLS = [
      "description": "Open a skill by name: its instructions, its folder and its files. Open the skill before a task it covers.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
     {"name": "goal",
-     "description": ("Set the goal for the task you're on, once you've worked out what would do it: hobkin writes "
-                     "CHECKLIST.md in the task folder (your current folder, or a new one named for the goal), shows "
-                     "it to whoever's watching, and keeps it in front of you, through compaction too. Until a goal "
-                     "is set, file changes (other than CHECKLIST.md and NOTES.md) aren't made. After each step, "
-                     "call it with just {\"done\": [N]} to tick it. When something new comes up mid-goal (someone asks "
+     "description": ("Set the goal for the task you're on, once you've worked out what would do it: hobkin keeps "
+                     "it (no file is written), shows it to whoever's watching, and keeps it in front of you, through "
+                     "compaction too. Called with nothing, it shows the goal and its steps. Until a goal is set, file "
+                     "changes (other than your memory) aren't made. After each step, call it with just "
+                     "{\"done\": [N]} to tick it. When something new comes up mid-goal (someone asks "
                      "for more, a prerequisite turns up), don't drop the goal: add a `subgoal` (it goes before the next "
                      "step, and you come back when it's done), or `revise` the goal's steps."),
      "input_schema": {"type": "object", "properties": {
@@ -812,8 +805,68 @@ shopt -s expand_aliases
 """
 
 
-COMMANDS = ("/stop", "/pause", "/resume", "/compact", "/status", "/interrupt", "/reminders", "/veto", "/restart", "/limits",
-            "/models", "/model", "/hello", "/drive", "/survey")
+# The commands, and their help: /help in a chat lists them (one line each), /help NAME gives the rest; hearthside
+# shows the lines beside its completions, and F1 there is /help. (args, one line, more). The agent answers all but
+# the chat's own (CHAT_COMMANDS); /hello is chat's, sent as it opens, so it isn't listed.
+COMMAND_HELP = {
+    "/help": ("[COMMAND]", "these commands; /help COMMAND for more on one", ""),
+    "/model": ("[N | NAME [@SERVICE] [anthropic|openai]]", "the models you have, or switch to one (now, even while it waits "
+               "out a rate limit)",
+               "Alone: your configured models, numbered, each with its service (> marks the one in use). /model N "
+               "switches to number N; /model NAME to that configured model, or to any model this API offers (it gets a "
+               "config entry like the current one). NAME @SERVICE (or NAME@SERVICE) asks another service for it, "
+               "named by a configured model's name or part of its host: the same model somewhere else, say, when one "
+               "service is out of quota. anthropic or openai asks for it in that API style on the same host. The "
+               "switch happens at once, even mid-call or while it's waiting out a rate limit, and is saved in the "
+               "agent's config.json. In hearthside, /model and Tab picks from a menu."),
+    "/models": ("[@SERVICE] | star N... | unstar N...", "what the API (or another service) offers, with context windows",
+                "Numbered, with their context windows: * for those in your config, > for the one in use. star N... adds "
+                "those (numbers from the last list, or ids) to the agent's own config.json; unstar N... takes them out "
+                "(not the one in use, and not entries from _shared)."),
+    "/stop": ("", "finish cleanly and exit", "Ctrl-C and SIGTERM to the agent do the same."),
+    "/pause": ("", "stop working; messages wait until /resume", ""),
+    "/resume": ("", "carry on after /pause, or after a model error", ""),
+    "/interrupt": ("", "kill the command it's running now", "It's told the command was interrupted, and carries on."),
+    "/compact": ("", "summarise and clear its conversation now", "Its note and its open goal carry it over."),
+    "/status": ("", "what it's doing, in its log", ""),
+    "/reminders": ("", "its reminders, in its log", ""),
+    "/veto": ("", "block every announced command waiting to run", "See \"Announce first\" in the README."),
+    "/drive": ("[on|off]", "push a model that stops before it's done",
+               "Each time the agent stops with its goal's steps unticked, it's pushed on, and its next reply must make "
+               "a tool call. Off once every step is ticked, after drive_max_pushes pushes, or when it says it's "
+               "waiting on someone."),
+    "/survey": ("[PATH]", "a brownie surveys a code base for the field lore (needs lorewell)",
+                "The folder you opened the chat in, if no PATH: its architecture, how it's built and tested, its "
+                "conventions and gotchas. Its report comes back as a message."),
+    "/limits": ("", "ask the API for the context window again", "It's also re-asked before every compaction and "
+                "after a \"too long\" error."),
+    "/restart": ("", "start over on the code on disk now, and carry on",
+                 "Once the current step is done, in the same process: after a git pull or pip install -U."),
+    "/copy": ("[N]", "the agent's last code block to your clipboard (N: the Nth from last)",
+              "Through the terminal (OSC 52), so it works over ssh; in tmux, set -g set-clipboard on. A shell command "
+              "split over lines with \\ comes out as one line. Answered in the chat, never sent."),
+}
+CHAT_COMMANDS = ("/help", "/copy")        # answered by the chat itself
+COMMANDS = tuple(c for c in COMMAND_HELP if c not in CHAT_COMMANDS) + ("/hello",)
+
+
+def command_help(arg: str = "") -> str:
+    """/help: every command, a line each; /help NAME: that one in full."""
+    want = arg.strip().split(" ", 1)[0].lower()
+    if want:
+        want = want if want.startswith("/") else "/" + want
+        if want not in COMMAND_HELP:
+            near = difflib.get_close_matches(want, list(COMMAND_HELP), n=3)
+            return f"no command {want}" + (f" (did you mean {', '.join(near)}?)" if near else "") + "; /help lists them"
+        args, line, more = COMMAND_HELP[want]
+        cols = min(100, shutil.get_terminal_size().columns - 1)
+        return f"{want} {args}".rstrip() + "\n" + textwrap.fill(
+            line[0].upper() + line[1:] + ". " + more, cols, initial_indent="  ", subsequent_indent="  ")
+    width = max(len(f"{c} {a}".rstrip()) for c, (a, _, _) in COMMAND_HELP.items() if len(a) < 20)
+    rows = [f"  {(c + ' ' + a).rstrip():<{width}}  {line}" if len(a) < 20 else f"  {c} {a}\n  {'':<{width}}  {line}"
+            for c, (a, line, _) in COMMAND_HELP.items()]
+    return ("commands (/help NAME for more on one):\n" + "\n".join(rows) +
+            "\nkeys: Enter sends; Ctrl-C drops what you've typed; Ctrl-D leaves the chat (the agent keeps going)")
 
 
 # Files shown on every turn get a size limit, so months of notes don't ride along forever
@@ -969,7 +1022,7 @@ PLAN_FIRST = ("Not run: say it out loud first, as separate steps in your reply: 
               "the thing, and how you'll check. Then make this change.{missing}")
 
 # Files that are part of planning (or memory), not the work: always writable
-PLANNING_FILES = {"checklist.md", "notes.md", "memory.md", "bloopers.md"}
+PLANNING_FILES = {"memory.md", "bloopers.md"}
 
 # What the agent gets when someone opens `hobkin chat` in a terminal
 GREET = ("[from hobkin: {who} just opened a chat with you, {stamp}{where}. Say hello: introduce yourself by name "
@@ -983,9 +1036,9 @@ SAFE_REFUSED = ("Not written: safe mode lets you write only in your workspace ($
                 "does it, and ask a human to review and run it.")
 
 CONTEXT_HALF = ("[hobkin: your context is {pct}% full. Read narrowly from here (grep for what you need, read_file "
-                "with offset and limit, `| tail`; a grep plus a targeted read still counts as reading it), keep your "
-                "checklist, NOTES.md and MEMORY.md current, and finish the step you're on: your context will be "
-                "compacted after it, and those files are what carry you over.]")
+                "with offset and limit, `| tail`; a grep plus a targeted read still counts as reading it), keep "
+                "MEMORY.md current and your goal's steps ticked, and finish the step you're on: your context will be "
+                "compacted after it, and those are what carry you over.]")
 
 # The front desk: what the agent is asked when someone writes while one of its commands is still running
 FRONT_DESK = ("[hobkin: {who} just wrote to you{where}, {stamp}, while that is still running:]\n{text}\n[hobkin: answer them "
@@ -1116,7 +1169,7 @@ RECALL = ("[hobkin: from the field lore (what hobkins here have learned; check i
           "with field_lore if it's wrong):\n{items}]")
 LIBRARIAN = ("You're the librarian of the field lore (the field_lore tool): what the hobkins on this machine know about "
              "their people, code bases, build systems and environments. {parent} just compacted its conversation; below are "
-             "its handoff note, the highlights of the conversation, and what the lore already says on related topics. "
+             "its compaction note, the highlights of the conversation, and what the lore already says on related topics. "
              "Work in as few steps as you can: aim for ONE field_lore call (action remember, all your entries), plus any "
              "forget or alias calls, then your report. Don't explore files or run commands.\n"
              "1. Pick out what's durable: would it still be true and useful in a month, to a different hobkin, on a "
@@ -1138,7 +1191,7 @@ LIBRARIAN = ("You're the librarian of the field lore (the field_lore tool): what
              "6. A blooper in its reel with a lesson another hobkin could use: file the lesson (not the joke) where it "
              "belongs (tools/<name>, env/<name>, repo/<name>/gotchas). The reel stays its own: never list it as MOVED.\n"
              "Nothing durable? File nothing: that's a fine outcome. End with REPORT: one line per topic you added, updated "
-             "or forgot (then any MOVED lines).\n\n## The handoff note\n\n{note}\n\n## Highlights of the conversation\n\n"
+             "or forgot (then any MOVED lines).\n\n## The compaction note\n\n{note}\n\n## Highlights of the conversation\n\n"
              "{highlights}\n\n## Its memory (MEMORY.md)\n\n{memory}\n\n## Its blooper reel\n\n{bloopers}\n\n"
              "## What the lore says on related topics\n\n{related}")
 SURVEY = ("Survey the code base at {path} for the field lore (the field_lore tool). First see what it already says "
@@ -1153,7 +1206,7 @@ TIDY = ("Tidy {parent}'s workspace, {work}, so it stays small and easy to find t
         "hobkin moves machines). Look first (du -sh, ls -la, find with sizes and ages), then remove only what's clearly "
         "junk: build outputs and caches (__pycache__, node_modules, .pytest_cache, dist/, build/, target/, *.pyc), "
         "temporary and scratch files, downloads and clones it can fetch again and hasn't touched in a week, logs older "
-        "than a week. Never touch spells/, tools/, any CHECKLIST.md, NOTES.md or SPELLBOOK.md, anything those mention, "
+        "than a week. Never touch spells/, tools/, SPELLBOOK.md, anything it mentions, "
         "anything changed in the last two days, anything with uncommitted git changes, or anything you're unsure of "
         "(list those in your report instead). A few steps at most. REPORT: what you removed and the space it freed, and "
         "what looked like junk that you left.")
@@ -2379,11 +2432,11 @@ class Agent:
         self.last_direct = 0.0             # when someone last talked to it directly (idle prompts wait)
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.turn_said = ""                # what the agent has said this turn (for "plan before changing files")
-        self.step_done = False             # a checklist step was just ticked: a good moment to compact
+        self.step_done = False             # a goal step was just ticked: a good moment to compact
         self.half_warned = False           # told once per context that it's half full
         self.idle_compact_tried = False
         self.plan_checked = False
-        self.plan_carried = False          # a compaction this turn carried the plan (the checklist) over
+        self.plan_carried = False          # a compaction this turn carried the plan (the goal) over
         self.greet_wanted = False          # someone opened `hobkin chat`: say hello
         self.empty_replies = 0             # empty replies in a row (asked again, twice)
         self.force_tool = False            # drive mode: the next reply must make a tool call
@@ -3194,7 +3247,7 @@ class Agent:
             sub = self.active_sub(g)
             now = (f"\n\n**You're on the sub-goal \"{sub['goal']}\"**; when it's done, back to step {sub['before']} of the "
                    "goal." if sub else "")
-            parts.append(f"# Your current goal ({g['folder']})\n\n{g['goal']}\n\n**What would:** {g['what_would']}{now}\n\n"
+            parts.append(f"# Your current goal\n\n{g['goal']}\n\n**What would:** {g['what_would']}{now}\n\n"
                          + self.goal_steps(g))
         if os.path.exists(self.p("reminders.json")):
             data, ok = self.load_reminders()
@@ -3315,8 +3368,14 @@ class Agent:
 
     def _take(self, text):
         body = []
-        for line in text.splitlines():
-            cmd = line.strip().split(" ", 1)[0].lower()
+        lines = text.splitlines()
+        # Commands lead a burst (chat's /hello, then what you typed straight after it, can arrive together):
+        # once a line of text has come, the rest is text, so a /stop inside a pasted block is just a line of it
+        commands_ok = True
+        for line in lines:
+            if line.strip() and line.strip().split(" ", 1)[0].lower() not in COMMANDS:
+                commands_ok = False
+            cmd = line.strip().split(" ", 1)[0].lower() if commands_ok else ""
             if cmd in COMMANDS and line.strip().lower() == cmd:
                 self.command(cmd)
             elif cmd == "/hello":                      # `hobkin chat` opening, with the folder it was opened in
@@ -4557,7 +4616,7 @@ class Agent:
         self.save_state()
 
     def librarian(self, note: str) -> None:
-        """At compaction: hand the handoff note and the conversation's highlights to a librarian brownie, which files
+        """At compaction: hand the compaction note and the conversation's highlights to a librarian brownie, which files
         what's durable in the field lore (in the background: compaction never waits on it)."""
         if not getattr(self, "lore", None) or self.brownie_of or not note:
             return
@@ -4802,7 +4861,7 @@ class Agent:
                 {"type": "image", "source": {"type": "base64", "media_type": media,
                                              "data": base64.b64encode(data).decode()}}], False
 
-    # --- the goal: CHECKLIST.md, and the plan said out loud before a file change
+    # --- the goal (kept in state.json, no file), and the plan said out loud before a file change
     @staticmethod
     def goal_steps(g: dict) -> str:
         """The goal's steps, each open-or-done sub-goal shown (indented) just before the step it comes before."""
@@ -4822,7 +4881,7 @@ class Agent:
                 out += list(sub_lines(sub))
         return "\n".join(out)
 
-    def goal_checklist(self, g: dict) -> str:
+    def goal_text(self, g: dict) -> str:
         return (f"# Goal\n\n{g['goal']}\n\n## How it works\n\n{g['how_it_works'] or '-'}\n\n## Why it doesn't\n\n"
                 f"{g['why_it_doesnt'] or '-'}\n\n## What would\n\n{g['what_would']}\n\n## Steps\n\n{self.goal_steps(g)}\n")
 
@@ -4835,9 +4894,12 @@ class Agent:
         return next((i + 1 for i in range(len(g["steps"])) if i + 1 not in g["done"]), len(g["steps"]) + 1)
 
     def tool_goal(self, inp: dict) -> ToolResult:
-        """Set the task's goal (writes CHECKLIST.md, shows the thinking, opens file changes) or tick steps."""
+        """Set the task's goal (shows the thinking, opens file changes), tick or reshape its steps, or (called
+        with nothing) show it."""
         g = self.state.get("goal") or {}
-        write = lambda: self.fs_write(os.path.join(g["folder"], "CHECKLIST.md"), self.goal_checklist(g).encode())
+        write = lambda: None                          # the goal lives in state.json: nothing to write
+        if not any(inp.get(k) for k in ("goal", "subgoal", "revise", "waiting")) and inp.get("done") is None:
+            return (self.goal_text(g) if g.get("open") else "No goal is set."), False
         if (inp.get("subgoal") or inp.get("revise") or inp.get("done") is not None or inp.get("waiting")) \
                 and not inp.get("goal") and not g.get("open"):
             return "No goal is set. Set one first (goal, what_would, steps).", True
@@ -4923,25 +4985,18 @@ class Agent:
         missing = [k for k in ("goal", "what_would", "steps") if not inp.get(k)]
         if missing:
             return f"A goal needs {', '.join(missing)} (and how_it_works, why_it_doesnt).", True
-        folder, base = self.cwd(), self.wdir()
-        if os.path.normpath(folder) == os.path.normpath(base):   # not in a task folder yet: make one
-            slug = re.sub(r"[^a-z0-9]+", "-", str(inp["goal"]).lower()).strip("-")[:40] or "task"
-            folder = os.path.join(base, slug)
-        keep = g.get("done", []) if g.get("open") and g.get("folder") == folder else []
+        keep = g.get("done", []) if g.get("open") and g.get("goal") == str(inp["goal"]) else []   # set again: more steps
         g = {"goal": str(inp["goal"]), "how_it_works": str(inp.get("how_it_works") or ""),
              "why_it_doesnt": str(inp.get("why_it_doesnt") or ""), "what_would": str(inp["what_would"]),
              "steps": [str(t) for t in inp["steps"]], "done": [n for n in keep if n <= len(inp["steps"])],
-             "folder": folder, "open": True, "set": time.time()}
+             "open": True, "set": time.time()}
         self.state["goal"] = g
-        path = os.path.join(folder, "CHECKLIST.md")
-        self.fs_write(path, self.goal_checklist(g).encode())
         self.save_state()
         self.log("goal", f"Goal: {g['goal']}\nHow it works: {g['how_it_works'] or '-'}\nWhy it doesn't: "
                          f"{g['why_it_doesnt'] or '-'}\nWhat would: {g['what_would']}\n"
                  + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(g["steps"])))
-        return (f"Goal set: {path} written ({len(g['steps'])} steps). " +
-                (f"Your task folder is {folder}: work from there. " if folder != self.cwd() else "") +
-                "Now make it do the thing, one step at a time; after each, call goal with {\"done\": [N]}."), False
+        return (f"Goal set ({len(g['steps'])} steps). Now make it do the thing, one step at a time; after each, "
+                "call goal with {\"done\": [N]}."), False
 
     def plan_said(self) -> bool:
         """Has the agent said **What would:** (its plan) out loud in this turn?"""
@@ -5117,10 +5172,6 @@ class Agent:
         """A tool's result, with any hint for what the agent just did added at the end."""
         if not isinstance(content, str):            # an image result: nothing to add
             return content
-        new_text = str(inp.get("content") if name == "write_file" else inp.get("new_text") or "")
-        if not err and name in ("write_file", "edit_file") and os.path.basename(str(inp.get("path", ""))).lower() \
-                == "checklist.md" and re.search(r"\[[xX]\]", new_text):
-            self.step_done = True                  # a step ticked: compaction, if due, can happen now
         early = float(self.cfg.get("compact_early") or 1)
         if not self.half_warned and self.context_share() > early:
             self.half_warned = True
@@ -5470,7 +5521,8 @@ class Agent:
         """Wait until `until` (commands still work), saying so in the log, state.json and the heartbeat."""
         clock = time.strftime("%H:%M:%S", time.localtime(until))
         self.waiting_note = f"waiting out a rate limit (until {clock})"
-        self.log("hobkin", f"{why}: waiting {max(1, round(until - time.time()))}s (until {clock})")
+        self.log("hobkin", f"{why}: waiting {max(1, round(until - time.time()))}s (until {clock}); "
+                           "/model switches now (/model alone lists yours)")
         self.save_state("waiting (rate limited)")
         while not self.stop and time.time() < until:
             self.poll_input(min(1.0, max(0.05, until - time.time())))
@@ -5514,7 +5566,7 @@ class Agent:
             budget, spent = self.cfg.get("daily_budget_usd"), self.state.get("spend_today", 0) - incident
         return budget, spent
 
-    # --- compaction: the conversation, summarised into a handoff note when it gets too big
+    # --- compaction: the conversation, summarised into a note when it gets too big
     def window(self) -> int | None:
         """The context the agent works within: the model's window, capped at context_budget."""
         return self.context_room()[0]
@@ -5587,38 +5639,15 @@ class Agent:
             for b in history[start]["content"]]
         return [{"role": "user", "content": first}] + history[start + 1:]
 
-    def current_checklist(self) -> tuple[str, str] | None:
-        """(path, text) of the checklist the agent's working from: the CHECKLIST.md in its workspace
-        changed most recently, if it changed in this conversation."""
-        newest, since = None, self.state.get("context_started", 0)
-        if self.host():                            # on a host: the open goal's checklist, if there is one
-            g = self.state.get("goal") or {}
-            if not g.get("open"):
-                return None
-            path = os.path.join(g["folder"], "CHECKLIST.md")
-            try:
-                return path, self.fs_read(path).decode(errors="replace")
-            except (OSError, subprocess.TimeoutExpired):
-                return None
-        for root, dirs, files in os.walk(self.work):
-            dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("node_modules", "__pycache__", ".venv")]
-            for f in files:
-                if f.lower() == "checklist.md":
-                    path = os.path.join(root, f)
-                    t = os.path.getmtime(path)
-                    if t >= since and (not newest or t > newest[0]):
-                        newest = (t, path)
-        return (newest[1], read(newest[1])) if newest else None
-
     def compact(self, why: str, idle: bool = False) -> None:
-        """Replace the conversation with the agent's own summary of it; archive the old one. Its current
-        checklist goes in word for word: that, not the summary, is what it carries on from. `idle`: done
+        """Replace the conversation with the agent's own summary of it; archive the old one. Its open goal
+        goes in word for word: that, not the summary, is what it carries on from. `idle`: done
         between tasks, so the agent isn't woken by it."""
         if not self.messages:
             return
         self.log("hobkin", f"compacting context ({why})")
         ask = {"role": "user", "content": [{"type": "text", "text": (
-            "Your conversation is about to be cleared to free up context. Write a handoff note to yourself: "
+            "Your conversation is about to be cleared to free up context. Write a note to yourself: "
             "the task and its status, ids, file paths, decisions made, what you were about to do next, and "
             "anything the operator asked for. For each file you read, what you'll need from it later, in a few "
             "lines (names, signatures, values, where things are), so you needn't read it again. Be complete but "
@@ -5648,15 +5677,12 @@ class Agent:
                 which = "your last command" if i == len(results) - 1 else "the command before it"
                 carry.append(f"[Result of {which}]\n{clip(result_text(b['content']), 2000, 1500)}")
             carry += [b["text"] for b in self.messages[-1]["content"] if b.get("type") == "text"]
-        text = (f"[Your context was compacted. Your handoff note (written by you, so check it against the real "
+        text = (f"[Your context was compacted. Your compaction note (written by you, so check it against the real "
                 f"thing before you trust it):]\n\n{note}\n\n")
-        checklist = self.current_checklist()
-        if checklist:
-            text += (f"[Your checklist, as it is now ({checklist[0]}): carry on from its first unchecked step.]\n"
-                     f"{clip(checklist[1], 6000, 2000)}\n\n")
-            notes = os.path.join(os.path.dirname(checklist[0]), "NOTES.md")
-            if os.path.isfile(notes):                    # ids, shapes, what was asked: verbatim, not remembered
-                text += f"[Your notes for this task, as they are now ({notes}):]\n{clip(read(notes), 6000, 2000)}\n\n"
+        g = self.state.get("goal") or {}
+        if g.get("open"):
+            text += (f"[Your goal, as it is now: carry on from its first unticked step.]\n"
+                     f"{clip(self.goal_text(g), 6000, 2000)}\n\n")
             self.plan_carried = True                     # the plan came over with it: no need to say it again
         text += "\n\n".join(carry) if carry else ("[You'd finished; nothing in progress.]" if idle else "[Carry on.]")
         os.makedirs(self.p("archive"), exist_ok=True)
@@ -5780,7 +5806,7 @@ class Agent:
             self.compact("requested")
         elif self.step_done and self.needs_compaction(float(self.cfg.get("compact_early") or 1)):
             self.step_done = False
-            self.compact("a checklist step is done: a good moment")
+            self.compact("a goal step is done: a good moment")
         elif self.needs_compaction():
             self.refresh_limits("context nearly full")     # it may have grown
             if self.needs_compaction():
@@ -6315,7 +6341,7 @@ def show_banner(name: str, color: bool, seconds: float = 0.35):
         out.write(ANSI["off"] + "\x1b[?25h\n"); out.flush()
 
 
-# --- chat: the view of the out log, colour, and the terminal (readline hooks, arrows, the status line)
+# --- chat: the view of the out log, colour, /copy, and the terminal (hearthside if installed, else plain lines)
 # Out-log entries that are tool calls (chat hides them unless --full): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full (but compaction's note).
 TOOL_WHO = ({"$", "=", "job", "reminder", "hold", "notify"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
@@ -6371,7 +6397,7 @@ def chat_rule(color: bool = False) -> str:
 def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False, name: str | None = None,
               rule_for: tuple[str, str] | None = None) -> list[str]:
     """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's (under its
-    `name`, so you know which hobkin it is) and hobkin's in full; tool calls and compaction's handoff note
+    `name`, so you know which hobkin it is) and hobkin's in full; tool calls and compaction's note
     hidden. `full` shows everything (each tool call with its output); `color` adds terminal colours. With
     `rule_for` (who, rule), each message from `who` gets `rule` above it. `st` carries the current entry
     between calls."""
@@ -6380,6 +6406,7 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = Fa
         if not line.startswith("    "):
             who, _, text = line[20:].partition("> ")
             st["who"] = who
+            st["fence"] = text.lstrip().startswith("```")   # a new entry: a fence opens only if it starts with one
             st["mine"] = line[20:].startswith(own)
             if full:
                 st["keep"] = "all"
@@ -6399,9 +6426,16 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = Fa
                 line = line[:9] + name + line[14:]
             shown.append(line)
         elif not st.get("mine") and st.get("keep") == "all":
-            if color:
-                who = st.get("who")
-                line = (ANSI["dim"] + line + ANSI["off"]) if who in TOOL_WHO or who == "hobkin" else "    " + paint(line[4:])
+            who = st.get("who")
+            if who in TOOL_WHO or who == "hobkin":       # tool output keeps its indent, under its command
+                shown.append(ANSI["dim"] + line + ANSI["off"] if color else line)
+                continue
+            line = line[4:]                              # talk: flush left, so code copies exactly as written
+            if line.lstrip().startswith("```"):
+                st["fence"] = not st.get("fence")
+                line = ANSI["dim"] + line + ANSI["off"] if color else line
+            elif color and not st.get("fence"):          # code is left as written (hearthside colours it)
+                line = paint(line)
             shown.append(line)
     return shown
 
@@ -6445,7 +6479,6 @@ def cmd_chat(agent_id, full=False):
     recent = chat_view(raw[-400:], "\0", full, {}, color, agent_id,      # the recent past, your own lines included
                        (me, chat_rule(color)) if sys.stdin.isatty() else None)[-12:]
     st = {}
-    short = lambda line: line                                  # chat_view has already shaped the lines
 
     def new_lines():
         nonlocal pos
@@ -6461,7 +6494,7 @@ def cmd_chat(agent_id, full=False):
     if sys.stdin.isatty():
         if sys.stdout.isatty():
             show_banner(agent_id, color)
-        return chat_terminal(agent_id, d, fifo, recent, new_lines, short, color)
+        return chat_terminal(agent_id, d, fifo, recent, new_lines, color)
     sent_at, eof = 0.0, False
     try:
         while True:
@@ -6489,265 +6522,175 @@ def cmd_chat(agent_id, full=False):
         os.close(fifo)
 
 
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+def code_blocks(lines: list[str]) -> list[tuple[str, str]]:
+    """The fenced code blocks in the agent's messages in out-log lines, oldest first, as it wrote them:
+    (language, code), the language as the fence names it ("" if it doesn't)."""
+    msgs, cur = [], None
+    for line in lines:
+        if not line.startswith("    "):
+            who, _, text = line[20:].partition("> ")
+            cur = [text] if who == "agent" else None
+            if cur is not None:
+                msgs.append(cur)
+        elif cur is not None:
+            cur.append(line[4:])
+    return [(m.group(1).strip().lower(), m.group(2)) for msg in msgs
+            for m in re.finditer(r"^\s*```([^\n]*)\n(.*?)\n\s*```", "\n".join(msg), re.S | re.M)]
 
 
-def readline_hook(readline, fn):
-    """Run fn() about ten times a second in the main thread while input() waits for keys: readline calls
-    PyOS_InputHook between keystrokes, the one moment it's safe to print and redraw its line (readline isn't
-    thread-safe). Set through ctypes; returns a function that removes it, or None where it can't be set."""
-    if not readline:
-        return None
-    try:
-        lib = ctypes.CDLL(readline.__file__)          # the module's handle finds the readline library it uses
-        lib.rl_on_new_line, lib.rl_forced_update_display  # (GNU readline; libedit may lack them)
-        slot = ctypes.c_void_p.in_dll(ctypes.pythonapi, "PyOS_InputHook")
-    except (OSError, AttributeError, ValueError):
-        return None
-    if slot.value:                                    # someone else's hook (a GUI toolkit): leave it be
-        return None
-    def call():
-        try:
-            fn(lib)
-        except Exception:                             # never let a drawing hiccup kill the chat
-            pass
-        return 0
-    hook = ctypes.CFUNCTYPE(ctypes.c_int)(call)
-    slot.value = ctypes.cast(hook, ctypes.c_void_p).value
-    def remove():
-        slot.value = None
-        keep.clear()
-    keep = [hook]                                     # the callback must outlive its use
-    return remove
+SHELL_FENCES = {"", "bash", "sh", "shell", "zsh", "ksh", "fish"}
 
 
-def cell_width(ch):
-    """Columns a character takes on screen, as readline draws it: wide (CJK, emoji) 2, combining 0, controls ^X."""
-    if ord(ch) < 32 or ord(ch) == 127:
-        return 2
-    if unicodedata.combining(ch):
-        return 0
-    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
-
-
-def screen_cells(text, prompt_len, width):
-    """(row, column) on screen of each character of an input after a prompt, and of its end: rows count
-    from the prompt's, wrapping at `width` and at newlines, as readline draws it."""
-    row, col, cells = 0, prompt_len, []
-    for ch in text:
-        w = cell_width(ch)
-        if ch != "\n" and col + w > width:
-            row, col = row + 1, 0
-        cells.append((row, col))
-        if ch == "\n":
-            row, col = row + 1, 0
+def join_continued(code: str) -> str:
+    """A shell command split over lines with trailing backslashes, as one line (each command on its own line
+    stays so): pasted into a terminal, it runs as it is, with no stray continuation prompts."""
+    out, held = [], ""
+    for line in code.splitlines():
+        if held:
+            line = line.lstrip()
+        bare = line.rstrip()
+        if bare.endswith("\\") and not bare.endswith("\\\\"):
+            held += bare[:-1].rstrip() + " "
         else:
-            col += w
-            if col >= width:
-                row, col = row + 1, 0
-    cells.append((row, col))                          # the end of the input
-    return cells
+            out.append(held + line)
+            held = ""
+    if held:
+        out.append(held.rstrip())
+    return "\n".join(out)
 
 
-def line_move(text, point, prompt_len, width, step):
-    """Where up (step -1) or down (+1) puts the cursor in an input that spans screen rows (pasted lines, or
-    one long line wrapped): the same column on the row above or below. None on the top or bottom row
-    (the arrows go through history there)."""
-    cells = screen_cells(text, prompt_len, width)
-    r, c = cells[point]
-    want = r + step
-    if want < 0 or want > cells[-1][0]:
-        return None
-    on_row = [i for i, (ri, _) in enumerate(cells) if ri == want]
-    return max((i for i in on_row if cells[i][1] <= c), default=on_row[0])
-
-
-def readline_arrows(readline, prompt_len):
-    """Bind up and down so they move between the rows of a multi-row input first, and through history
-    only from its top or bottom row. GNU readline through ctypes; returns what has to stay alive, or None
-    where it can't be bound (libedit), and the arrows just go through history."""
-    if not readline or "libedit" in (readline.__doc__ or ""):
-        return None
+def copy_block(d: str, arg: str) -> str:
+    """/copy [N]: the agent's last code block (or the Nth from last) to your clipboard, through the terminal
+    (OSC 52: works over ssh; tmux needs `set -g set-clipboard on`). A shell command split over lines with
+    trailing backslashes is copied as one line. Nothing is sent to the agent."""
     try:
-        lib = ctypes.CDLL(readline.__file__)
-        point, end = ctypes.c_int.in_dll(lib, "rl_point"), ctypes.c_int.in_dll(lib, "rl_end")
-        buffer = ctypes.c_char_p.in_dll(lib, "rl_line_buffer")
-        history = {-1: lib.rl_get_previous_history, 1: lib.rl_get_next_history}
-        lib.rl_bind_keyseq.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
-    except (OSError, AttributeError, ValueError):
-        return None
-    def arrow(step):
-        def move(count, key):
-            try:
-                raw = ctypes.string_at(buffer.value or b"", end.value) if buffer.value else b""
-                text = raw.decode("utf-8", "surrogateescape")
-                at = len(raw[:point.value].decode("utf-8", "surrogateescape"))
-                to = line_move(text, at, prompt_len, shutil.get_terminal_size().columns, step)
-            except Exception:                         # never let the arrow keys kill the chat
-                to = None
-            if to is None:
-                return history[step](count, key)
-            point.value = len(text[:to].encode("utf-8", "surrogateescape"))
-            return 0
-        return ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)(move)
-    up, down = arrow(-1), arrow(1)
-    for seq, fn in ((b"\x1b[A", up), (b"\x1bOA", up), (b"\x1b[B", down), (b"\x1bOB", down)):
-        lib.rl_bind_keyseq(seq, ctypes.cast(fn, ctypes.c_void_p))
-    return up, down
+        with open(os.path.join(d, "out"), "rb") as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - 400_000))
+            blocks = code_blocks(f.read().decode(errors="replace").splitlines()[1:])
+    except OSError:
+        blocks = []
+    n = int(arg) if arg.strip().isdigit() and int(arg) > 0 else 1
+    if len(blocks) < n:
+        return f"(no code block {n} back to copy)" if blocks else "(no code blocks to copy yet)"
+    lang, code = blocks[-n]
+    rows = len(code.splitlines())
+    if lang in SHELL_FENCES:
+        code = join_continued(code)
+    sys.__stdout__.write("\x1b]52;c;" + base64.b64encode(code.encode()).decode() + "\x07")
+    sys.__stdout__.flush()
+    first = code.strip().splitlines()[0] if code.strip() else ""
+    lines = len(code.splitlines())
+    joined = f" (joined from {rows})" if lines < rows else ""
+    return (f"(copied: {lines} line{'s' * (lines != 1)}{joined}, starting {clip(first, 50, 0)!r}; "
+            "nothing on your clipboard? your terminal doesn't allow it, and in tmux: set -g set-clipboard on)")
 
 
-def chat_terminal(agent_id, d, fifo, recent, new_lines, short, short_color=False):
-    """The interactive side of chat: input() with readline; output and a status line (what the agent's doing)
-    drawn above the prompt from readline's input hook, then your input drawn again below them."""
+def model_choices(d: str) -> list[tuple[str, str]]:
+    """(name, what it is) for each configured model, for hearthside's /model menu: the model and its service, the
+    one in use, and any rate limit it's waiting out (as hit by any agent on that service and key)."""
     try:
-        import readline
-    except ImportError:              # no line editing then, but everything else works
-        readline = None
-    history = os.path.join(d, ".chat_history")
-    if readline:
+        cfg = load_config(d)
+    except SystemExit:                                     # a config.json that doesn't parse: nothing to offer
+        return []
+    st, now, out = read_json(os.path.join(d, "state.json"), {}), time.time(), []
+    current = (st.get("model") or "").split(" ", 1)[0] or cfg.get("model")
+    for name, e in cfg["models"].items():
+        if not isinstance(e, dict) or not e.get("model") or not e.get("base_url"):
+            continue
+        what = f"{e['model']} at {urllib.parse.urlparse(e['base_url']).netloc}"
         try:
-            readline.read_history_file(history)
-        except OSError:
-            pass
-        readline.set_history_length(1000)
-    prompt, lock, done = "> ", threading.Lock(), threading.Event()
-    print("\n".join(short(line) for line in recent))
-    print(f"-- chatting with {agent_id}: type and press Enter to send (up arrow for history); "
-          "/stop, /pause, /interrupt work; Ctrl-C drops what you've typed; Ctrl-D to leave --", flush=True)
-    os.write(fifo, f"/hello {os.getcwd()}\n".encode())      # the agent says hi first (and knows where you are)
+            until = Model(name, e).blocked_until()
+        except (OSError, KeyError, ValueError):
+            until = 0
+        if name == current:
+            what += " · in use"
+            if (st.get("status") or "").startswith("waiting (rate limited)"):
+                until = max(until, now + 1)
+        if until > now:
+            what += " · rate limited" + (f" until {time.strftime('%H:%M', time.localtime(until))}" if until > now + 1 else "")
+        out.append((name, what))
+    return out
 
-    def doing():
-        """What the agent's busy with, for the spinner (None when it's idle, waiting for you)."""
+
+def chat_terminal(agent_id, d, fifo, recent, new_lines, color=False):
+    """The interactive side of chat. With hearthside installed (pip install hearthside), its editor: multi-line
+    input, a status bar, output above the prompt. Without it, the plain fallback: lines in, output printed as
+    it comes (it can land in what you're typing, on screen only), a line ending in \\ carries on to the next."""
+    history = os.path.join(d, ".chat_history")
+    send = lambda text: os.write(fifo, (text.rstrip("\n") + "\n").encode())
+    local = {"/copy": lambda arg: copy_block(d, arg), "/help": command_help}
+
+    def status():
+        """What the agent's busy with (None when it's idle, waiting for you)."""
         st = read_json(os.path.join(d, "state.json"), {})
-        b, status = st.get("busy"), st.get("status") or ""
+        b, now = st.get("busy"), st.get("status") or ""
         if b:
             return f"{agent_id} is {b['what']} ({span_text(time.time() - float(b['since']))})"
-        return f"{agent_id} is {status}" if status.startswith(("working", "waiting")) else None
+        return f"{agent_id} is {now}" if now.startswith(("working", "waiting", "paused", "error")) else None
 
-    look = {"spinning": False, "status": False, "turn": 0, "next": 0.0, "cancel": False}
+    send(f"/hello {os.getcwd()}")                           # the agent says hi first (and knows where you are)
+    try:                                                       # HOBKIN_CHAT=plain: the fallback, even with it
+        import hearthside
+    except ImportError:
+        hearthside = None
+    if os.environ.get("HOBKIN_CHAT") == "plain":
+        hearthside = None
+    if hearthside:
+        try:
+            extra = {"status": status, "history": history + "-hearthside", "local": local,
+                     "commands": {c: line for c, (_, line, _) in COMMAND_HELP.items()},
+                     "arguments": {"/model": lambda: model_choices(d),
+                                   "/help": lambda: [(c[1:], line) for c, (_, line, _) in COMMAND_HELP.items()]}}
+            takes = inspect.signature(hearthside.chat).parameters          # an older hearthside: what it knows
+            return hearthside.chat(agent_id, recent, new_lines, send, **{k: v for k, v in extra.items() if k in takes})
+        finally:
+            os.close(fifo)
+    try:
+        import readline                                        # up arrow for history, where there is one
+        readline.set_history_length(1000)
+        readline.read_history_file(history)
+    except (ImportError, OSError):
+        readline = None if "readline" not in sys.modules else sys.modules["readline"]
+    for line in recent:
+        print(line)
+    print(f"-- chatting with {agent_id}: Enter sends; end a line with \\ to carry on to the next; /help for commands; "
+          "Ctrl-C drops a line, Ctrl-D leaves. (pip install hearthside for the full editor) --", flush=True)
+    done = threading.Event()
 
-    def cursor_row(lib) -> int:
-        """Which screen row of the input the cursor is on (0: the prompt's), so we can find the prompt."""
-        typed = readline.get_line_buffer()
-        at = ctypes.c_int.in_dll(lib, "rl_point").value
-        chars = len(typed.encode("utf-8", "surrogateescape")[:at].decode("utf-8", "ignore"))
-        return screen_cells(typed, len(prompt), shutil.get_terminal_size().columns)[chars][0]
-
-    def draw(lib=None):
-        """Print what's new above the input, with what the agent's doing on a status line of its own just above
-        the prompt (the line you type on is never written over). With lib (in readline's own thread, from its
-        input hook) readline redraws your input, cursor where you left it; without it (no hook: libedit, say)
-        the spinner shows only on an empty input line, as it can't be put back above."""
-        if lib and look["cancel"]:
-            cancel_line(lib)
-        if time.time() < look["next"]:
-            return
-        lines, note = new_lines(), doing()
-        spin = None
-        if note:
-            look["turn"] += 1
-            spin = clip(SPINNER[look["turn"] % len(SPINNER)] + " " + note, shutil.get_terminal_size().columns - 2, 0)
-            spin = ANSI["dim"] + spin + ANSI["off"] if short_color else spin
-        look["next"] = time.time() + (0.15 if note else 0.3)
-        if not lib:
-            typed = readline.get_line_buffer() if readline else ""
-            if lines:
-                sys.stdout.write("\r\x1b[2K" + "\n".join(lines) + "\n" + prompt + typed)
-            elif spin and not typed:
-                sys.stdout.write("\r\x1b[2K" + spin)
-            elif look["spinning"]:
-                sys.stdout.write("\r\x1b[2K" + prompt + typed)
-            look["spinning"] = bool(spin and not typed and not lines)
-            sys.stdout.flush()
-            return
-        row = cursor_row(lib)
-        if lines or bool(spin) != look["status"]:
-            # up to the prompt (and the status line over it), clear from there down, print what's new and the
-            # status line, then readline draws the prompt and your input again below them
-            up = row + (1 if look["status"] else 0)
-            sys.stdout.write((f"\x1b[{up}A" if up else "") + "\r\x1b[J" + "".join(l + "\n" for l in lines)
-                             + (spin + "\n" if spin else ""))
-            sys.stdout.flush()
-            look["status"] = bool(spin)
-            lib.rl_on_new_line()
-            lib.rl_forced_update_display()
-        elif spin:                             # just the spinner moving: the status line alone, cursor kept
-            sys.stdout.write(f"\x1b7\x1b[{row + 1}A\r\x1b[2K{spin}\x1b8")
-        sys.stdout.flush()
-
-    def drop_status(rows_typed: int) -> None:
-        """Enter or Ctrl-D: take the status line out from above what was just typed (deleting the line, so the
-        input moves up into its place), so it doesn't stay behind in the scrollback."""
-        if look["status"]:
-            sys.stdout.write(f"\x1b[{rows_typed + 1}A\x1b[1M" + (f"\x1b[{rows_typed}B" if rows_typed else ""))
-            sys.stdout.flush()
-            look["status"] = False
-
-    def cancel_line(lib) -> None:
-        """Ctrl-C, as in a shell: what was typed is dropped (^C shown after it), and a fresh prompt below."""
-        look["cancel"] = False
-        typed = readline.get_line_buffer()
-        rows = screen_cells(typed, len(prompt), shutil.get_terminal_size().columns)[-1][0] + 1
-        down = rows - 1 - cursor_row(lib)
-        sys.stdout.write((f"\x1b[{down}B" if down > 0 else "") + "^C\r\n")
-        drop_status(rows)
-        lib.rl_replace_line.argtypes = [ctypes.c_char_p, ctypes.c_int]
-        lib.rl_replace_line(b"", 0)
-        ctypes.c_int.in_dll(lib, "rl_point").value = 0
-        if hasattr(lib, "using_history"):
-            lib.using_history()               # ↑ starts again from the newest message
-        lib.rl_on_new_line()
-        lib.rl_forced_update_display()
-        look["next"] = 0.0
-
-    def rule_above(rows_typed: int) -> None:
-        """Enter: a rule above what was just typed, so your messages stand out. The status line over it becomes
-        the rule; with none, a row is opened above the input for it (a new line made below first, so the
-        input never gets pushed off the bottom of the screen)."""
-        rule = chat_rule(short_color)
-        if look["status"]:
-            sys.stdout.write(f"\x1b[{rows_typed + 1}A\r\x1b[2K{rule}\r\x1b[{rows_typed + 1}B")
-            look["status"] = False
-        else:
-            sys.stdout.write(f"\n\x1b[A\x1b[{rows_typed}A\r\x1b[1L{rule}\r\x1b[{rows_typed + 1}B")
-        sys.stdout.flush()
-
-    def printer():                           # without the hook: from a thread (fine unless you type mid-reply)
+    def printer():
+        last = None
         while not done.is_set():
-            with lock:
-                draw()
-            done.wait(0.1)
-
-    unhook = readline_hook(readline, draw)
-    arrows = readline_arrows(readline, len(prompt))   # noqa: F841 (the callbacks must stay alive while input() runs)
-    if not unhook:
-        threading.Thread(target=printer, daemon=True).start()
-    # Ctrl-C mostly lands in the input hook (a ctypes callback, where a KeyboardInterrupt is only printed as
-    # "Exception ignored"): with the hook it's caught here instead, and the hook drops the line, like a shell
-    old_sigint = signal.signal(signal.SIGINT, lambda *_: look.update(cancel=True)) if unhook else None
+            for line in new_lines():
+                print(line, flush=True)
+            now = (read_json(os.path.join(d, "state.json"), {}).get("status") or "").split(":")[0]
+            if now != last and now in ("working", "waiting", "paused", "error"):
+                note = f"· {agent_id} is {now}"
+                print(ANSI["dim"] + note + ANSI["off"] if color else note, flush=True)
+            last = now
+            done.wait(0.3)
+    threading.Thread(target=printer, daemon=True).start()
+    held = []
     try:
         while True:
             try:
-                line = input(prompt)
-            except EOFError:
-                drop_status(0)               # still on the prompt's row: nothing was entered
-                break
-            # Enter moved to the line below the input: count its rows, then the status line over them goes
-            rows = screen_cells(line, len(prompt), shutil.get_terminal_size().columns)[-1][0] + 1
-            if line.strip():
-                rule_above(rows)
-            else:
-                drop_status(rows)
-            if line.strip():
-                os.write(fifo, (line + "\n").encode())
-    except KeyboardInterrupt:
+                line = input("… " if held else "> ")
+            except KeyboardInterrupt:
+                print("^C")
+                held = []
+                continue
+            if line.endswith("\\"):
+                held.append(line[:-1])
+                continue
+            text, held = "\n".join(held + [line]), []
+            word, _, rest = text.strip().partition(" ")
+            if word.lower() in local:
+                print(local[word.lower()](rest))
+            elif text.strip():
+                send(text)
+    except EOFError:
         pass
     finally:
         done.set()
-        if old_sigint is not None:
-            signal.signal(signal.SIGINT, old_sigint)
-        if unhook:
-            unhook()
         print()
         if readline:
             try:

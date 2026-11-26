@@ -25,8 +25,11 @@ def start(h, aid=None, **extra_env):
         if os.path.exists(d + "/in") and "up:" in open(d + "/out").read() if os.path.exists(d + "/out") else False: break
         time.sleep(0.1)
     return p, aid, d
-def say(d, text): 
-    with open(d + "/in", "w") as f: f.write(text + "\n")
+def say(d, text):
+    # Non-blocking: an agent that has died (nothing reading its FIFO) fails the test at once, never hangs it
+    fd = os.open(d + "/in", os.O_WRONLY | os.O_NONBLOCK)
+    os.set_blocking(fd, True)
+    with os.fdopen(fd, "w") as f: f.write(text + "\n")
 def wait_for(d, needle, t=15, file="out"):
     end = time.time() + t
     while time.time() < end:
@@ -39,6 +42,9 @@ def ctx(d): return [json.loads(l) for l in open(d + "/context.jsonl")]
 def last_results(d):
     """The last user message that carries tool results (the wrap-up check may follow it)."""
     return [m for m in ctx(d) if m["role"] == "user" and any(b.get("type") == "tool_result" for b in m["content"])][-1]
+def is_running_(d):
+    st = json.load(open(d + "/state.json"))
+    return st.get("status") not in ("stopped",)
 def check(name, cond, info=""):
     print(("PASS " if cond else "FAIL ") + name + ("" if cond else f"  {info}")); 
     if not cond: global failed; failed = True
@@ -130,11 +136,12 @@ try:
                            capture_output=True, text=True, timeout=30)
         check(f"[{api}] chat (piped) prints the reply, under the agent's name", f"{aid}> echo: hi from a pipe" in r.stdout
               and "agent>" not in r.stdout and "operator>" not in r.stdout, r.stdout + r.stderr)
-        # chat, interactive: in a pseudo-terminal (readline: history, input kept on screen)
+        # chat, interactive: in a pseudo-terminal, the plain fallback (hearthside is the full editor)
         import pty
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["HOBKIN_HOME"] = h
+            os.environ["HOBKIN_CHAT"] = "plain"
             os.environ["TERM"] = "xterm"
             os.chdir(HERE)                                   # the folder chat tells the agent about
             os.execv(sys.executable, [sys.executable, HOB, "chat", aid])
@@ -150,26 +157,34 @@ try:
                 if until(nonlocal_buf[0]): break
             return nonlocal_buf[0]
         buf += pump(lambda b: b"chatting with" in b)
-        os.write(fd, b"typed in a terminal\n")
+        os.write(fd, b"typed in a terminal\r")
         buf += pump(lambda b: b"echo: typed in a terminal" in b)
-        os.write(fd, b"half-typ")                      # start typing; the agent talks meanwhile
-        time.sleep(0.5); say(d, "from elsewhere")
-        later = pump(lambda b: b"echo: from elsewhere" in b and b"> half-typ" in b.split(b"echo: from elsewhere")[-1])
-        check(f"[{api}] chat (terminal) redraws what you were typing after output",
-              b"> half-typ" in later.split(b"echo: from elsewhere")[-1], later[-300:])
-        os.write(fd, b"\x15\x1b[A\r")                 # Ctrl-U clears, up arrow recalls, Enter sends
+        os.write(fd, b"\x1b[A\r")                      # up arrow recalls, Enter sends
         again = pump(lambda b: b"echo: typed in a terminal" in b)
         check(f"[{api}] chat (terminal) up arrow resends from history", b"echo: typed in a terminal" in again, again[-300:])
-        import readline as rl_
-        if "libedit" not in (rl_.__doc__ or ""):     # GNU readline: Ctrl-C drops the line, no traceback, chat stays
-            os.write(fd, b"dropped-by-ctrl-c"); time.sleep(0.3); os.write(fd, b"\x03"); time.sleep(0.5)
-            os.write(fd, b"after ctrl-c\r")
-            cc = pump(lambda b: b"echo: after ctrl-c" in b)
-            check(f"[{api}] chat (terminal) a rule above each message you send",
-                  "─".encode() * 10 in cc.split(b"> after ctrl-c")[-1].split(b"echo: after ctrl-c")[0], cc[-400:])
-            check(f"[{api}] chat (terminal) Ctrl-C drops the typed line and stays, no KeyboardInterrupt",
-                  b"echo: after ctrl-c" in cc and b"^C" in cc and b"KeyboardInterrupt" not in cc
-                  and "echo: dropped-by-ctrl-c" not in open(d + "/out").read(), cc[-400:])
+        os.write(fd, b"first line \\\r"); time.sleep(0.5); os.write(fd, b"second line\r")
+        two = pump(lambda b: b"echo: first line" in b)
+        check(f"[{api}] chat (terminal) a line ending in \\ carries on: one message of two lines",
+              "(2 lines, sent as one message)" in open(d + "/out").read(), two[-300:])
+        os.write(fd, b"dropped-by-ctrl-c"); time.sleep(0.3); os.write(fd, b"\x03"); time.sleep(0.5)
+        os.write(fd, b"after ctrl-c\r")
+        cc = pump(lambda b: b"echo: after ctrl-c" in b)
+        check(f"[{api}] chat (terminal) Ctrl-C drops the typed line and stays, no KeyboardInterrupt",
+              b"echo: after ctrl-c" in cc and b"^C" in cc and b"KeyboardInterrupt" not in cc
+              and "echo: dropped-by-ctrl-c" not in open(d + "/out").read(), cc[-400:])
+        stops = open(d + "/out").read().count("command /stop")      # an earlier test stopped it once
+        say(d, "a paste with\n/stop\nin the middle")
+        wait_for(d, "echo: a paste with")
+        check(f"[{api}] a command inside pasted lines is text, not a command",
+              open(d + "/out").read().count("command /stop") == stops and is_running_(d), open(d + "/out").read()[-300:])
+        os.write(fd, b"/help\r")
+        hp = pump(lambda b: b"keys: Enter sends" in b, 5)
+        check(f"[{api}] chat (terminal) /help lists the commands, answered there, not sent",
+              b"/model [N | NAME" in hp and "/help" not in open(d + "/out").read(), hp[-300:])
+        os.write(fd, b"/copy\r")
+        cp = pump(lambda b: b"copy" in b and b")" in b.split(b"/copy")[-1], 5)
+        check(f"[{api}] chat (terminal) /copy is answered there, not sent", b"no code blocks to copy yet" in cp
+              and "/copy" not in open(d + "/out").read(), cp[-300:])
         os.write(fd, b"\x04")   # Ctrl-D leaves
         _, status = os.waitpid(pid, 0)
         check(f"[{api}] chat (terminal) round trip and Ctrl-D", b"echo: typed in a terminal" in buf and status == 0, buf[-400:])
@@ -245,25 +260,26 @@ try:
           [len(r["messages"]) for r in reqs[-3:]])
     p.send_signal(signal.SIGTERM); p.wait(10)
 
-    # context: a budget below the model's window; compaction at good moments; the checklist carried over
+    # context: a budget below the model's window; compaction at good moments; the goal carried over
     h = home("ctxbudget", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
                            "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000, "compact_early": 0.5})
     p, aid, d = start(h)
     base = json.load(open(d + "/state.json"))
-    say(d, 'call: write_file {"path": "CHECKLIST.md", "content": "# goal\\n- [ ] count\\n- [ ] report\\n"}')
-    wait_for(d, "Created")
+    say(d, 'call: goal {"goal": "count them", "what_would": "z", "steps": ["count", "report"]}')
+    wait_for(d, "Goal set")
     for _ in range(50):
         if json.load(open(d + "/state.json")).get("status") == "idle": break
         time.sleep(0.1)
-    say(d, 'multi-call: [["bash", {"command": "seq 1 9000"}], ["edit_file", {"path": "CHECKLIST.md", "old_text": "- [ ] count", "new_text": "- [x] count"}]]')
+    say(d, 'multi-call: [["bash", {"command": "seq 1 9000"}], ["goal", {"done": [1]}]]')
     wait_for(d, "compacted; note", 20)
     why = "".join(open(f"{d}/archive/{n}").read() for n in os.listdir(d + "/archive") if n.startswith("out-"))
     first = ctx(d)[1]["content"][0]["text"]
     check("[context] the window is capped by context_budget (the model says 100000)", base.get("context_tokens") == 100000)
-    check("[context] a ticked checklist step past half the budget: compacted there, not mid-step",
-          "compacting context (a checklist step is done" in why, why[-400:])
-    check("[context] the checklist goes over word for word", "Your checklist, as it is now" in first and "- [x] count" in first
-          and "- [ ] report" in first, first[:600])
+    check("[context] a ticked goal step past half the budget: compacted there, not mid-step",
+          "compacting context (a goal step is done" in why, why[-400:])
+    check("[context] the goal goes over word for word", "Your goal, as it is now" in first and "- [x] 1. count" in first
+          and "- [ ] 2. report" in first, first[:600])
+    check("[goal] no file is written for it", not any(f.upper() == "CHECKLIST.MD" for _, _, fs in os.walk(d) for f in fs))
     check("[context] mid-task, the last two command results come over (what it was just looking at)",
           "[Result of the command before it]" in first and "9000" in first and "[Result of your last command]" in first,
           first[-1500:])
@@ -272,14 +288,14 @@ try:
     h = home("ctxdefault", {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake", "key_env": "TESTKEY",
                             "max_output_tokens": 200}, {"idle_prompt": None, "context_budget": 24000})
     p, aid, d = start(h)
-    say(d, 'call: write_file {"path": "CHECKLIST.md", "content": "# goal\\n- [ ] count\\n- [ ] report\\n"}')
-    wait_for(d, "Created")
+    say(d, 'call: goal {"goal": "count them", "what_would": "z", "steps": ["count", "report"]}')
+    wait_for(d, "Goal set")
     for _ in range(50):
         if json.load(open(d + "/state.json")).get("status") == "idle": break
         time.sleep(0.1)
-    say(d, 'multi-call: [["bash", {"command": "seq 1 9000"}], ["edit_file", {"path": "CHECKLIST.md", "old_text": "- [ ] count", "new_text": "- [x] count"}]]')
+    say(d, 'multi-call: [["bash", {"command": "seq 1 9000"}], ["goal", {"done": [1]}]]')
     for _ in range(100):
-        if "Edited" in open(d + "/context.jsonl").read() and json.load(open(d + "/state.json")).get("status") == "idle": break
+        if "Ticked" in open(d + "/context.jsonl").read() and json.load(open(d + "/state.json")).get("status") == "idle": break
         time.sleep(0.1)
     time.sleep(1)
     st = json.load(open(d + "/state.json"))
@@ -855,6 +871,38 @@ try:
                    "10:00:07 s1> carrying on"], view)
     full_view = hb.chat_view(["2026-10-24 10:00:05 hobkin> compacted; note:", "    the secret handoff note"], "\0", True, {})
     check("[chat] --full shows compaction's note", "    the secret handoff note" in full_view, full_view)
+    talk = hb.chat_view(["2026-10-24 10:00:07 agent> Run this:", "    ```bash", "    cd /srv && make", "    ```",
+                         "2026-10-24 10:00:08 $> ls", "2026-10-24 10:00:09 => (exit code 0)", "    a.txt"],
+                        "\0", True, {}, False, "s1")
+    check("[chat] talk prints flush left (code copies as written); tool output keeps its indent",
+          talk[1:4] == ["```bash", "cd /srv && make", "```"] and "    a.txt" in talk, talk)
+    blocks = hb.code_blocks(["2026-10-24 10:00:07 agent> Run:", "    ```bash", "    cd /srv && make", "      indented", "    ```",
+                             "2026-10-24 10:00:08 frank> ```", "    not the agent's", "    ```",
+                             "2026-10-24 10:00:09 agent> and", "    ```", "    two", "    ```"])
+    painted = hb.chat_view(["2026-10-24 10:00:07 agent> See `a.py`:", "    ```python", "    open('a.py')", "    ```",
+                            "    then `b.py`"], "\0", False, {}, True, "s1")
+    check("[chat] in colour, code in a fence is left as written; text around it is painted",
+          painted[2] == "open('a.py')" and "\x1b[32mb.py" in painted[4] and "\x1b[32ma.py" in painted[0], painted)
+    helptext = hb.command_help()
+    check("[help] /help lists every command, a line each; /help NAME gives one in full; a near miss is named",
+          all(c in helptext for c in hb.COMMAND_HELP) and "/hello" not in helptext
+          and "rate limit" in hb.command_help("model") and "NAME @SERVICE" in hb.command_help("/model")
+          and "did you mean /model" in hb.command_help("modle"), helptext)
+    mh = os.path.join(BASE, "choices"); os.makedirs(mh + "/_shared"); os.makedirs(mh + "/a1")
+    json.dump({"model": "m", "models": {"m": {"api": "anthropic", "base_url": "http://127.0.0.1:48701", "model": "fake"},
+                                        "n": {"api": "openai", "base_url": "https://openrouter.ai/api/v1", "model": "fake"}}},
+              open(mh + "/_shared/config.json", "w"))
+    old_shared = hb.SHARED; hb.SHARED = mh + "/_shared"
+    hb.Model("n", {"api": "openai", "base_url": "https://openrouter.ai/api/v1", "model": "fake"}).block(time.time() + 3600)
+    choices = dict(hb.model_choices(mh + "/a1")); hb.SHARED = old_shared
+    check("[model] the picker's list: each model with its service, the one in use, and a rate limit it's waiting out",
+          choices.get("m", "").startswith("fake at 127.0.0.1:48701 · in use") and "openrouter.ai · rate limited until" in choices.get("n", ""),
+          choices)
+    check("[chat] /copy finds the agent's code blocks, newest last, as written",
+          blocks == [("bash", "cd /srv && make\n  indented"), ("", "two")], blocks)
+    check("[chat] /copy joins a shell command split with backslashes into one line, other lines kept",
+          hb.join_continued("docker run \\\n  -p 80:80 \\\n  nginx\nls -la\necho 'a\\\\'")
+          == "docker run -p 80:80 nginx\nls -la\necho 'a\\\\'", hb.join_continued("docker run \\\n  -p 80:80 \\\n  nginx"))
     check("[chat] a one-line clip is the start and …, not the whole text again",
           hb.clip("running `" + "x" * 80 + "`", 20, 0) == "running `xxxxxxxxxx…", hb.clip("x" * 80, 20, 0))
     ctx_s1 = open(hs + "/s1/context.jsonl").read()
@@ -862,10 +910,9 @@ try:
     check("[prompt] the default personality tests lightly, asks before any test harness, hands validation over",
           "**YOLO on testing.**" in ctx_s1 and "Never build a test harness without asking" in ctx_s1
           and "**Team up on validation.**" in ctx_s1 and "verify the whole result" not in ctx_s1, ctx_s1[:300])
-    check("[prompt] a handoff is a gitignored HANDOFF.md next to the code: a paste-ready check for the human, then notes for a hobkin",
-          "**Handoff notes travel with the code.**" in ctx_s1 and "right next to the code you worked on" in ctx_s1
-          and "**The human, at the top:**" in ctx_s1 and "**A fresh hobkin, below a `---`,**" in ctx_s1
-          and "`HANDOFF.md` next to it, if there is one" in ctx_s1, ctx_s1[:300])
+    check("[prompt] a check handed over goes where it reports, paste-ready; no handoff or checklist files",
+          "Hand it over\\n  where you report" in ctx_s1 and "paste and run as-is" in ctx_s1
+          and "HANDOFF" not in ctx_s1 and "CHECKLIST" not in ctx_s1 and "NOTES.md" not in ctx_s1, ctx_s1[:300])
     # Opening a chat asks the agent to say hello first
     run("send", "s1", "/hello /home/frank/projects/site")
     for _ in range(50):
@@ -879,8 +926,8 @@ try:
     r = run("chat", "s1", input='noplan-call: write_file {"path": "fix.txt", "content": "x"}\n')
     check("[steps] a file change before **What would:** is said isn't run, and says why", "not run: no plan said yet" in open(hs + "/s1/out").read()
           and not os.path.exists(hs + "/s1/work/fix.txt"), r.stdout)
-    r = run("chat", "s1", input='noplan-call: write_file {"path": "CHECKLIST.md", "content": "- [ ] x"}\n')
-    check("[steps] the checklist (part of planning) can always be written", os.path.exists(hs + "/s1/work/CHECKLIST.md"), r.stdout)
+    r = run("chat", "s1", input='noplan-call: write_file {"path": "$HOBKIN_MEMORY", "content": "- on x"}\n')
+    check("[steps] memory (part of planning) can always be written", "on x" in read_or_empty(hs + "/s1/MEMORY.md"), r.stdout)
     r = run("chat", "s1", input='call: write_file {"path": "fix.txt", "content": "x"}\n')
     check("[steps] with the plan said, the change goes through", os.path.exists(hs + "/s1/work/fix.txt"), r.stdout)
     check("[chat] an agent with no skills is told its work is what people ask, not the machine",
@@ -1816,8 +1863,8 @@ try:
     check("[goal] a new goal doesn't silently replace an open one", json.load(open(d + "/state.json"))["goal"]["goal"] == "Ship the report")
     goal({"subgoal": "Add the chart Frank asked for", "why": "Frank asked mid-task", "steps": ["make chart", "embed it"]}, "Sub-goal set, before step 2")
     sysp = ctx(d)[0]["content"]
-    cl = open(json.load(open(d + "/state.json"))["goal"]["folder"] + "/CHECKLIST.md").read()
-    check("[goal] a sub-goal sits before the next step, in the checklist and the prompt; the goal is kept",
+    cl = goal({}, "Sub-goal (on it now)")              # called with nothing, it shows the goal
+    check("[goal] a sub-goal sits before the next step, in the goal shown and the prompt; the goal is kept",
           cl.index("Sub-goal (on it now): Add the chart") < cl.index("2. write it") and "Ship the report" in cl
           and "You're on the sub-goal" in sysp, cl)
     goal({"done": [1]}, "Next: 2. embed it")                              # ticks the sub-goal's steps
