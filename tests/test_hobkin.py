@@ -212,9 +212,16 @@ try:
         base = f"http://127.0.0.1:{port}" + ("/v1" if api == "openai" else "")
         h = home(api + "-small", {"api": api, "base_url": base, "model": "fake", "key_env": "TESTKEY", "max_output_tokens": 200})
         p, aid, d = start(h)
+        def said_anywhere(needle):                           # compaction can archive the log just after it's said
+            logs = [d + "/out"] + [f"{d}/archive/{n}" for n in (os.listdir(d + "/archive") if os.path.isdir(d + "/archive") else [])
+                                   if n.startswith("out-")]
+            return any(needle in read_or_empty(f) for f in logs)
         for i in range(20):                                  # until the window has overflowed and been compacted
             say(d, f"run: seq 1 {1000 + i}")
-            wait_for(d, f"{1000 + i}", 20); time.sleep(0.3)
+            end = time.time() + 20
+            while time.time() < end and not said_anywhere(f"{1000 + i}"): time.sleep(0.2)
+            assert said_anywhere(f"{1000 + i}"), "timeout waiting for " + str(1000 + i) + ":\n" + open(d + "/out").read()[-1500:]
+            time.sleep(0.3)
             if "compacted; note" in open(d + "/out").read() and i >= 3:
                 break
         last_n = 1000 + i
