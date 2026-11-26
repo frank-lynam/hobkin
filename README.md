@@ -135,10 +135,14 @@ they come, each message flush left under its name, so a code block copies out
 exactly as the agent wrote it; `/copy` puts its last code block on your
 clipboard (`/copy 2`, the one before; a shell command split over lines with
 `\` comes out as one line, ready to paste; it goes through the terminal, so it
-works over ssh, and in tmux with `set -g set-clipboard on`). Tool calls are hidden, and so
-is the note compaction writes. `hobkin chat ID --full` shows them all, tool
-calls dimmed with their output and failed commands in red, as the `out` file
-has it.
+works over ssh, and in tmux with `set -g set-clipboard on`). What it shows is up to you, at four levels: `talk` (the default: what's
+said, and hobkin's notices that matter), `chores` (and housekeeping: the field
+lore and its librarian, compaction, idle prompts, and what the agent says while
+it does its after-report chores, so its report isn't buried under them), `tools`
+(and what it runs, without the output) and `full` (everything, failed commands
+in red, as the `out` file has it). `/show LEVEL` switches as you go (alone, to
+the next; F2 in hearthside), and `hobkin chat ID --show tools` starts there
+(`--full` is `--show full`).
 
 **For the full editor, install [hearthside](https://github.com/frank-lynam/hearthside)**
 beside hobkin (`pip install hearthside`, or `pip install "hobkin[chat]"`; `hobkin[all]` brings lorewell too):

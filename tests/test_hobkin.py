@@ -79,6 +79,10 @@ try:
         check(f"[{api}] context file: system, task, tool round, reply, wrap-up check, reply",
               [m["role"] for m in c] == ["system", "user", "assistant", "user", "assistant", "user", "assistant"]
               and c[5]["content"][0]["text"].startswith("[hobkin: wrap-up check!"), [m["role"] for m in c])
+        wait_for(d, "aside> ")
+        out_ = open(d + "/out").read()
+        check(f"[{api}] what it says in the wrap-up, after its report, is an aside (chat hides it by default)",
+              out_.index("agent> Done. Output was") < out_.index("aside> "), out_[-400:])
         check(f"[{api}] model key hidden from the shell", "KEY=unset" in open(d + "/out").read())
         # the shell keeps its folder between calls (and says where it is)
         say(d, "run: mkdir -p sub/deeper && cd sub/deeper")
@@ -629,7 +633,7 @@ try:
           not any("[hobkin: a task or an idea" in t or "wrap-up check" in t for t in texts)
           and "idle prompt" not in open(d + "/out").read(), [t[:60] for t in texts])
     os.remove(d + "/reminders.json")
-    wait_for(d, "hobkin> idle prompt", 10)
+    wait_for(d, "tidy> idle prompt", 10)
     check("[quiet] once nothing's scheduled, the idle nag is back", True)
     p.send_signal(signal.SIGTERM); p.wait(10)
 
@@ -862,15 +866,32 @@ try:
     r = run("chat", "s1", "--full", input="run: echo shown-out-$((40+3))\n")
     check("[chat] --full shows tool calls and their output", "$> echo shown-out-$((40+3))" in r.stdout
           and "    shown-out-43" in r.stdout, r.stdout)
-    view = hb.chat_view(["2026-10-24 10:00:00 hobkin> compacting context (full)",
-                         "2026-10-24 10:00:05 hobkin> compacted; note:", "    the secret handoff note",
+    view = hb.chat_view(["2026-10-24 10:00:00 tidy> compacting context (full)",
+                         "2026-10-24 10:00:05 tidy> compacted; note:", "    the secret handoff note",
                          "2026-10-24 10:00:06 frank> what now?", "2026-10-24 10:00:07 agent> carrying on"],
                         "\0", False, {}, False, "s1", ("frank", "-----"))
-    check("[chat] compaction's note is hidden (that it's compacting shows); a rule above your messages",
-          view == ["10:00:00 hobkin> compacting context (full)", "-----", "10:00:06 frank> what now?",
+    check("[chat] compaction is housekeeping, hidden by default; a rule above your messages",
+          view == ["-----", "10:00:06 frank> what now?",
                    "10:00:07 s1> carrying on"], view)
-    full_view = hb.chat_view(["2026-10-24 10:00:05 hobkin> compacted; note:", "    the secret handoff note"], "\0", True, {})
+    full_view = hb.chat_view(["2026-10-24 10:00:05 tidy> compacted; note:", "    the secret handoff note"], "\0", True, {})
     check("[chat] --full shows compaction's note", "    the secret handoff note" in full_view, full_view)
+    log = ["2026-10-24 10:00:01 agent> Done! Report: fixed it.", "2026-10-24 10:00:02 $> ls", "2026-10-24 10:00:03 => (exit code 0)",
+           "    a.txt", "2026-10-24 10:00:04 aside> Trimmed the blooper reel.", "2026-10-24 10:00:05 tidy> librarian: moved x",
+           "2026-10-24 10:00:06 tidy> compacted; note:", "    secret note", "2026-10-24 10:00:07 agent> Correction: b.txt",
+           "2026-10-24 10:00:08 hobkin> rate limited"]
+    lv = [hb.chat_view(log, "\0", n, {}, False, "s1") for n in range(4)]
+    check("[chat] levels: talk hides housekeeping and tools (a correction and hobkin's notices show); chores adds the "
+          "housekeeping; tools the calls, not their output; full everything",
+          lv[0] == ["10:00:01 s1> Done! Report: fixed it.", "10:00:07 s1> Correction: b.txt", "10:00:08 hobkin> rate limited"]
+          and "10:00:04 s1 (aside)> Trimmed the blooper reel." in lv[1] and "10:00:05 tidy> librarian: moved x" in lv[1]
+          and "10:00:02 $> ls" not in lv[1] and "10:00:02 $> ls" in lv[2] and "    a.txt" not in lv[2]
+          and "    a.txt" in lv[3] and "    secret note" in lv[3] and "secret note" not in " ".join(lv[2]), lv)
+    v = {"level": 0}
+    check("[chat] /show sets the level, alone goes round to the next, and says what it shows",
+          "showing: chores" in hb.show_level(v, "") and v["level"] == 1 and "showing: full" in hb.show_level(v, "full")
+          and v["level"] == 3 and hb.show_level(v, "") and v["level"] == 0 and "not 'loud'" in hb.show_level(v, "loud"))
+    check("[chat] the wrap-up asks for chores without a running commentary, a wrong report corrected in a line",
+          "Correction:" in hb.WRAP_UP and "your report stands" in hb.WRAP_UP)
     talk = hb.chat_view(["2026-10-24 10:00:07 agent> Run this:", "    ```bash", "    cd /srv && make", "    ```",
                          "2026-10-24 10:00:08 $> ls", "2026-10-24 10:00:09 => (exit code 0)", "    a.txt"],
                         "\0", True, {}, False, "s1")

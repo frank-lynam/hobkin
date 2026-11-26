@@ -29,7 +29,7 @@ setup options:
 agents:
   hobkin                    start a new agent (prints its id)
   hobkin ID                 resume agent ID
-  hobkin chat [ID]          talk to a running agent in this terminal (--full: tool output too)
+  hobkin chat [ID]          talk to a running agent in this terminal (--show chores|tools|full: more than talk)
   hobkin send ID TEXT       message an agent (queued if it isn't running)
   hobkin list               list agents
   hobkin watch [ID ...]     one screen: every agent, what it's doing, risky-looking commands
@@ -81,7 +81,7 @@ message. Or run the file directly: python3 hobkin.py ... More: https://github.co
 
 from __future__ import annotations
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 import email.utils
 import base64
@@ -842,11 +842,16 @@ COMMAND_HELP = {
                 "after a \"too long\" error."),
     "/restart": ("", "start over on the code on disk now, and carry on",
                  "Once the current step is done, in the same process: after a git pull or pip install -U."),
+    "/show": ("[talk|chores|tools|full]", "how much the chat shows (alone: the next level; F2 in hearthside)",
+              "talk (the default): what's said, and hobkin's notices that matter. chores: and housekeeping (the "
+              "field lore and its librarian, compaction, idle prompts, and what the agent says while it does its "
+              "after-report chores). tools: and what it runs, without the output. full: everything, output too. "
+              "hobkin chat ID --show LEVEL starts there. Answered in the chat, never sent."),
     "/copy": ("[N]", "the agent's last code block to your clipboard (N: the Nth from last)",
               "Through the terminal (OSC 52), so it works over ssh; in tmux, set -g set-clipboard on. A shell command "
               "split over lines with \\ comes out as one line. Answered in the chat, never sent."),
 }
-CHAT_COMMANDS = ("/help", "/copy")        # answered by the chat itself
+CHAT_COMMANDS = ("/help", "/copy", "/show")        # answered by the chat itself
 COMMANDS = tuple(c for c in COMMAND_HELP if c not in CHAT_COMMANDS) + ("/hello",)
 
 
@@ -951,8 +956,9 @@ SAY_IT = "[hobkin: just say that in your reply; echo is for scripts.]"
 WRAP_UP = ("[hobkin: wrap-up check! Before you stop: (1) did you post your report where the people are "
            "(your work system's chat or comments)? (2) any slips for your blooper reel? (3) more work to grab? "
            "(4) does what you did match what you said? Check the files, names and claims in your report with ls "
-           "or read_file; if they don't match, fix whichever is wrong. "
-           "Do whatever's missing. If it's all done, end your turn with no reply: don't answer this list.]")
+           "or read_file; if they don't match, fix whichever is wrong, and if your report was wrong, say so in one line "
+           "starting \"Correction:\". Do whatever's missing, without a running commentary: your report stands. If "
+           "it's all done, end your turn with no reply: don't answer this list.]")
 
 
 KEEP_GOING = ("[hobkin: you stopped, but your goal isn't done: next is step {n}. {step}. Carry on now and make the "
@@ -2433,6 +2439,7 @@ class Agent:
         self.turn_used_tools = False       # for the one wrap-up check at the end of a working turn
         self.turn_said = ""                # what the agent has said this turn (for "plan before changing files")
         self.step_done = False             # a goal step was just ticked: a good moment to compact
+        self.housekeeping = False          # after its report: the wrap-up's chores (its words logged as "aside")
         self.half_warned = False           # told once per context that it's half full
         self.idle_compact_tried = False
         self.plan_checked = False
@@ -3400,7 +3407,7 @@ class Agent:
         if body:
             self.log(self.who, body)
             if "\n" in body:                            # a paste: lines that came together are one message
-                self.log("hobkin", f"({body.count(chr(10)) + 1} lines, sent as one message)")
+                self.log("tidy", f"({body.count(chr(10)) + 1} lines, sent as one message)")
             self.pending.append(body)
             self.last_direct = time.time()
 
@@ -3706,7 +3713,7 @@ class Agent:
         for thread, where in owed:
             try:
                 self.inbox_request(str(inbox["reply"]).replace("{thread}", str(thread)), text.encode())
-                self.log("hobkin", f"posted to the board's chat ({where})")
+                self.log("tidy", f"posted to the board's chat ({where})")
             except (KeyError, urllib.error.URLError, OSError) as e:
                 self.log("hobkin", f"couldn't post to the board's chat ({where}): {e}; answer there yourself")
 
@@ -4527,7 +4534,7 @@ class Agent:
             text, _ = self.brownie_finish(int(key), c["dir"], c["model"], c["pid"], reason)
             del self.state["brownies"][key]
             if c.get("quiet"):                       # housekeeping (the librarian, the tidy): logged, not a message
-                self.log("hobkin", f"{c['quiet']} (brownie #{key}): {clip(text.split(chr(10), 1)[-1].strip(), 1500, 0)}")
+                self.log("tidy", f"{c['quiet']} (brownie #{key}): {clip(text.split(chr(10), 1)[-1].strip(), 1500, 0)}")
                 if c["quiet"] == "librarian":
                     self.moved_to_lore(text)
                 continue
@@ -4547,13 +4554,13 @@ class Agent:
         try:
             hits = self.lore.recall(f"{text}\n{g.get('goal', '') if g.get('open') else ''}", n=3, skip=set(seen))
         except Exception as e:                      # a broken lore mustn't stop a message getting through
-            self.log("hobkin", f"field lore: recall failed ({e})")
+            self.log("tidy", f"field lore: recall failed ({e})")
             return ""
         if not hits:
             return ""
         seen.extend(h["topic"] for h in hits)
         items = "\n".join(f"- **{h['topic']}**: {clip(' '.join(h['body'].split()), 600, 0)}" for h in hits)
-        self.log("hobkin", "field lore recalled: " + ", ".join(h["topic"] for h in hits))
+        self.log("tidy", "field lore recalled: " + ", ".join(h["topic"] for h in hits))
         return "\n" + RECALL.format(items=items)
 
     def tool_field_lore(self, inp: dict) -> ToolResult:
@@ -4583,12 +4590,12 @@ class Agent:
                     return "remember what? give topic and text, or entries", True
                 done = [f"{lv.remember(str(e.get('topic')), str(e.get('text') or ''), by, source, why)}: {e.get('topic')}"
                         for e in entries]
-                self.log("hobkin", "field lore: " + "; ".join(done))
+                self.log("tidy", "field lore: " + "; ".join(done))
                 return "\n".join(done), False
             if act == "forget":
                 ok = lv.forget(str(inp.get("topic") or ""), by, why)
                 if ok:
-                    self.log("hobkin", f"field lore: forgot {inp.get('topic')}" + (f" ({why})" if why else ""))
+                    self.log("tidy", f"field lore: forgot {inp.get('topic')}" + (f" ({why})" if why else ""))
                 return (f"forgot {inp.get('topic')} (it's in the history)" if ok else f"no topic {inp.get('topic')!r}"), not ok
             if act == "alias":
                 if not inp.get("alias") or not inp.get("name"):
@@ -4631,7 +4638,7 @@ class Agent:
             related = self.lore.recall(note + "\n" + highlights, n=12, min_words=2)
             aliases = self.lore.aliases()
         except Exception as e:
-            self.log("hobkin", f"librarian: the field lore can't be read ({e})")
+            self.log("tidy", f"librarian: the field lore can't be read ({e})")
             return
         rel = "\n\n".join(f"### {r['topic']}\n{clip(r['body'], 1500, 0)}" for r in related) or "(nothing yet)"
         if aliases:
@@ -4660,7 +4667,7 @@ class Agent:
                 gone.append(f"{topic}: {clip(lines.pop(hit).strip(), 120, 0)}")
         if gone:
             write_atomic(path, "\n".join(lines).rstrip() + "\n")
-            self.log("hobkin", "the librarian moved from your memory to the field lore: " + "; ".join(gone))
+            self.log("tidy", "the librarian moved from your memory to the field lore: " + "; ".join(gone))
         return gone
 
     def survey(self, where: str) -> str:
@@ -5221,7 +5228,10 @@ class Agent:
             return True
         if self.push_on():                          # stopped with the goal unfinished
             return True
-        return bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP)
+        if bool(self.turn_used_tools) and not self.scheduled() and self.nudge_once("wrap_up_sent", WRAP_UP):
+            self.housekeeping = True                # its report's given: what follows is chores, quiet in the chat
+            return True
+        return False
 
     # --- drive: keep going until the goal is done (stopping early is a model's habit, not a decision)
     def goal_left(self) -> tuple[int, str] | None:
@@ -5645,7 +5655,7 @@ class Agent:
         between tasks, so the agent isn't woken by it."""
         if not self.messages:
             return
-        self.log("hobkin", f"compacting context ({why})")
+        self.log("tidy", f"compacting context ({why})")
         ask = {"role": "user", "content": [{"type": "text", "text": (
             "Your conversation is about to be cleared to free up context. Write a note to yourself: "
             "the task and its status, ids, file paths, decisions made, what you were about to do next, and "
@@ -5707,8 +5717,8 @@ class Agent:
         self.working = not idle
         self.save_context()
         self.save_state()
-        self.log("hobkin", f"earlier log: {old_log}")
-        self.log("hobkin", f"compacted; note:\n{note}")
+        self.log("tidy", f"earlier log: {old_log}")
+        self.log("tidy", f"compacted; note:\n{note}")
         self.prune()
 
     def prune(self) -> None:
@@ -5732,7 +5742,7 @@ class Agent:
         if record:                         # people's messages and hobkin's notices, in an incident's timeline
             self.timeline("told: " + clip(" ".join(text.split()), 400, 100))
         self.turn_used_tools = self.wrap_up_sent = self.voice_sent = self.continue_sent = False   # a new turn
-        self.announce_sent = False
+        self.announce_sent = self.housekeeping = False
         (self.state.get("goal") or {}).pop("waiting", None)                 # someone's said something: on we go
         self.turn_said, self.plan_checked, self.idle_compact_tried = "", False, False
         self.plan_carried = False
@@ -5867,7 +5877,8 @@ class Agent:
         self.save_context()
         for b in blocks:
             if b.get("type") == "text":
-                self.log("agent", b["text"])
+                quiet = self.housekeeping and not b["text"].lstrip().lower().startswith("correction")
+                self.log("aside" if quiet else "agent", b["text"])     # after-report chores: chat hides them
                 self.turn_said += "\n" + b["text"]
                 self.timeline("said: " + clip(" ".join(b["text"].split()), 400, 100))
         said = "\n\n".join(b["text"].strip() for b in blocks if b.get("type") == "text" and b.get("text", "").strip())
@@ -6048,7 +6059,7 @@ class Agent:
                     self.poll_input(max(0.0, min(30.0, idle_since + every - time.time(),
                                                  float(self.glass["until"]) - time.time())))   # ends on time
                     if not self.pending and not self.paused and time.time() - idle_since >= every:
-                        self.log("hobkin", "idle prompt (incident)")
+                        self.log("tidy", "idle prompt (incident)")
                         self.add_user("\n\n".join([GLASS_IDLE.format(reason=self.glass["reason"], stamp=self.stamp())]
                                                     + self.team_news()), record=False)
                         idle_since = time.time()
@@ -6056,7 +6067,7 @@ class Agent:
                 if self.cfg.get("wake") and not self.paused:
                     news = self.take_wake()
                     if news:
-                        self.log("hobkin", "woken by " + self.wake_source().replace("your ", "the "))
+                        self.log("tidy", "woken by " + self.wake_source().replace("your ", "the "))
                         self.add_user(WOKEN.format(source=self.wake_source(), stamp=self.stamp(), body=news)
                                       + self.recall(news))
                         idle_since = time.time()
@@ -6079,7 +6090,7 @@ class Agent:
                     nxt = min(nxt, 1.0) if nxt is not None else 1.0   # look for finished jobs and brownies every second
                 self.poll_input(min(wait, nxt) if nxt is not None else wait)
                 if prompt and not self.pending and not self.paused and time.time() - idle_since >= every:
-                    self.log("hobkin", "idle prompt")
+                    self.log("tidy", "idle prompt")
                     self.add_user(f"[from hobkin: idle prompt, {self.stamp()}]\n{prompt}")
                     idle_since = time.time()
         except KeyboardInterrupt:
@@ -6342,9 +6353,14 @@ def show_banner(name: str, color: bool, seconds: float = 0.35):
 
 
 # --- chat: the view of the out log, colour, /copy, and the terminal (hearthside if installed, else plain lines)
-# Out-log entries that are tool calls (chat hides them unless --full): bash's command and result, every
+# Out-log entries that are tool calls (chat hides them below its "tools" level): bash's command and result, every
 # other tool by name, finished jobs, reminders. Everything else is talk: shown in full (but compaction's note).
 TOOL_WHO = ({"$", "=", "job", "reminder", "hold", "notify"} | {t["name"] for t in TOOLS}) - {"goal"}   # a goal is thinking: shown
+# Housekeeping (chat hides it until you ask): hobkin's own chores ("tidy": the field lore and its librarian,
+# compaction, idle prompts, receipts), and what the agent says while it does its after-report chores ("aside")
+QUIET_WHO = {"tidy", "aside"}
+# What the chat shows, least to most: talk; and housekeeping; and what it ran (no output); everything
+CHAT_LEVELS = ("talk", "chores", "tools", "full")
 
 
 # Colour in chat (only on a terminal, and not with NO_COLOR set): who's talking, `code` and file
@@ -6383,6 +6399,8 @@ def paint_header(line: str, who: str, text: str, own: str, name: str | None = No
         return f'{a["dim"]}{clock}{a["off"]} {a["red"] if failed else a["dim"]}=> {text}{a["off"]}'
     if who in TOOL_WHO:
         return f'{a["dim"]}{clock} {who}> {text}{a["off"]}'
+    if who in QUIET_WHO:                              # housekeeping: dim, the agent's aside under its name
+        return f'{a["dim"]}{clock} {(name or "agent") + " (aside)" if who == "aside" else who}> {text}{a["off"]}'
     label = (a["magenta"] + a["bold"]) if who == "agent" else a["yellow"] if who == "hobkin" else (a["blue"] + a["bold"])
     body = paint(text) if who != "hobkin" else a["dim"] + text + a["off"]
     return f'{a["dim"]}{clock}{a["off"]} {label}{name if who == "agent" and name else who}>{a["off"]} {body}'
@@ -6394,13 +6412,15 @@ def chat_rule(color: bool = False) -> str:
     return ANSI["dim"] + rule + ANSI["off"] if color else rule
 
 
-def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = False, name: str | None = None,
+def chat_view(lines: list[str], own: str, level, st: dict, color: bool = False, name: str | None = None,
               rule_for: tuple[str, str] | None = None) -> list[str]:
     """Out-log lines as chat shows them: your own messages left out (you typed them), the agent's (under its
-    `name`, so you know which hobkin it is) and hobkin's in full; tool calls and compaction's note
-    hidden. `full` shows everything (each tool call with its output); `color` adds terminal colours. With
-    `rule_for` (who, rule), each message from `who` gets `rule` above it. `st` carries the current entry
-    between calls."""
+    `name`, so you know which hobkin it is) and hobkin's in full. `level` (a CHAT_LEVELS index; True is "full")
+    says what else: talk (0) hides housekeeping (QUIET_WHO), tool calls and compaction's note; chores (1) shows
+    the housekeeping; tools (2) also what it ran, without the output; full (3) everything. `color` adds terminal
+    colours. With `rule_for` (who, rule), each message from `who` gets `rule` above it. `st` carries the current
+    entry between calls."""
+    level = 3 if level is True else int(level or 0)
     shown = []
     for line in lines:
         if not line.startswith("    "):
@@ -6408,10 +6428,12 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = Fa
             st["who"] = who
             st["fence"] = text.lstrip().startswith("```")   # a new entry: a fence opens only if it starts with one
             st["mine"] = line[20:].startswith(own)
-            if full:
+            if level >= 3:
                 st["keep"] = "all"
-            elif who in TOOL_WHO or (who == "hobkin" and text.startswith("compacted; note:")):
-                st["keep"] = "none"
+            elif who in TOOL_WHO:
+                st["keep"] = "head" if level == 2 else "none"     # tools: the call, not its output
+            elif who in QUIET_WHO:
+                st["keep"] = "none" if level < 1 or text.startswith("compacted; note:") else "all"
             else:
                 st["keep"] = "all"
             if st["mine"] or st["keep"] == "none":
@@ -6422,12 +6444,12 @@ def chat_view(lines: list[str], own: str, full: bool, st: dict, color: bool = Fa
             if color:
                 who_, _, text_ = line[9:].partition("> ")
                 line = paint_header(line, who_, text_, own, name)
-            elif who == "agent" and name:
-                line = line[:9] + name + line[14:]
+            elif who in ("agent", "aside") and name:
+                line = line[:9] + name + (" (aside)" if who == "aside" else "") + line[14:]
             shown.append(line)
         elif not st.get("mine") and st.get("keep") == "all":
             who = st.get("who")
-            if who in TOOL_WHO or who == "hobkin":       # tool output keeps its indent, under its command
+            if who in TOOL_WHO or who in ("hobkin", "tidy"):    # tool output and notices keep their indent
                 shown.append(ANSI["dim"] + line + ANSI["off"] if color else line)
                 continue
             line = line[4:]                              # talk: flush left, so code copies exactly as written
@@ -6459,11 +6481,11 @@ def pick_chat_agent() -> str:
     return pick
 
 
-def cmd_chat(agent_id, full=False):
+def cmd_chat(agent_id, level=0):
     """Talk to a running agent in one terminal: its output appears as it comes, and each line
     you type (or paste) is sent. In a terminal, readline gives line editing and history (up
     arrow), and output never overwrites what you're typing. Piped input: send it all, print
-    the reply, exit. Tool calls are hidden unless `full`."""
+    the reply, exit. `level` (CHAT_LEVELS) says how much besides talk it shows; /show changes it as you go."""
     d = os.path.join(HOME, valid_id(agent_id))
     if not os.path.isdir(d) or not is_running(d):
         sys.exit(f"hobkin: {agent_id} isn't running (start it with: hobkin {agent_id})")
@@ -6476,7 +6498,8 @@ def cmd_chat(agent_id, full=False):
         pos = f.tell()
     color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     me = own[:-2]
-    recent = chat_view(raw[-400:], "\0", full, {}, color, agent_id,      # the recent past, your own lines included
+    view = {"level": level}                                    # /show changes it as you go
+    recent = chat_view(raw[-400:], "\0", level, {}, color, agent_id,     # the recent past, your own lines included
                        (me, chat_rule(color)) if sys.stdin.isatty() else None)[-12:]
     st = {}
 
@@ -6489,12 +6512,12 @@ def cmd_chat(agent_id, full=False):
             chunk = f.read()
         cut = chunk.rfind(b"\n") + 1   # whole lines only
         pos += cut
-        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, full, st, color, agent_id)
+        return chat_view(chunk[:cut].decode(errors="replace").splitlines(), own, view["level"], st, color, agent_id)
 
     if sys.stdin.isatty():
         if sys.stdout.isatty():
             show_banner(agent_id, color)
-        return chat_terminal(agent_id, d, fifo, recent, new_lines, color)
+        return chat_terminal(agent_id, d, fifo, recent, new_lines, color, view)
     sent_at, eof = 0.0, False
     try:
         while True:
@@ -6612,13 +6635,31 @@ def model_choices(d: str) -> list[tuple[str, str]]:
     return out
 
 
-def chat_terminal(agent_id, d, fifo, recent, new_lines, color=False):
+SHOWS = {"talk": "what's said", "chores": "and housekeeping (the field lore, compaction, its after-report chores)",
+         "tools": "and what it runs (not the output)", "full": "everything, output too"}
+
+
+def show_level(view: dict, arg: str) -> str:
+    """/show [LEVEL]: how much the chat shows besides what's said (CHAT_LEVELS); alone, the next one round.
+    From the next output on (PgUp's scrollback too)."""
+    want = arg.strip().lower()
+    if want.isdigit() and int(want) < len(CHAT_LEVELS):
+        want = CHAT_LEVELS[int(want)]
+    if want and want not in CHAT_LEVELS:
+        return f"(/show {' | '.join(CHAT_LEVELS)}, not {arg.strip()!r})"
+    view["level"] = CHAT_LEVELS.index(want) if want else (view["level"] + 1) % len(CHAT_LEVELS)
+    now = CHAT_LEVELS[view["level"]]
+    return f"(showing: {now}: {SHOWS[now]}; /show {' | '.join(CHAT_LEVELS)})"
+
+
+def chat_terminal(agent_id, d, fifo, recent, new_lines, color=False, view=None):
     """The interactive side of chat. With hearthside installed (pip install hearthside), its editor: multi-line
     input, a status bar, output above the prompt. Without it, the plain fallback: lines in, output printed as
     it comes (it can land in what you're typing, on screen only), a line ending in \\ carries on to the next."""
     history = os.path.join(d, ".chat_history")
     send = lambda text: os.write(fifo, (text.rstrip("\n") + "\n").encode())
-    local = {"/copy": lambda arg: copy_block(d, arg), "/help": command_help}
+    view = view if view is not None else {"level": 0}
+    local = {"/copy": lambda arg: copy_block(d, arg), "/help": command_help, "/show": lambda arg: show_level(view, arg)}
 
     def status():
         """What the agent's busy with (None when it's idle, waiting for you)."""
@@ -6639,9 +6680,10 @@ def chat_terminal(agent_id, d, fifo, recent, new_lines, color=False):
         try:
             extra = {"status": status, "history": history + "-hearthside", "local": local,
                      "commands": {c: line for c, (_, line, _) in COMMAND_HELP.items()},
-                     "backlog": lambda: chat_view(read(os.path.join(d, "out")).splitlines(), "\0", False, {}, False,
-                                                  agent_id),     # PgUp: since its last compaction
+                     "backlog": lambda: chat_view(read(os.path.join(d, "out")).splitlines(), "\0", view["level"], {},
+                                                  False, agent_id),     # PgUp: since its last compaction
                      "arguments": {"/model": lambda: model_choices(d),
+                                   "/show": lambda: [(n, SHOWS[n]) for n in CHAT_LEVELS],
                                    "/help": lambda: [(c[1:], line) for c, (_, line, _) in COMMAND_HELP.items()]}}
             takes = inspect.signature(hearthside.chat).parameters          # an older hearthside: what it knows
             return hearthside.chat(agent_id, recent, new_lines, send, **{k: v for k, v in extra.items() if k in takes})
@@ -7762,10 +7804,14 @@ def main(argv):
     if argv[:1] == ["service"]:
         return cmd_service(argv[1:])
     if argv[:1] == ["chat"]:
-        pos, opts = split_args(argv[1:], {"--full"}, set())
+        pos, opts = split_args(argv[1:], {"--full"}, {"--show"})
         if len(pos) > 1:
-            sys.exit("usage: hobkin chat [ID] [--full]   (no ID: a running one, idle if it can; --full: tool output too)")
-        return cmd_chat(pos[0] if pos else pick_chat_agent(), full=bool(opts.get("--full")))
+            sys.exit("usage: hobkin chat [ID] [--show talk|chores|tools|full]   (no ID: a running one, idle if it can; "
+                     "--full is --show full)")
+        show = "full" if opts.get("--full") else (opts.get("--show") or "talk").lower()
+        if show not in CHAT_LEVELS:
+            sys.exit(f"hobkin: --show is one of {', '.join(CHAT_LEVELS)}")
+        return cmd_chat(pos[0] if pos else pick_chat_agent(), level=CHAT_LEVELS.index(show))
     if argv[:1] == ["send"]:
         if len(argv) < 3:
             sys.exit("usage: hobkin send ID TEXT")
