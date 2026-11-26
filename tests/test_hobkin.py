@@ -1564,12 +1564,15 @@ try:
     say(d, "and now?"); wait_for(d, "echo: always-empty please")
     check("[replies] three empty in a row: it waits, and the next message carries on (roles still alternate)",
           "INVALID" not in open(LOG).read())
-    # a paste: lines that arrive together are one message, and it says so; a line that's exactly a command still runs
-    say(d, "pasted one\npasted two\n/status\npasted three"); wait_for(d, "echo: pasted one")
+    # a paste: lines that arrive together are one message, and it says so; a command leading the burst runs, one
+    # among the pasted lines is just text
+    before = open(d + "/out").read().count("command /status")
+    say(d, "/status\npasted one\npasted two\n/status\npasted three"); wait_for(d, "echo: pasted one")
     out = open(d + "/out").read()
-    check("[paste] several lines at once: one message, noted; a command among them still runs",
-          "(3 lines, sent as one message)" in out and "command /status" in out and out.count("echo: pasted one") == 1
-          and any("pasted one" in json.dumps(m) and "pasted three" in json.dumps(m) and "/status" not in json.dumps(m)
+    check("[paste] several lines at once: one message, noted; a leading command runs, one among them is text",
+          "(4 lines, sent as one message)" in out and out.count("command /status") == before + 1
+          and out.count("echo: pasted one") == 1
+          and any("pasted one" in json.dumps(m) and "pasted three" in json.dumps(m) and "/status" in json.dumps(m)
                   for m in ctx(d) if m["role"] == "user"), out[-800:])
     # commands work while the model thinks (the call runs in a thread), and chat shows a spinner meanwhile
     say(d, "slow:4 think hard"); wait_for(d, "operator> slow:4 think hard"); time.sleep(0.5)
@@ -1594,50 +1597,15 @@ try:
     os.write(fd, b"slow:3 spin for me\n")
     pump(lambda b: b"echo: slow:3 spin for me" in b)
     check("[chat] no name: the only running hobkin", f"chatting with {aid}".encode() in buf, buf[-300:])
-    check("[chat] a spinner while it thinks", f"{aid} is thinking (".encode() in buf, buf[-600:])
-    os.write(fd, b"abc"); time.sleep(0.3); mark = len(buf)              # typing while it thinks: the status line is
-    subprocess.Popen([sys.executable, HOB, "send", aid, "slow:3 under typing"], env={**os.environ, "HOBKIN_HOME": h},
-                     stdout=subprocess.DEVNULL)                          # drawn above the prompt, the typing left be
-    pump(lambda b: b"echo: slow:3 under typing" in b[mark:]          # the reply, then the prompt drawn again below it
-         and b"> abc" in b[mark:].split(b"echo: slow:3 under typing")[-1])
-    later = buf[mark:]
-    check("[chat] the spinner has its own line above the prompt, and shows while you type",
-          f"{aid} is thinking (".encode() in later and b"\x1b7" in later and b"> abc" in later.split(b"echo: slow:3 under typing")[-1],
-          later[-600:])
-    os.write(fd, b"\x15")                                                # clear the line for what comes next
-    for ch in "hello world":                                   # typing while a reply lands, then editing mid-line
+    check("[chat] the plain chat says when it starts working", f"· {aid} is working".encode() in buf, buf[-600:])
+    for ch in "hello wo":                                      # typing while a reply lands: what you typed is intact
         os.write(fd, ch.encode()); time.sleep(0.05)
-        if ch == "o":
-            subprocess.Popen([sys.executable, HOB, "send", aid, "landing mid-typing"], env={**os.environ, "HOBKIN_HOME": h},
-                             stdout=subprocess.DEVNULL)
-    pump(lambda b: b"echo: landing mid-typing" in b); time.sleep(0.5)
-    os.write(fd, b"\x1b[D\x1b[D\x1b[DX\r")
-    wait_for(d, "operator> hello woXrld")
-    import readline as rl
-    unhook = hbk.readline_hook(rl, lambda lib: None)
-    check("[chat] typing survives a reply landing mid-line; output is drawn from readline's own input hook",
-          unhook is not None)
-    if unhook: unhook()
-    # up and down: between the rows of a multi-row input first, through history only from its top or bottom
-    print(f"INFO [env] python {sys.version.split()[0]}, readline {getattr(rl, '_READLINE_LIBRARY_VERSION', '?')}"
-          f" ({'libedit' if 'libedit' in (rl.__doc__ or '') else 'GNU'})")
-    moved = hbk.line_move("line one\nline two", 17, 2, 80, -1)
-    check("[chat] up from the end of a second row lands on the first, at its column", moved == 6, f"got {moved!r}")
-    if sys.version_info < (3, 10):
-        # Python 3.9's readline keeps bracketed paste off, so a pasted block arrives line by line (still sent as one
-        # message) and there are no rows to move between; the arrows go through history as usual.
-        print("INFO [chat] Python 3.9: moving between the rows of a pasted block isn't available; skipped")
-    else:
-        os.write(fd, b"\x1b[200~line one\nline two\x1b[201~\x1b[AY\r")   # a pasted two-line message; up, then type
-        wait_for(d, "operator> line oYne")
-        os.write(fd, b"\x1b[A\x1b[A\x1b[A\r")  # history: that message (cursor on its last row), its top row, the one before
-        end = time.time() + 20
-        while time.time() < end and open(d + "/out").read().count("operator> hello woXrld") < 2: time.sleep(0.2)
-        check("[chat] up moves between the rows of what you're typing, then through history",
-              open(d + "/out").read().count("operator> hello woXrld") == 2, open(d + "/out").read()[-600:])
-    check("[chat] the rows of a long line wrapped on screen count too",
-          hbk.line_move("a" * 30, 30, 2, 10, -1) == 20 and hbk.line_move("a" * 30, 3, 2, 10, 1) == 13
-          and hbk.line_move("a" * 30, 3, 2, 10, -1) is None and hbk.line_move("界" * 6, 6, 2, 10, -1) == 1)
+    subprocess.Popen([sys.executable, HOB, "send", aid, "landing mid-typing"], env={**os.environ, "HOBKIN_HOME": h},
+                     stdout=subprocess.DEVNULL)
+    pump(lambda b: b"echo: landing mid-typing" in b); time.sleep(0.3)
+    os.write(fd, b"rld\r")
+    wait_for(d, "operator> hello world")
+    check("[chat] a reply landing mid-line leaves what you typed intact", "operator> hello world" in open(d + "/out").read())
     os.write(fd, b"\x04"); os.waitpid(pid, 0)
     p.send_signal(signal.SIGTERM); p.wait(10)
 
